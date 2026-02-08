@@ -78,8 +78,8 @@ def train_autoencoder(
         
         print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
         
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -158,12 +158,19 @@ def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8
 def main():
     # Configuration
     batch_size = 128
-    epochs = 50
+    epochs = 20
     latent_dim = 256
     temperature = 1.0
     lr = 0.001
     data_root = './data/cifar10'
     save_dir = f'outputs/training/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    
+    # Architecture parameters
+    encoder_kernel_sizes = [5, 5, 5]  # int or list [k1, k2, k3] for each TaxonConv layer
+    decoder_kernel_sizes = [6, 6, 5]  # None = default [4, 4, 3], or list [k1, k2, k3]
+    encoder_strides = [2, 2]  # int or list [s1, s2] for downsampling between layers
+    decoder_strides = [2, 2, 1]  # None = default [2, 2, 1], or list [s1, s2, s3]
+    use_maxpool = True  # True = max pooling, False = average pooling
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -175,6 +182,11 @@ def main():
     print(f"Latent dim: {latent_dim}")
     print(f"Temperature: {temperature}")
     print(f"Learning rate: {lr}")
+    print(f"Encoder kernel sizes: {encoder_kernel_sizes}")
+    print(f"Decoder kernel sizes: {decoder_kernel_sizes if decoder_kernel_sizes else '[4, 4, 3] (default)'}")
+    print(f"Encoder strides: {encoder_strides}")
+    print(f"Decoder strides: {decoder_strides if decoder_strides else '[2, 2, 1] (default)'}")
+    print(f"Use max pooling: {use_maxpool}")
     print(f"Data directory: {data_root}")
     print(f"Save directory: {save_dir}")
     print("=" * 60)
@@ -188,7 +200,15 @@ def main():
     
     # Create model
     print("\nCreating CIFAR10TaxonAutoencoder...")
-    model = CIFAR10TaxonAutoencoder(latent_dim=latent_dim, temperature=temperature)
+    model = CIFAR10TaxonAutoencoder(
+        latent_dim=latent_dim, 
+        temperature=temperature,
+        encoder_kernel_sizes=encoder_kernel_sizes,
+        decoder_kernel_sizes=decoder_kernel_sizes,
+        encoder_strides=encoder_strides,
+        decoder_strides=decoder_strides,
+        use_maxpool=use_maxpool
+    )
     
     # Train
     print("\nStarting training...\n")

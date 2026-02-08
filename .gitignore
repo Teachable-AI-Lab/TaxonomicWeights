@@ -1,2 +1,4 @@
 data
 intuitions.pdf
+*.pt
+__pycache__

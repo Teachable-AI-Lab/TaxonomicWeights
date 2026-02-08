@@ -76,14 +76,19 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='taxon_conv1', n_col
         
         for i in range(n_filters):
             filt = w_norm[i]
-            if in_ch > 1:
-                # For RGB, show as color image
-                filt = np.transpose(filt, (1, 2, 0))
-            else:
-                # For grayscale
-                filt = filt.squeeze()
             
-            axes[i].imshow(filt, cmap='gray' if in_ch == 1 else None)
+            if in_ch == 1:
+                filt = filt.squeeze()
+                cmap = 'gray'
+            elif in_ch == 3:
+                filt = np.transpose(filt, (1, 2, 0))
+                cmap = None
+            else:
+                # Too many channels - average across all input channels
+                filt = filt.mean(axis=0)
+                cmap = 'viridis'
+            
+            axes[i].imshow(filt, cmap=cmap)
             axes[i].axis('off')
         
         # Turn off extra axes
@@ -123,24 +128,16 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='taxon_deconv1', n
         w_np = w_tensor.detach().cpu().numpy()
         in_ch, out_ch, k, _ = w_np.shape
         
-        # For deconv, we visualize a sample of filters (since there can be many)
-        # Show first n_cols*n_cols filters
+        # For deconv, visualize a subset of output filters
         max_filters = min(out_ch, n_cols * 8)
+        w_subset = w_np[:, :max_filters, :, :]
         
-        # Normalize per filter (across input channels)
-        w_np = w_np[:, :max_filters, :, :]  # Take subset
-        
-        # For visualization, average across input channels or show first input channel
-        if in_ch > 3:
-            # Too many input channels, show first channel
-            w_display = w_np[0, :, :, :]  # (out_ch, k, k)
-        else:
-            # Few input channels, can display
-            w_display = w_np.transpose(1, 2, 3, 0)  # (out_ch, k, k, in_ch)
+        # Average across input channels for visualization
+        w_display = w_subset.mean(axis=0)
         
         # Normalize
-        mins = w_display.min(axis=tuple(range(1, w_display.ndim)), keepdims=True)
-        maxs = w_display.max(axis=tuple(range(1, w_display.ndim)), keepdims=True)
+        mins = w_display.min(axis=(1, 2), keepdims=True)
+        maxs = w_display.max(axis=(1, 2), keepdims=True)
         w_norm = (w_display - mins) / (maxs - mins + 1e-5)
         
         # Grid setup
@@ -151,19 +148,14 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='taxon_deconv1', n
         axes = axes.flatten()
         
         for i in range(max_filters):
-            filt = w_norm[i]
-            if filt.ndim == 3 and filt.shape[2] in [1, 3]:
-                # Color or grayscale
-                if filt.shape[2] == 1:
-                    filt = filt.squeeze()
-            axes[i].imshow(filt, cmap='gray' if filt.ndim == 2 else None)
+            axes[i].imshow(w_norm[i], cmap='viridis')
             axes[i].axis('off')
         
         # Turn off extra axes
         for ax in axes[max_filters:]:
             ax.axis('off')
         
-        plt.suptitle(f'{layer_name} Level {level_idx} ({out_ch} filters, {in_ch}→1ch, {k}×{k})')
+        plt.suptitle(f'{layer_name} Level {level_idx} ({out_ch} filters, avg of {in_ch} in_ch, {k}×{k})')
         plt.tight_layout()
         plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
         plt.close()

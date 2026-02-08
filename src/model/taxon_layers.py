@@ -352,7 +352,9 @@ class TaxonDeconv(nn.Module):
                 self.in_channels, alpha_sig.shape[0], 2,
                 self.out_channels, self.kernel_size, self.kernel_size
             )
-            a = alpha_sig.view(1, alpha_sig.shape[0], 2, 1, 1, 1)
+            a = alpha_sig.view(alpha_sig.shape[0], 1, 1, 1, 1)
+            a = torch.cat([a, 1 - a], dim=1)
+            a = a.unsqueeze(0)
             parent = (a * children).sum(dim=2)
             parent = parent.view(
                 self.in_channels, alpha_sig.shape[0] * self.out_channels,
