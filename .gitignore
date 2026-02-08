@@ -2,3 +2,5 @@ data
 intuitions.pdf
 *.pt
 __pycache__
+slurm
+*.npz

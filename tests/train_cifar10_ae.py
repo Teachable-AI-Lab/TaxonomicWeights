@@ -6,6 +6,8 @@ Trains the CIFAR10TaxonAutoencoder and saves the model checkpoint.
 
 import os
 import sys
+import json
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -155,23 +157,77 @@ def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8
     print(f"Reconstructions saved to {save_dir}/reconstructions.png")
 
 
+def load_config(config_path):
+    """Load configuration from JSON file."""
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
 def main():
-    # Configuration
-    batch_size = 128
-    epochs = 20
-    latent_dim = 256
-    temperature = 1.0
-    lr = 0.001
-    data_root = './data/cifar10'
-    save_dir = f'outputs/training/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    parser = argparse.ArgumentParser(description='Train CIFAR-10 Taxonomic Autoencoder')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to JSON config file')
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--latent-dim', type=int, default=None)
+    parser.add_argument('--temperature', type=float, default=None)
     
-    # Architecture parameters
-    encoder_kernel_sizes = [5, 5, 5]  # int or list [k1, k2, k3] for each TaxonConv layer
-    decoder_kernel_sizes = [6, 6, 5]  # None = default [4, 4, 3], or list [k1, k2, k3]
-    encoder_strides = [2, 2]  # int or list [s1, s2] for downsampling between layers
-    decoder_strides = [2, 2, 1]  # None = default [2, 2, 1], or list [s1, s2, s3]
-    use_maxpool = True  # True = max pooling, False = average pooling
+    args = parser.parse_args()
     
+    # Load config if provided, otherwise use defaults
+    if args.config:
+        config = load_config(args.config)
+        batch_size = config['data']['batch_size']
+        data_root = config['data']['data_root']
+        latent_dim = config['model']['latent_dim']
+        temperature = config['model']['temperature']
+        encoder_kernel_sizes = config['model']['encoder_kernel_sizes']
+        decoder_kernel_sizes = config['model']['decoder_kernel_sizes']
+        encoder_strides = config['model']['encoder_strides']
+        decoder_strides = config['model']['decoder_strides']
+        encoder_n_layers = config['model'].get('encoder_n_layers', None)
+        decoder_n_layers = config['model'].get('decoder_n_layers', None)
+        decoder_paddings = config['model'].get('decoder_paddings', None)
+        decoder_output_paddings = config['model'].get('decoder_output_paddings', None)
+        use_maxpool = config['model']['use_maxpool']
+        
+        # Training-specific parameters (optional)
+        epochs = config.get('training', {}).get('epochs', 20)
+        lr = config.get('training', {}).get('learning_rate', 0.001)
+        save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/training')
+    else:
+        # Default configuration
+        batch_size = 128
+        epochs = 20
+        lr = 0.001
+        data_root = './data/cifar10'
+        latent_dim = 256
+        temperature = 1.0
+        encoder_kernel_sizes = [5, 5, 5]
+        decoder_kernel_sizes = [6, 6, 5]
+        encoder_strides = [2, 2]
+        decoder_strides = [2, 2, 1]
+        encoder_n_layers = None
+        decoder_n_layers = None
+        decoder_paddings = None
+        decoder_output_paddings = None
+        use_maxpool = True
+        save_dir_prefix = 'outputs/training'
+    
+    # Command line args override config
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    if args.epochs is not None:
+        epochs = args.epochs
+    if args.lr is not None:
+        lr = args.lr
+    if args.latent_dim is not None:
+        latent_dim = args.latent_dim
+    if args.temperature is not None:
+        temperature = args.temperature
+    
+    save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print("=" * 60)
@@ -207,6 +263,10 @@ def main():
         decoder_kernel_sizes=decoder_kernel_sizes,
         encoder_strides=encoder_strides,
         decoder_strides=decoder_strides,
+        encoder_n_layers=encoder_n_layers,
+        decoder_n_layers=decoder_n_layers,
+        decoder_paddings=decoder_paddings,
+        decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool
     )
     

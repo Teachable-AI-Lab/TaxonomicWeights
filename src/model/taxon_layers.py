@@ -117,8 +117,10 @@ class TaxonConv(nn.Module):
             
             # Combine child weights: parent = α*child_0 + (1-α)*child_1
             child_w = weights[-1]
+            # Use actual child weight dimensions, not self.in_channels
+            num_children, in_ch, kh, kw = child_w.shape
             child_w = child_w.view(
-                alpha_raw.shape[0], 2, self.in_channels, self.kernel_size, self.kernel_size
+                alpha_raw.shape[0], 2, in_ch, kh, kw
             )
             a_w = alpha_raw.view(alpha_raw.shape[0], 1, 1, 1, 1)
             a_w = torch.cat([a_w, 1 - a_w], dim=1)
@@ -251,7 +253,7 @@ class TaxonDeconv(nn.Module):
     """
     
     def __init__(self, in_channels, out_channels=1, kernel_size=4, n_layers=3, 
-                 stride=2, padding=1, temperature=1.0):
+                 stride=2, padding=1, output_padding=0, temperature=1.0):
         super(TaxonDeconv, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -260,6 +262,7 @@ class TaxonDeconv(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.output_padding = output_padding
 
         # Leaf weights for conv_transpose2d: (in_ch, out_ch*2^n_layers, k, k)
         self.leaves_weights = nn.Parameter(
@@ -324,7 +327,7 @@ class TaxonDeconv(nn.Module):
 
         # Apply transposed convolution at each level and concatenate
         outs = [
-            F.conv_transpose2d(x, w, bias=b, stride=self.stride, padding=self.padding)
+            F.conv_transpose2d(x, w, bias=b, stride=self.stride, padding=self.padding, output_padding=self.output_padding)
             for w, b in zip(weights, biases)
         ]
         out = torch.cat(outs, dim=1)

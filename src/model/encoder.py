@@ -33,12 +33,16 @@ class CIFAR10TaxonEncoder(nn.Module):
     kernel_sizes : list of int or int
         Kernel sizes for each TaxonConv layer (default: 3)
     strides : list of int or int
-        Strides for downsampling between layers (default: 2)
+        Strides for downsampling after each layer (default: [2, 2, 1])
+        If only 2 values provided, third defaults to 1 (no pooling)
+    n_layers : list of int or int
+        Number of hierarchy layers for each TaxonConv (default: [4, 6, 7])
     use_maxpool : bool
         If True, use maxpooling for downsampling. If False, use stride in conv layers.
     """
     
-    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=2, use_maxpool=True):
+    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=2, 
+                 n_layers=None, use_maxpool=True):
         super(CIFAR10TaxonEncoder, self).__init__()
         self.latent_dim = latent_dim
         self.use_maxpool = use_maxpool
@@ -47,33 +51,44 @@ class CIFAR10TaxonEncoder(nn.Module):
         if isinstance(kernel_sizes, int):
             kernel_sizes = [kernel_sizes] * 3
         if isinstance(strides, int):
-            strides = [strides, strides]
+            strides = [strides, strides, 1]  # Default: pool twice, then no pool
+        elif len(strides) == 2:
+            strides = strides + [1]  # Add default no-pool for third layer
+        if n_layers is None:
+            n_layers = [4, 6, 7]
+        elif isinstance(n_layers, int):
+            n_layers = [n_layers] * 3
         
-        # TaxonConv: outputs 1+2+4+8+16=31 channels for n_layers=4
+        # TaxonConv layer 1: outputs sum(2^i for i in range(n_layers[0]+1)) channels
         self.taxon_conv1 = TaxonConv(
-            in_channels=3, kernel_size=kernel_sizes[0], n_layers=4, temperature=temperature
+            in_channels=3, kernel_size=kernel_sizes[0], n_layers=n_layers[0], temperature=temperature
         )
+        out_channels_1 = sum(2**i for i in range(n_layers[0]+1))
         
-        # TaxonConv: outputs 1+2+4+8+16+32+64=127 channels for n_layers=6
+        # TaxonConv layer 2
         self.taxon_conv2 = TaxonConv(
-            in_channels=31, kernel_size=kernel_sizes[1], n_layers=6, temperature=temperature
+            in_channels=out_channels_1, kernel_size=kernel_sizes[1], n_layers=n_layers[1], temperature=temperature
         )
+        out_channels_2 = sum(2**i for i in range(n_layers[1]+1))
         
-        # TaxonConv: outputs 1+2+4+8+16+32+64+128=255 channels for n_layers=7
+        # TaxonConv layer 3
         self.taxon_conv3 = TaxonConv(
-            in_channels=127, kernel_size=kernel_sizes[2], n_layers=7, temperature=temperature
+            in_channels=out_channels_2, kernel_size=kernel_sizes[2], n_layers=n_layers[2], temperature=temperature
         )
+        out_channels_3 = sum(2**i for i in range(n_layers[2]+1))
         
         self.pool_stride1 = strides[0]
         self.pool_stride2 = strides[1]
+        self.pool_stride3 = strides[2]
         
         # Calculate final spatial size
         final_size = 32
         final_size = final_size // self.pool_stride1
         final_size = final_size // self.pool_stride2
+        final_size = final_size // self.pool_stride3
         
         # Fully connected to latent space
-        self.fc = nn.Linear(255 * final_size * final_size, latent_dim)
+        self.fc = nn.Linear(out_channels_3 * final_size * final_size, latent_dim)
         
     def forward(self, x):
         # Layer 1
@@ -95,6 +110,11 @@ class CIFAR10TaxonEncoder(nn.Module):
         # Layer 3
         x = self.taxon_conv3(x)
         x = F.relu(x)
+        if self.pool_stride3 > 1:
+            if self.use_maxpool:
+                x = F.max_pool2d(x, self.pool_stride3)
+            else:
+                x = F.avg_pool2d(x, self.pool_stride3)
         
         x = x.view(x.size(0), -1)
         x = self.fc(x)

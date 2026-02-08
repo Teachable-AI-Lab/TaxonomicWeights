@@ -41,7 +41,8 @@ class CIFAR10TaxonAutoencoder(nn.Module):
     
     def __init__(self, latent_dim=256, temperature=1.0, encoder_kernel_sizes=3,
                  decoder_kernel_sizes=None, encoder_strides=2, decoder_strides=None,
-                 decoder_paddings=None, use_maxpool=True):
+                 encoder_n_layers=None, decoder_n_layers=None,
+                 decoder_paddings=None, decoder_output_paddings=None, use_maxpool=True):
         super(CIFAR10TaxonAutoencoder, self).__init__()
         self.latent_dim = latent_dim
         
@@ -57,6 +58,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             temperature=temperature,
             kernel_sizes=encoder_kernel_sizes,
             strides=encoder_strides,
+            n_layers=encoder_n_layers,
             use_maxpool=use_maxpool
         )
         self.decoder = CIFAR10TaxonDecoder(
@@ -64,6 +66,9 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             temperature=temperature,
             kernel_sizes=decoder_kernel_sizes,
             strides=decoder_strides,
+            paddings=decoder_paddings,
+            output_paddings=decoder_output_paddings,
+            n_layers=decoder_n_layers,
             initial_spatial_size=initial_size
         )
         
