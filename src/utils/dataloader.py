@@ -3,6 +3,7 @@ import random
 import numpy as np
 from torchvision import transforms, datasets
 from torch.utils.data import DataLoader, Dataset, Subset
+from pathlib import Path
 
 class TargetRemappedSubset(Dataset):
     """
@@ -119,7 +120,7 @@ class ImageNetLoader:
     def get_loaders(self):
         """Returns train and validation loaders."""
         return self.train_loader, self.val_loader
-    
+
     def make_random_subset(
         self,
         num_classes: int = 10,
@@ -168,7 +169,7 @@ class ImageNetLoader:
         base_subset = Subset(self.train_dataset, subset_inds)
         remapped = TargetRemappedSubset(base_subset, class_map)
         return remapped, selected_classes
-    
+
     def create_subset_loader(
         self,
         num_classes: int = 10,
@@ -207,3 +208,133 @@ class ImageNetLoader:
         )
         
         return subset_loader, selected_classes
+
+
+class CelebAHQLoader:
+    """
+    DataLoader wrapper for CelebA-HQ stored in an ImageFolder-style directory.
+
+    Directory layout options:
+    1) data_root/train and data_root/val (preferred)
+    2) data_root only: a random val_split is carved out.
+    3) If data_root doesn't exist: Falls back to datasets.CelebA (30k subset)
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        batch_size: int = 16,
+        num_workers: int = 4,
+        image_size: int = 256,
+        val_split: float = 0.05,
+        seed: int = 42,
+        pin_memory: bool = True,
+    ):
+        self.data_root = Path(data_root)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),  # Scales to [0, 1]
+        ])
+
+        train_dir = self.data_root / "train"
+        val_dir = self.data_root / "val"
+
+        # Check if data exists at data_root
+        data_exists = False
+        if train_dir.exists() and any(train_dir.iterdir()):
+            data_exists = True
+        elif self.data_root.exists() and any(self.data_root.iterdir()):
+            # Check if it's a valid ImageFolder structure
+            try:
+                test_dataset = datasets.ImageFolder(root=str(self.data_root), transform=None)
+                if len(test_dataset) > 0:
+                    data_exists = True
+            except:
+                data_exists = False
+
+        if not data_exists:
+            # Fallback to CelebA dataset
+            print("=" * 70)
+            print("WARNING: CelebA-HQ data not found at:", self.data_root)
+            print("Falling back to torchvision's CelebA dataset (30k subset)")
+            print("This is a temporary solution - please obtain CelebA-HQ for full quality")
+            print("=" * 70)
+            
+            # Download and use CelebA
+            celeba_root = self.data_root.parent / "celeba_fallback"
+            celeba_root.mkdir(parents=True, exist_ok=True)
+            
+            full_celeba = datasets.CelebA(
+                root=str(celeba_root),
+                split='train',
+                transform=self.transform,
+                download=True
+            )
+            
+            # Create a 30k subset
+            subset_size = min(30000, len(full_celeba))
+            indices = list(range(subset_size))
+            random.seed(seed)
+            random.shuffle(indices)
+            
+            full_subset = Subset(full_celeba, indices)
+            
+            if val_split > 0:
+                val_size = int(subset_size * val_split)
+                train_size = subset_size - val_size
+                self.trainset, self.valset = torch.utils.data.random_split(
+                    full_subset,
+                    [train_size, val_size],
+                    generator=torch.Generator().manual_seed(seed)
+                )
+            else:
+                self.trainset = full_subset
+                self.valset = None
+            
+        elif train_dir.exists():
+            self.trainset = datasets.ImageFolder(root=str(train_dir), transform=self.transform)
+            if val_dir.exists():
+                self.valset = datasets.ImageFolder(root=str(val_dir), transform=self.transform)
+            else:
+                self.valset = None
+        else:
+            # Single directory: split into train/val
+            full_dataset = datasets.ImageFolder(root=str(self.data_root), transform=self.transform)
+            if val_split > 0:
+                val_size = int(len(full_dataset) * val_split)
+                train_size = len(full_dataset) - val_size
+                self.trainset, self.valset = torch.utils.data.random_split(
+                    full_dataset,
+                    [train_size, val_size],
+                    generator=torch.Generator().manual_seed(seed)
+                )
+            else:
+                self.trainset = full_dataset
+                self.valset = None
+
+        self.train_loader = DataLoader(
+            self.trainset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+
+        self.val_loader = None
+        if self.valset is not None:
+            self.val_loader = DataLoader(
+                self.valset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                drop_last=False,
+            )
+
+    def get_loaders(self):
+        return self.train_loader, self.val_loader

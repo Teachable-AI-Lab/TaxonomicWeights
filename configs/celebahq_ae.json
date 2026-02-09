@@ -1,0 +1,175 @@
+{
+  "_comment": "Taxonomic CelebA-HQ autoencoder matching the specified architecture with hierarchical filters",
+  "description": "CelebA-HQ Taxonomic Autoencoder: 10 encoder layers (5 blocks × 2) and 8 decoder layers (4 blocks × 2), spatial latent 16x16x511",
+  "experiment_name": "celebahq_taxonomic",
+  "data": {
+    "data_root": "./data/celeba_hq",
+    "batch_size": 16,
+    "num_workers": 4,
+    "image_size": 256,
+    "val_split": 0.05
+  },
+  "model": {
+    "latent_dim": 256,
+    "temperature": 1.0,
+    "use_maxpool": true,
+    "output_activation": "sigmoid",
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 1, Layer 1: 256x256x3 -> 256x256x31 (2^5=32 leaf filters, 31 total)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "_comment": "Block 1, Layer 2: 256x256x31 -> MaxPool -> 128x128x31"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 2, Layer 1: 128x128x31 -> 128x128x63 (2^6=64 leaf filters, 63 total)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "_comment": "Block 2, Layer 2: 128x128x63 -> MaxPool -> 64x64x63"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 3, Layer 1: 64x64x63 -> 64x64x127 (2^7=128 leaf filters, 127 total)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 2,
+        "_comment": "Block 3, Layer 2: 64x64x127 -> MaxPool -> 32x32x127"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 4, Layer 1: 32x32x127 -> 32x32x255 (2^8=256 leaf filters, 255 total)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 2,
+        "_comment": "Block 4, Layer 2: 32x32x255 -> MaxPool -> 16x16x255"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 9,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 5, Layer 1: 16x16x255 -> 16x16x511 (2^9=512 leaf filters, 511 total)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 9,
+        "kernel_size": 3,
+        "stride": 1,
+        "_comment": "Block 5, Layer 2 (latent): 16x16x511 -> 16x16x511"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 9,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 1, Layer 1 (DECONV - upsample): 16x16x511 -> 32x32x511"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 1, Layer 2 (CONV - refine): 32x32x511 -> 32x32x255"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 2, Layer 1 (DECONV - upsample): 32x32x255 -> 64x64x255"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 2, Layer 2 (CONV - refine): 64x64x255 -> 64x64x127"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 3, Layer 1 (DECONV - upsample): 64x64x127 -> 128x128x127"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 3, Layer 2 (CONV - refine): 128x128x127 -> 128x128x63"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 4, Layer 1 (DECONV - upsample): 128x128x63 -> 256x256x63"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 4, Layer 2 (CONV - refine): 256x256x63 -> 256x256x31, then final conv to 256x256x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 20,
+    "learning_rate": 0.0001
+  },
+  "analysis": {
+    "num_batches": 10
+  },
+  "output": {
+    "training_save_dir": "outputs/celebahq/training/celebahq_taxonomic",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_taxonomic"
+  }
+}

@@ -36,7 +36,9 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
                encoder_n_filters=None, decoder_n_filters=None,
                encoder_layer_types=None, decoder_layer_types=None,
                decoder_paddings=None, decoder_output_paddings=None, 
-               use_maxpool=True):
+               use_maxpool=True, random_init_alphas=False,
+               alpha_init_distribution="uniform", alpha_init_range=None,
+               alpha_init_seed=None):
     """Load trained model from checkpoint."""
     model = CIFAR10TaxonAutoencoder(
         latent_dim=latent_dim, 
@@ -53,7 +55,11 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
         decoder_layer_types=decoder_layer_types,
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
-        use_maxpool=use_maxpool
+        use_maxpool=use_maxpool,
+        random_init_alphas=random_init_alphas,
+        alpha_init_distribution=alpha_init_distribution,
+        alpha_init_range=alpha_init_range,
+        alpha_init_seed=alpha_init_seed
     )
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -979,6 +985,10 @@ def main():
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
         use_maxpool = config['model']['use_maxpool']
+        random_init_alphas = config['model'].get('random_init_alphas', False)
+        alpha_init_distribution = config['model'].get('alpha_init_distribution', 'uniform')
+        alpha_init_range = config['model'].get('alpha_init_range', None)
+        alpha_init_seed = config['model'].get('alpha_init_seed', None)
         
         # Parse layer configurations (supports both formats)
         layer_params = parse_layer_config(config)
@@ -1029,6 +1039,10 @@ def main():
         decoder_paddings = None
         decoder_output_paddings = None
         use_maxpool = True
+        random_init_alphas = False
+        alpha_init_distribution = 'uniform'
+        alpha_init_range = None
+        alpha_init_seed = None
         num_latent_batches = 50
         num_reconstruction_batches = 20
         num_multiple_recon_images = 8
@@ -1087,6 +1101,7 @@ def main():
     print(f"Encoder strides: {encoder_strides}")
     print(f"Decoder strides: {decoder_strides}")
     print(f"Use max pooling: {use_maxpool}")
+    print(f"Random alpha init: {random_init_alphas} (dist={alpha_init_distribution}, range={alpha_init_range}, seed={alpha_init_seed})")
     print("=" * 60)
     
     # Load model
@@ -1108,7 +1123,11 @@ def main():
         decoder_layer_types=decoder_layer_types,
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
-        use_maxpool=use_maxpool
+        use_maxpool=use_maxpool,
+        random_init_alphas=random_init_alphas,
+        alpha_init_distribution=alpha_init_distribution,
+        alpha_init_range=alpha_init_range,
+        alpha_init_seed=alpha_init_seed
     )
     
     # Load data

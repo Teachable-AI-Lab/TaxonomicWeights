@@ -74,7 +74,9 @@ class TaxonConv(nn.Module):
     >>> print(out.shape)  # torch.Size([2, 15, 32, 32])
     """
     
-    def __init__(self, in_channels=1, kernel_size=5, n_layers=3, temperature=1.0):
+    def __init__(self, in_channels=1, kernel_size=5, n_layers=3, temperature=1.0,
+                 random_init_alphas=False, alpha_init_distribution="uniform",
+                 alpha_init_range=None, alpha_init_seed=None):
         super(TaxonConv, self).__init__()
         self.in_channels = in_channels
         self.temperature = temperature
@@ -94,6 +96,42 @@ class TaxonConv(nn.Module):
         alphas = [nn.Parameter(torch.zeros(2**i, 1)) for i in range(n_layers)]
         alphas.reverse()
         self.alphas = nn.ParameterList(alphas)
+
+        self._init_alphas(random_init_alphas, alpha_init_distribution,
+                          alpha_init_range, alpha_init_seed)
+
+    def _init_alphas(self, random_init_alphas, distribution, value_range, seed):
+        """Initialize alpha parameters with optional randomness.
+
+        If random_init_alphas is False, all alphas stay at 0 so sigmoid → 0.5.
+        """
+        if not random_init_alphas:
+            # Explicitly zero for clarity (sigmoid(0) = 0.5).
+            for alpha in self.alphas:
+                alpha.data.zero_()
+            return
+
+        # Normalize range input
+        if value_range and len(value_range) == 2:
+            low, high = float(value_range[0]), float(value_range[1])
+        else:
+            low, high = -0.5, 0.5
+
+        generator = torch.Generator(device=self.leaves_weights.device)
+        if seed is not None:
+            generator.manual_seed(int(seed))
+
+        dist = (distribution or "uniform").lower()
+        with torch.no_grad():
+            for alpha in self.alphas:
+                if dist in ("uniform", "uniform_weird"):
+                    alpha.data.uniform_(low, high, generator=generator)
+                elif dist == "normal":
+                    mean = 0.5 * (low + high)
+                    std = abs(high - low) / 6 if high != low else 1.0
+                    alpha.data.normal_(mean, std, generator=generator)
+                else:
+                    alpha.data.uniform_(low, high, generator=generator)
 
     def forward(self, x):
         """
@@ -253,7 +291,9 @@ class TaxonDeconv(nn.Module):
     """
     
     def __init__(self, in_channels, out_channels=1, kernel_size=4, n_layers=3, 
-                 stride=2, padding=1, output_padding=0, temperature=1.0):
+                 stride=2, padding=1, output_padding=0, temperature=1.0,
+                 random_init_alphas=False, alpha_init_distribution="uniform",
+                 alpha_init_range=None, alpha_init_seed=None):
         super(TaxonDeconv, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -277,6 +317,36 @@ class TaxonDeconv(nn.Module):
         alphas = [nn.Parameter(torch.zeros(2**i, 1)) for i in range(n_layers)]
         alphas.reverse()
         self.alphas = nn.ParameterList(alphas)
+
+        self._init_alphas(random_init_alphas, alpha_init_distribution,
+                          alpha_init_range, alpha_init_seed)
+
+    def _init_alphas(self, random_init_alphas, distribution, value_range, seed):
+        if not random_init_alphas:
+            for alpha in self.alphas:
+                alpha.data.zero_()
+            return
+
+        if value_range and len(value_range) == 2:
+            low, high = float(value_range[0]), float(value_range[1])
+        else:
+            low, high = -0.5, 0.5
+
+        generator = torch.Generator(device=self.leaves_weights.device)
+        if seed is not None:
+            generator.manual_seed(int(seed))
+
+        dist = (distribution or "uniform").lower()
+        with torch.no_grad():
+            for alpha in self.alphas:
+                if dist in ("uniform", "uniform_weird"):
+                    alpha.data.uniform_(low, high, generator=generator)
+                elif dist == "normal":
+                    mean = 0.5 * (low + high)
+                    std = abs(high - low) / 6 if high != low else 1.0
+                    alpha.data.normal_(mean, std, generator=generator)
+                else:
+                    alpha.data.uniform_(low, high, generator=generator)
 
     def forward(self, x):
         """

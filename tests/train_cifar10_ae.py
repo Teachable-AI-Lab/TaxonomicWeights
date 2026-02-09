@@ -261,6 +261,10 @@ def main():
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
         use_maxpool = config['model']['use_maxpool']
+        random_init_alphas = config['model'].get('random_init_alphas', False)
+        alpha_init_distribution = config['model'].get('alpha_init_distribution', 'uniform')
+        alpha_init_range = config['model'].get('alpha_init_range', None)
+        alpha_init_seed = config['model'].get('alpha_init_seed', None)
         
         # Parse layer configurations (supports both formats)
         layer_params = parse_layer_config(config)
@@ -304,6 +308,10 @@ def main():
         decoder_paddings = None
         decoder_output_paddings = None
         use_maxpool = True
+        random_init_alphas = False
+        alpha_init_distribution = 'uniform'
+        alpha_init_range = None
+        alpha_init_seed = None
         save_dir_prefix = 'outputs/training'
     
     # Command line args override config
@@ -339,6 +347,7 @@ def main():
     print(f"Encoder strides: {encoder_strides}")
     print(f"Decoder strides: {decoder_strides if decoder_strides else '[2, 2, 1] (default)'}")
     print(f"Use max pooling: {use_maxpool}")
+    print(f"Random alpha init: {random_init_alphas} (dist={alpha_init_distribution}, range={alpha_init_range}, seed={alpha_init_seed})")
     print(f"Data directory: {data_root}")
     print(f"Save directory: {save_dir}")
     print("=" * 60)
@@ -367,7 +376,11 @@ def main():
         decoder_layer_types=decoder_layer_types,
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
-        use_maxpool=use_maxpool
+        use_maxpool=use_maxpool,
+        random_init_alphas=random_init_alphas,
+        alpha_init_distribution=alpha_init_distribution,
+        alpha_init_range=alpha_init_range,
+        alpha_init_seed=alpha_init_seed
     )
     
     # Train

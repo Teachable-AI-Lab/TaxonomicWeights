@@ -14,7 +14,7 @@
 
 export PYTHONUNBUFFERED=TRUE
 source ~/.bashrc
-conda activate rag-cobweb
+conda activate taxon-weights
 cd ~/flash/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
