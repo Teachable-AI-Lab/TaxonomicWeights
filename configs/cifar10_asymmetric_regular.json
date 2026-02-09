@@ -1,0 +1,76 @@
+{
+  "_comment": "Asymmetric autoencoder using regular Conv2d/ConvTranspose2d layers (no taxonomy)",
+  "description": "Regular CIFAR-10 Autoencoder: 3 encoder layers (32x32->8x8) and 2 decoder layers (8x8->32x32) with standard convolutions",
+  "experiment_name": "asymmetric_regular",
+  "data": {
+    "batch_size": 128,
+    "data_root": "./data/cifar10"
+  },
+  "model": {
+    "latent_dim": 256,
+    "temperature": 1.0,
+    "use_maxpool": true,
+    "encoder_layers": [
+      {
+        "layer_type": "conv",
+        "n_filters": 63,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "32x32x3 -> 16x16x63"
+      },
+      {
+        "layer_type": "conv",
+        "n_filters": 127,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "16x16x63 -> 8x8x127"
+      },
+      {
+        "layer_type": "conv",
+        "n_filters": 255,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "8x8x127 -> 8x8x255 (latent space)"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "deconv",
+        "n_filters": 127,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "8x8x255 -> 16x16x127"
+      },
+      {
+        "layer_type": "deconv",
+        "n_filters": 63,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "16x16x127 -> 32x32x63, then final conv to 32x32x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 20,
+    "learning_rate": 0.001
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/training/asymmetric_regular/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/training/asymmetric_regular",
+    "analysis_save_dir": "outputs/analysis/asymmetric_regular"
+  }
+}

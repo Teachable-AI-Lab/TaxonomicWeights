@@ -97,7 +97,9 @@ class CIFAR10TaxonEncoder(nn.Module):
         self.conv_layers = nn.ModuleList()
         in_ch = 3
         for i in range(self.num_layers):
-            if layer_types[i] == 'taxonomic':
+            layer_type = layer_types[i]
+            
+            if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
                 # Use TaxonConv
                 conv = TaxonConv(
                     in_channels=in_ch, 
@@ -106,7 +108,7 @@ class CIFAR10TaxonEncoder(nn.Module):
                     temperature=temperature
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
-            else:
+            elif layer_type == 'conv':
                 # Use regular Conv2d
                 out_ch = n_filters[i] if n_filters else 64
                 conv = nn.Conv2d(
@@ -116,6 +118,8 @@ class CIFAR10TaxonEncoder(nn.Module):
                     padding=kernel_sizes[i] // 2,
                     bias=True
                 )
+            else:
+                raise ValueError(f"Unknown layer_type in encoder: {layer_type}")
             
             self.conv_layers.append(conv)
             in_ch = out_ch

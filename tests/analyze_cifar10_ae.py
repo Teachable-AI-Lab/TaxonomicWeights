@@ -25,6 +25,7 @@ import networkx as nx
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CIFAR10TaxonAutoencoder
+from src.model.taxon_layers import TaxonConv, TaxonDeconv
 from src.utils.dataloader import CIFAR10Loader
 
 
@@ -192,15 +193,17 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1',
     print(f"Deconv filter visualizations saved to {layer_dir}")
 
 
-def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
-    """Visualize the taxonomic hierarchy as a tree with alpha parameters and filter images.
+def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activations=None):
+    """Visualize the taxonomic hierarchy as a tree with alpha parameters and filter/activation images.
     
     Args:
         layer: TaxonConv or TaxonDeconv layer
         layer_name: Name for the layer (e.g., 'taxon_conv1')
         save_dir: Directory to save visualization
         max_depth: Maximum depth to visualize (including root)
+        activations: Optional activation tensor (1, C, H, W) to visualize activations instead of filters
     """
+    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
     
     # Get alpha parameters and apply sigmoid (alphas is a ParameterList)
     # Each element in alphas has shape (2^i, 1) where i is the level
@@ -212,39 +215,49 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
         print(f"  Alpha level {i}: shape {alpha_sig.shape}, mean={alpha_sig.mean():.4f}, "
               f"min={alpha_sig.min():.4f}, max={alpha_sig.max():.4f}")
     
-    # Get hierarchy weights (filters at each level)
-    hierarchy_weights = layer.get_hierarchy_weights()
+    # Get hierarchy weights (filters at each level) or use activations
+    is_deconv = isinstance(layer, TaxonDeconv)
+    if activations is not None:
+        # Use activations instead of filters
+        acts = activations[0].detach().cpu().numpy()  # (C, H, W)
+        image_type = "activations"
+    else:
+        hierarchy_weights = layer.get_hierarchy_weights()
+        image_type = "filters"
     
     # Determine actual depth (including root = depth 0)
     n_layers = layer.n_layers
-    actual_depth = min(n_layers + 1, max_depth)  # +1 for root
+    actual_depth = min(n_layers + 1, max_depth, 4)  # Cap at 4 layers
     
-    # Create figure with larger size
+    # Create figure with larger size to accommodate high-resolution images
     max_nodes = 2 ** (actual_depth - 1)
-    fig_width = max(30, max_nodes * 2.5)  # Increased from *1.5 to *2.5
-    fig_height = 18  # Increased from 12 to 18
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    # Scale up for high-resolution images
+    fig_width = max(60, max_nodes * 6.0)  # Horizontal space unchanged
+    fig_height = 30  # Condensed height to ~1/3 of previous
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=100)
     ax.axis('off')
     
     # Track node positions and connections
     positions = {}
     node_labels = {}
-    node_filter_indices = {}
+    node_image_indices = {}  # Will store either (level, filter_idx) or (start_ch, end_ch)
     edges = []
     edge_labels = {}
     
-    # Build tree structure with better layout
-    # Use a proper tree layout where each level gets equal vertical spacing
-    # and horizontal spacing is proportional to the number of nodes
-    
     # Level 0: Root
-    node_id = 0
-    positions[0] = (0.5, 0.95)  # Top center
+    positions[0] = (0.5, 0.88)  # Moved down from 0.95 to leave space for title
     node_labels[0] = "Root"
-    node_filter_indices[0] = (0, 0)
-    
+
+    # Channel accounting per node
+    per_node_channels = 1 if not is_deconv else layer.out_channels
+    if image_type == "activations":
+        node_image_indices[0] = (0, per_node_channels)
+    else:
+        node_image_indices[0] = (0, 0)  # (level, filter_idx)
+
     node_counter = 1
-    vertical_spacing = 0.9 / actual_depth  # Increased back to 0.9 for more spacing
+    cumulative_start = per_node_channels  # next available channel start
+    vertical_spacing = 0.55 / actual_depth  # Condensed vertical spacing
     
     # Process each level
     for level in range(1, actual_depth):
@@ -252,11 +265,11 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
             break
             
         num_nodes = 2 ** level
-        y_pos = 0.95 - level * vertical_spacing
+        y_pos = 0.88 - level * vertical_spacing  # Adjusted to match new root position
         
         # Horizontal spacing: spread nodes evenly across width
         # Add padding on the sides
-        padding = 0.05
+        padding = 0.10  # Increased padding for better horizontal spacing
         available_width = 1.0 - 2 * padding
         
         for node_idx in range(num_nodes):
@@ -270,7 +283,15 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
             
             positions[node_id] = (x_pos, y_pos)
             node_labels[node_id] = f"L{level}N{node_idx}"
-            node_filter_indices[node_id] = (level, node_idx)
+
+            # Store image index differently based on type
+            if image_type == "activations":
+                start_ch = cumulative_start + node_idx * per_node_channels
+                end_ch = start_ch + per_node_channels
+                node_image_indices[node_id] = (start_ch, end_ch)
+            else:
+                # For filters: use (level, filter_idx)
+                node_image_indices[node_id] = (level, node_idx)
             
             # Find parent - FIXED CALCULATION
             parent_idx = node_idx // 2
@@ -300,36 +321,90 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
                     edges.append((parent_id, node_id))
                     edge_labels[(parent_id, node_id)] = ""
         
+        if image_type == "activations":
+            cumulative_start += per_node_channels * num_nodes
         node_counter += num_nodes
     
-    # Pre-render all filter thumbnails to avoid expensive inline rendering
-    filter_thumbnails = {}
-    print(f"  Pre-rendering {len(positions)} filter thumbnails...")
+    # Pre-render all image thumbnails to avoid expensive inline rendering
+    image_thumbnails = {}
+    image_sizes = {}
+    print(f"  Pre-rendering {len(positions)} {image_type} thumbnails...")
     for node_id, (x, y) in positions.items():
-        level_idx, filter_idx = node_filter_indices[node_id]
+        img_idx = node_image_indices[node_id]
         
-        if level_idx < len(hierarchy_weights):
-            w_np = hierarchy_weights[level_idx].detach().cpu().numpy()
-            
-            # Handle different weight shapes
-            if len(w_np.shape) == 4:
-                if filter_idx >= w_np.shape[0]:
-                    filter_idx = 0
+        if image_type == "activations":
+            # img_idx is a channel slice (start, end)
+            start_ch, end_ch = img_idx
+            if end_ch <= acts.shape[0]:
+                # Aggregate across the slice (mean over channels within the node)
+                img_data = acts[start_ch:end_ch, :, :].mean(axis=0)
                 
-                # Get filter and average across input channels
-                filt = w_np[filter_idx, :, :, :]
-                filt = filt.mean(axis=0)
-            else:
-                filt = w_np[0] if len(w_np.shape) > 0 else w_np
+                # Store original size
+                image_sizes[node_id] = img_data.shape
+                
+                # Normalize to [0, 1] - NO RESIZING, keep original resolution
+                img_min, img_max = img_data.min(), img_data.max()
+                if img_max > img_min:
+                    img_norm = (img_data - img_min) / (img_max - img_min)
+                else:
+                    img_norm = np.zeros_like(img_data)
+                
+                image_thumbnails[node_id] = img_norm
+        else:
+            # img_idx is (level, filter_idx) for filters
+            level_idx, filter_idx = img_idx
             
-            # Normalize to [0, 1]
-            fmin, fmax = filt.min(), filt.max()
-            if fmax > fmin:
-                filt_norm = (filt - fmin) / (fmax - fmin)
-            else:
-                filt_norm = np.zeros_like(filt)
-            
-            filter_thumbnails[node_id] = filt_norm
+            if level_idx < len(hierarchy_weights):
+                w_np = hierarchy_weights[level_idx].detach().cpu().numpy()
+                
+                # Handle Conv vs Deconv shapes
+                if len(w_np.shape) == 4 and w_np.shape[0] == layer.in_channels:
+                    # Deconv: (in_ch, out_ch * nodes, k, k)
+                    nodes = 2 ** level_idx
+                    out_ch = layer.out_channels
+                    w_np = w_np.transpose(1, 0, 2, 3)  # (out_ch*nodes, in_ch, k, k)
+                    w_np = w_np.reshape(nodes, out_ch, layer.in_channels, w_np.shape[2], w_np.shape[3])
+                    if filter_idx >= nodes:
+                        filter_idx = 0
+                    img_data = w_np[filter_idx].mean(axis=0).mean(axis=0)
+                elif len(w_np.shape) == 4:
+                    # Conv: (num_filters, in_ch, k, k)
+                    if filter_idx >= w_np.shape[0]:
+                        filter_idx = 0
+                    img_data = w_np[filter_idx, :, :, :]
+                    img_data = img_data.mean(axis=0)
+                else:
+                    img_data = w_np[0] if len(w_np.shape) > 0 else w_np
+                
+                # Store original size
+                image_sizes[node_id] = img_data.shape
+                
+                # Normalize to [0, 1]
+                img_min, img_max = img_data.min(), img_data.max()
+                if img_max > img_min:
+                    img_norm = (img_data - img_min) / (img_max - img_min)
+                else:
+                    img_norm = np.zeros_like(img_data)
+                
+                image_thumbnails[node_id] = img_norm
+    
+    # Determine zoom based on image size to maintain consistent visual size
+    # Target visual size in inches (adjust as needed)
+    if image_type == "activations":
+        target_size_inches = 2.5  # Larger activations
+    else:
+        target_size_inches = 2.5  # Larger filters
+    
+    # Get a representative image size
+    if image_sizes:
+        sample_size = list(image_sizes.values())[0]
+        sample_pixels = max(sample_size)
+        # Calculate zoom to achieve target size
+        # zoom * pixels / dpi = inches, so zoom = inches * dpi / pixels
+        # Assume 100 dpi for OffsetImage
+        base_zoom = (target_size_inches * 100) / sample_pixels
+    else:
+        base_zoom = 35.0
     
     # Draw edges first (so they appear behind nodes)
     print(f"  Drawing {len(edges)} edges...")
@@ -338,41 +413,40 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
         cx, cy = positions[child_id]
         
         # Draw line with minimal thickness
-        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)  # Reduced from 1.5 to 0.5
+        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)
         
         # Add alpha label at midpoint
         mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
         label = edge_labels[(parent_id, child_id)]
         
         if label:  # Only draw label if it exists
-            bbox_props = dict(boxstyle='round,pad=0.6', facecolor='lightyellow', 
-                             edgecolor='gray', alpha=0.9, linewidth=1.0)  # Even larger padding and border
-            ax.text(mid_x, mid_y, label, ha='center', va='center', 
-                    fontsize=14, fontweight='bold', bbox=bbox_props, zorder=2)  # Increased from 12 to 14
+                bbox_props = dict(boxstyle='round,pad=0.7', facecolor='lightyellow', 
+                         edgecolor='gray', alpha=0.9, linewidth=1.3)
+                ax.text(mid_x, mid_y, label, ha='center', va='center', 
+                    fontsize=16, fontweight='bold', bbox=bbox_props, zorder=2)
     
-    # Draw nodes with filter visualizations using OffsetImage for better control
-    print(f"  Drawing {len(positions)} nodes with filters...")
+    # Draw nodes with image visualizations using OffsetImage for better control
+    print(f"  Drawing {len(positions)} nodes with {image_type}...")
     from matplotlib.offsetbox import OffsetImage, AnnotationBbox
     
-    zoom = 35.0  # Increased from 25.0 to 35.0 for even bigger filters
-    
     for node_id, (x, y) in positions.items():
-        if node_id in filter_thumbnails:
-            # Create OffsetImage from the filter data
-            imagebox = OffsetImage(filter_thumbnails[node_id], cmap='viridis', zoom=zoom)
+        if node_id in image_thumbnails:
+            # Use nearest-neighbor interpolation to preserve pixel boundaries
+            imagebox = OffsetImage(image_thumbnails[node_id], cmap='viridis', 
+                                 zoom=base_zoom, interpolation='nearest')
             imagebox.image.axes = ax
             
             # Create AnnotationBbox to place the image
             ab = AnnotationBbox(imagebox, (x, y),
                                frameon=True,
                                pad=0.0,
-                               bboxprops=dict(edgecolor='black', linewidth=1.5, facecolor='none'))  # Increased from 1.0 to 1.5
+                               bboxprops=dict(edgecolor='black', linewidth=1.5, facecolor='none'))
             ax.add_artist(ab)
             
-            # Add label below (estimate image height for positioning)
-            label_offset = 0.18  # Increased from 0.15 to account for bigger filters
+            # Add label below
+            label_offset = 0.08  # Reduced to bring labels closer to images
             ax.text(x, y - label_offset, node_labels[node_id], 
-                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)  # Increased from 8 to 11
+                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)
         else:
             # Fallback: draw circle
             circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black', linewidth=2, zorder=3)
@@ -380,35 +454,38 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
             ax.text(x, y - 0.03, node_labels[node_id], 
                     ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
     
-    # Add title with layer info
+    # Add title with layer info and extra padding
     print(f"  Adding title and saving...")
-    title = f"{layer_name} Taxonomy Tree\n"
+    title_text = f"{layer_name} Taxonomy Tree\n"
     if actual_depth < n_layers + 1:
-        title += f"(Showing first {actual_depth} levels, truncated from {n_layers + 1})"
+        title_text += f"(Showing first {actual_depth} levels, truncated from {n_layers + 1})"
     else:
-        title += f"(Full hierarchy: {actual_depth} levels)"
+        title_text += f"(Full hierarchy: {actual_depth} levels)"
     
-    ax.set_title(title, fontsize=18, fontweight='bold', pad=20)  # Increased from 14 to 18
+    # Use text instead of set_title for better control of positioning
+    ax.text(0.5, 0.98, title_text, ha='center', va='top', 
+            transform=ax.transAxes, fontsize=18, fontweight='bold')
     
     # Add legend
     legend_text = (
         f"Total layers: {n_layers}\n"
         f"Nodes at each level: 1, 2, 4, 8, ...\n"
-        f"α = Sigmoid weight for child selection"
+        f"α = Sigmoid weight for child selection\n"
+        f"{'Brighter = Higher activation' if image_type == 'activations' else 'Filter weights shown'}"
     )
     ax.text(0.02, 0.98, legend_text, transform=ax.transAxes,
-            fontsize=11, verticalalignment='top',  # Increased from 9 to 11
+            fontsize=11, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # Save with lower DPI for faster rendering
-    tree_dir = os.path.join(save_dir, 'taxonomy_trees')
-    os.makedirs(tree_dir, exist_ok=True)
-    save_path = os.path.join(tree_dir, f'{layer_name}_tree.png')
+    # Save with higher DPI to preserve detail
+    os.makedirs(save_dir, exist_ok=True)
+    safe_name = layer_name.lower().replace(' ', '_')
+    save_path = os.path.join(save_dir, f'{safe_name}_tree.png')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     
-    print(f"  Saved taxonomy tree to {save_path}")
+    print(f"  Saved taxonomy tree to {save_path} (full resolution preserved)")
 
 
 def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50):
@@ -620,7 +697,16 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             # Process each encoder layer
             for i, conv_layer in enumerate(model.encoder.conv_layers):
                 x = conv_layer(x)
-                visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'), f'Encoder Layer {i+1}', max_maps=16)
+                
+                # Check if this is a TaxonConv layer
+                if isinstance(conv_layer, TaxonConv):
+                    visualize_taxonomy_tree(conv_layer, f'Encoder Layer {i+1}', img_dir, 
+                                          max_depth=4, activations=x)
+                else:
+                    # Regular conv - use grid visualization
+                    visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
+                                         f'Encoder Layer {i+1}', max_maps=16)
+                
                 x = F.relu(x)
                 if i < len(model.encoder.strides) and model.encoder.strides[i] > 1:
                     if model.encoder.use_maxpool:
@@ -652,7 +738,16 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             # Process each decoder layer
             for i, deconv_layer in enumerate(model.decoder.deconv_layers):
                 x = deconv_layer(x)
-                visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'), f'Decoder Layer {i+1}', max_maps=16)
+                
+                # Check if this is a TaxonDeconv or TaxonConv layer
+                if isinstance(deconv_layer, (TaxonDeconv, TaxonConv)):
+                    visualize_taxonomy_tree(deconv_layer, f'Decoder Layer {i+1}', img_dir,
+                                          max_depth=4, activations=x)
+                else:
+                    # Regular deconv - use grid visualization
+                    visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
+                                         f'Decoder Layer {i+1}', max_maps=16)
+                
                 x = F.relu(x)
             
             # Final Conv2D layer to RGB
@@ -1041,7 +1136,8 @@ def main():
     
     for layer, layer_name in encoder_layers:
         print(f"\nProcessing {layer_name}...")
-        visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4)
+        layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
+        visualize_taxonomy_tree(layer, layer_name, layer_save_dir, max_depth=4)
     
     # Analysis 3: Visualize decoder Deconv filters
     print("\n" + "=" * 60)
@@ -1063,7 +1159,8 @@ def main():
     
     for layer, layer_name in decoder_layers:
         print(f"\nProcessing {layer_name}...")
-        visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4)
+        layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
+        visualize_taxonomy_tree(layer, layer_name, layer_save_dir, max_depth=4)
     
     # Note: final_conv is now a regular Conv2D, not a TaxonConv, so we skip its visualization
     print(f"\nSkipping final_conv - it's a regular Conv2D for RGB projection")

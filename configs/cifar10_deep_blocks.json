@@ -12,7 +12,7 @@
     "use_maxpool": true,
     "encoder_layers": [
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 5,
         "kernel_size": 3,
         "stride": 1,
@@ -20,7 +20,7 @@
         "_comment": "Block 1, Layer 1: 32x32x3 -> 32x32x63 (2^5=32 leaf filters)"
       },
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 5,
         "kernel_size": 3,
         "stride": 2,
@@ -28,7 +28,7 @@
         "_comment": "Block 1, Layer 2: 32x32x63 -> 32x32x63 -> MaxPool -> 16x16x63"
       },
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 6,
         "kernel_size": 3,
         "stride": 1,
@@ -36,7 +36,7 @@
         "_comment": "Block 2, Layer 1: 16x16x63 -> 16x16x127 (2^6=64 leaf filters)"
       },
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 6,
         "kernel_size": 3,
         "stride": 2,
@@ -44,7 +44,7 @@
         "_comment": "Block 2, Layer 2: 16x16x127 -> 16x16x127 -> MaxPool -> 8x8x127"
       },
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 7,
         "kernel_size": 3,
         "stride": 1,
@@ -52,7 +52,7 @@
         "_comment": "Block 3, Layer 1: 8x8x127 -> 8x8x255 (2^7=128 leaf filters)"
       },
       {
-        "layer_type": "taxonomic",
+        "layer_type": "taxonomic_conv",
         "n_layers": 7,
         "kernel_size": 3,
         "stride": 1,
