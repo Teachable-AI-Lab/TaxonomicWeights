@@ -19,7 +19,7 @@ cd ~/flash/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Config file - can be overridden by command line argument
-CONFIG_FILE=${1:-"configs/cifar10_default.json"}
+CONFIG_FILE=${1:-"configs/cifar10_standard.json"}
 
 echo "Starting CIFAR-10 Taxonomic Autoencoder training at $(date)"
 echo "Using config: $CONFIG_FILE"

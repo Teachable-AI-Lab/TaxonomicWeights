@@ -40,6 +40,7 @@ def train_autoencoder(
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+    # criterion = nn.L1Loss()
     
     train_losses = []
     test_losses = []
@@ -163,6 +164,83 @@ def load_config(config_path):
         return json.load(f)
 
 
+def parse_layer_config(config):
+    """Parse layer-by-layer config format and auto-infer parameters.
+    
+    Supports both legacy format (separate lists) and new layer-by-layer format.
+    """
+    model_config = config['model']
+    
+    # Check if using new layer-by-layer format
+    if 'encoder_layers' in model_config:
+        encoder_layers = model_config['encoder_layers']
+        decoder_layers = model_config['decoder_layers']
+        
+        # Extract parameters from layer configs
+        encoder_kernel_sizes = [layer['kernel_size'] for layer in encoder_layers]
+        encoder_strides = [layer['stride'] for layer in encoder_layers]
+        
+        # Check for n_layers (taxonomic) or n_filters (regular)
+        encoder_n_layers = [layer.get('n_layers') for layer in encoder_layers] if 'n_layers' in encoder_layers[0] else None
+        encoder_n_filters = [layer.get('n_filters') for layer in encoder_layers] if 'n_filters' in encoder_layers[0] else None
+        encoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in encoder_layers]
+        
+        decoder_kernel_sizes = [layer['kernel_size'] for layer in decoder_layers]
+        decoder_strides = [layer['stride'] for layer in decoder_layers]
+        decoder_n_layers = [layer.get('n_layers') for layer in decoder_layers] if 'n_layers' in decoder_layers[0] else None
+        decoder_n_filters = [layer.get('n_filters') for layer in decoder_layers] if 'n_filters' in decoder_layers[0] else None
+        decoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in decoder_layers]
+        
+        # Auto-infer decoder paddings if not specified
+        decoder_paddings = []
+        for layer in decoder_layers:
+            if 'padding' in layer:
+                decoder_paddings.append(layer['padding'])
+            else:
+                # Auto-calculate: for kernel k, use k//2
+                k = layer['kernel_size']
+                decoder_paddings.append(k // 2)
+        
+        # Auto-infer decoder output_paddings if not specified
+        decoder_output_paddings = []
+        for layer in decoder_layers:
+            if 'output_padding' in layer:
+                decoder_output_paddings.append(layer['output_padding'])
+            else:
+                # Default: 1 for stride>1, 0 for stride=1
+                decoder_output_paddings.append(1 if layer['stride'] > 1 else 0)
+    else:
+        # Legacy format - use separate lists
+        encoder_kernel_sizes = model_config.get('encoder_kernel_sizes')
+        encoder_strides = model_config.get('encoder_strides')
+        encoder_n_layers = model_config.get('encoder_n_layers', None)
+        encoder_n_filters = model_config.get('encoder_n_filters', None)
+        encoder_layer_types = model_config.get('encoder_layer_types', None)
+        
+        decoder_kernel_sizes = model_config.get('decoder_kernel_sizes')
+        decoder_strides = model_config.get('decoder_strides')
+        decoder_n_layers = model_config.get('decoder_n_layers', None)
+        decoder_n_filters = model_config.get('decoder_n_filters', None)
+        decoder_layer_types = model_config.get('decoder_layer_types', None)
+        decoder_paddings = model_config.get('decoder_paddings', None)
+        decoder_output_paddings = model_config.get('decoder_output_paddings', None)
+    
+    return {
+        'encoder_kernel_sizes': encoder_kernel_sizes,
+        'encoder_strides': encoder_strides,
+        'encoder_n_layers': encoder_n_layers,
+        'encoder_n_filters': encoder_n_filters,
+        'encoder_layer_types': encoder_layer_types,
+        'decoder_kernel_sizes': decoder_kernel_sizes,
+        'decoder_strides': decoder_strides,
+        'decoder_n_layers': decoder_n_layers,
+        'decoder_n_filters': decoder_n_filters,
+        'decoder_layer_types': decoder_layer_types,
+        'decoder_paddings': decoder_paddings,
+        'decoder_output_paddings': decoder_output_paddings
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train CIFAR-10 Taxonomic Autoencoder')
     parser.add_argument('--config', type=str, default=None,
@@ -182,20 +260,33 @@ def main():
         data_root = config['data']['data_root']
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
-        encoder_kernel_sizes = config['model']['encoder_kernel_sizes']
-        decoder_kernel_sizes = config['model']['decoder_kernel_sizes']
-        encoder_strides = config['model']['encoder_strides']
-        decoder_strides = config['model']['decoder_strides']
-        encoder_n_layers = config['model'].get('encoder_n_layers', None)
-        decoder_n_layers = config['model'].get('decoder_n_layers', None)
-        decoder_paddings = config['model'].get('decoder_paddings', None)
-        decoder_output_paddings = config['model'].get('decoder_output_paddings', None)
         use_maxpool = config['model']['use_maxpool']
+        
+        # Parse layer configurations (supports both formats)
+        layer_params = parse_layer_config(config)
+        encoder_kernel_sizes = layer_params['encoder_kernel_sizes']
+        encoder_strides = layer_params['encoder_strides']
+        encoder_n_layers = layer_params['encoder_n_layers']
+        encoder_n_filters = layer_params['encoder_n_filters']
+        encoder_layer_types = layer_params['encoder_layer_types']
+        decoder_kernel_sizes = layer_params['decoder_kernel_sizes']
+        decoder_strides = layer_params['decoder_strides']
+        decoder_n_layers = layer_params['decoder_n_layers']
+        decoder_n_filters = layer_params['decoder_n_filters']
+        decoder_layer_types = layer_params['decoder_layer_types']
+        decoder_paddings = layer_params['decoder_paddings']
+        decoder_output_paddings = layer_params['decoder_output_paddings']
         
         # Training-specific parameters (optional)
         epochs = config.get('training', {}).get('epochs', 20)
         lr = config.get('training', {}).get('learning_rate', 0.001)
-        save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/training')
+        
+        # Use experiment_name from config, or fall back to training_save_dir
+        experiment_name = config.get('experiment_name', None)
+        if experiment_name:
+            save_dir_prefix = f"outputs/training/{experiment_name}"
+        else:
+            save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/training')
     else:
         # Default configuration
         batch_size = 128
@@ -227,7 +318,12 @@ def main():
     if args.temperature is not None:
         temperature = args.temperature
     
-    save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    # Use experiment name if provided in config, otherwise use timestamp
+    if args.config and 'experiment_name' in config:
+        save_dir = save_dir_prefix
+    else:
+        save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print("=" * 60)
@@ -265,6 +361,10 @@ def main():
         decoder_strides=decoder_strides,
         encoder_n_layers=encoder_n_layers,
         decoder_n_layers=decoder_n_layers,
+        encoder_n_filters=encoder_n_filters,
+        decoder_n_filters=decoder_n_filters,
+        encoder_layer_types=encoder_layer_types,
+        decoder_layer_types=decoder_layer_types,
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool

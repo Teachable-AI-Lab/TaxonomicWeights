@@ -20,23 +20,11 @@ export PYTHONPATH=$(pwd)
 
 # Config file or checkpoint path - can be overridden by command line argument
 # If argument looks like a .json file, treat it as config, otherwise as checkpoint
-ARG=${1:-"configs/cifar10_default.json"}
+ARG=${1:-"configs/cifar10_standard.json"}
 
 echo "Starting CIFAR-10 Taxonomic Autoencoder analysis at $(date)"
 
-if [[ "$ARG" == *.json ]]; then
-    echo "Using config file: $ARG"
-    srun python tests/analyze_cifar10_ae.py --config "$ARG"
-else
-    echo "Using checkpoint: $ARG (with default architecture)"
-    # Architecture parameters must match training configuration
-    srun python tests/analyze_cifar10_ae.py \
-        --checkpoint "$ARG" \
-        --encoder-kernel-sizes 5 5 5 \
-        --decoder-kernel-sizes 6 6 5 \
-        --encoder-strides 2 2 \
-        --decoder-strides 2 2 1 \
-        --use-maxpool
-fi
+echo "Using config file: $ARG"
+srun python tests/analyze_cifar10_ae.py --config "$ARG"
 
 echo "Analysis script completed at $(date)"

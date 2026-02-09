@@ -1,0 +1,118 @@
+{
+  "_comment": "Deep block architecture matching the standard Conv2D pattern with taxonomic layers",
+  "description": "Deep CIFAR-10 Taxonomic Autoencoder: 6 encoder layers (2 conv blocks of 2 layers each + 2 latent layers) and 4 decoder layers, no linear bottleneck. Uses n_layers to match filter counts (32->63, 64->127, 128->255)",
+  "experiment_name": "deep_blocks_taxonomic",
+  "data": {
+    "batch_size": 128,
+    "data_root": "./data/cifar10"
+  },
+  "model": {
+    "latent_dim": 256,
+    "temperature": 1.0,
+    "use_maxpool": true,
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "Block 1, Layer 1: 32x32x3 -> 32x32x63 (2^5=32 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "Block 1, Layer 2: 32x32x63 -> 32x32x63 -> MaxPool -> 16x16x63"
+      },
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "Block 2, Layer 1: 16x16x63 -> 16x16x127 (2^6=64 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "Block 2, Layer 2: 16x16x127 -> 16x16x127 -> MaxPool -> 8x8x127"
+      },
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "Block 3, Layer 1: 8x8x127 -> 8x8x255 (2^7=128 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "Block 3, Layer 2 (latent): 8x8x255 -> 8x8x255"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 1, Layer 1 (DECONV - upsample): 8x8x255 -> 16x16x255 (2^7=128 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 1, Layer 2 (CONV - refine): 16x16x255 -> 16x16x127 (2^6=64 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "Block 2, Layer 1 (DECONV - upsample): 16x16x127 -> 32x32x127 (2^6=64 leaf filters)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "output_padding": 0,
+        "_comment": "Block 2, Layer 2 (CONV - refine): 32x32x127 -> 32x32x63 (2^5=32 leaf filters), then final conv to 32x32x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 20,
+    "learning_rate": 0.001
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/training/deep_blocks_taxonomic/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/training/deep_blocks_taxonomic",
+    "analysis_save_dir": "outputs/analysis/deep_blocks_taxonomic"
+  }
+}

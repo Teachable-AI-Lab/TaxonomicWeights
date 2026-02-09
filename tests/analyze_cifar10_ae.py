@@ -16,8 +16,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 from tqdm import tqdm
 from datetime import datetime
+import networkx as nx
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -29,7 +31,11 @@ from src.utils.dataloader import CIFAR10Loader
 def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
                encoder_kernel_sizes=None, decoder_kernel_sizes=None,
                encoder_strides=None, decoder_strides=None, 
-               encoder_n_layers=None, decoder_n_layers=None, use_maxpool=True):
+               encoder_n_layers=None, decoder_n_layers=None,
+               encoder_n_filters=None, decoder_n_filters=None,
+               encoder_layer_types=None, decoder_layer_types=None,
+               decoder_paddings=None, decoder_output_paddings=None, 
+               use_maxpool=True):
     """Load trained model from checkpoint."""
     model = CIFAR10TaxonAutoencoder(
         latent_dim=latent_dim, 
@@ -40,10 +46,16 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
         decoder_strides=decoder_strides,
         encoder_n_layers=encoder_n_layers,
         decoder_n_layers=decoder_n_layers,
+        encoder_n_filters=encoder_n_filters,
+        decoder_n_filters=decoder_n_filters,
+        encoder_layer_types=encoder_layer_types,
+        decoder_layer_types=decoder_layer_types,
+        decoder_paddings=decoder_paddings,
+        decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool
     )
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model = model.to(device)
     model.eval()
     print(f"Loaded model from epoch {checkpoint['epoch']}")
@@ -52,16 +64,17 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
     return model, checkpoint
 
 
-def visualize_taxonconv_filters(model, save_dir, layer_name='taxon_conv1', n_cols=8):
+def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonConv layer."""
     
     # Get the TaxonConv layer
-    if layer_name == 'taxon_conv1':
-        taxon_conv = model.encoder.taxon_conv1
-    elif layer_name == 'taxon_conv2':
-        taxon_conv = model.encoder.taxon_conv2
-    elif layer_name == 'taxon_conv3':
-        taxon_conv = model.encoder.taxon_conv3
+    if layer_name.startswith('encoder_layer_'):
+        layer_idx = int(layer_name.split('_')[-1]) - 1
+        taxon_conv = model.encoder.conv_layers[layer_idx]
+    elif layer_name == 'final_conv':
+        # final_conv is now a regular Conv2D, skip visualization
+        print(f"  Skipping {layer_name} - it's a regular Conv2D, not a TaxonConv")
+        return
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
     
@@ -120,16 +133,13 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='taxon_conv1', n_col
     print(f"Conv filter visualizations saved to {layer_dir}")
 
 
-def visualize_taxondeconv_filters(model, save_dir, layer_name='taxon_deconv1', n_cols=8):
+def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonDeconv layer."""
     
     # Get the TaxonDeconv layer
-    if layer_name == 'taxon_deconv1':
-        taxon_deconv = model.decoder.taxon_deconv1
-    elif layer_name == 'taxon_deconv2':
-        taxon_deconv = model.decoder.taxon_deconv2
-    elif layer_name == 'taxon_deconv3':
-        taxon_deconv = model.decoder.taxon_deconv3
+    if layer_name.startswith('decoder_layer_'):
+        layer_idx = int(layer_name.split('_')[-1]) - 1
+        taxon_deconv = model.decoder.deconv_layers[layer_idx]
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
     
@@ -182,6 +192,225 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='taxon_deconv1', n
     print(f"Deconv filter visualizations saved to {layer_dir}")
 
 
+def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4):
+    """Visualize the taxonomic hierarchy as a tree with alpha parameters and filter images.
+    
+    Args:
+        layer: TaxonConv or TaxonDeconv layer
+        layer_name: Name for the layer (e.g., 'taxon_conv1')
+        save_dir: Directory to save visualization
+        max_depth: Maximum depth to visualize (including root)
+    """
+    
+    # Get alpha parameters and apply sigmoid (alphas is a ParameterList)
+    # Each element in alphas has shape (2^i, 1) where i is the level
+    alpha_values = []
+    for i, alpha in enumerate(layer.alphas):
+        # Apply sigmoid to get mixing coefficients in [0, 1]
+        alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
+        alpha_values.append(alpha_sig)
+        print(f"  Alpha level {i}: shape {alpha_sig.shape}, mean={alpha_sig.mean():.4f}, "
+              f"min={alpha_sig.min():.4f}, max={alpha_sig.max():.4f}")
+    
+    # Get hierarchy weights (filters at each level)
+    hierarchy_weights = layer.get_hierarchy_weights()
+    
+    # Determine actual depth (including root = depth 0)
+    n_layers = layer.n_layers
+    actual_depth = min(n_layers + 1, max_depth)  # +1 for root
+    
+    # Create figure with larger size
+    max_nodes = 2 ** (actual_depth - 1)
+    fig_width = max(30, max_nodes * 2.5)  # Increased from *1.5 to *2.5
+    fig_height = 18  # Increased from 12 to 18
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis('off')
+    
+    # Track node positions and connections
+    positions = {}
+    node_labels = {}
+    node_filter_indices = {}
+    edges = []
+    edge_labels = {}
+    
+    # Build tree structure with better layout
+    # Use a proper tree layout where each level gets equal vertical spacing
+    # and horizontal spacing is proportional to the number of nodes
+    
+    # Level 0: Root
+    node_id = 0
+    positions[0] = (0.5, 0.95)  # Top center
+    node_labels[0] = "Root"
+    node_filter_indices[0] = (0, 0)
+    
+    node_counter = 1
+    vertical_spacing = 0.9 / actual_depth  # Increased back to 0.9 for more spacing
+    
+    # Process each level
+    for level in range(1, actual_depth):
+        if level > n_layers:
+            break
+            
+        num_nodes = 2 ** level
+        y_pos = 0.95 - level * vertical_spacing
+        
+        # Horizontal spacing: spread nodes evenly across width
+        # Add padding on the sides
+        padding = 0.05
+        available_width = 1.0 - 2 * padding
+        
+        for node_idx in range(num_nodes):
+            node_id = node_counter + node_idx
+            
+            # Evenly space nodes horizontally
+            if num_nodes == 1:
+                x_pos = 0.5
+            else:
+                x_pos = padding + available_width * node_idx / (num_nodes - 1)
+            
+            positions[node_id] = (x_pos, y_pos)
+            node_labels[node_id] = f"L{level}N{node_idx}"
+            node_filter_indices[node_id] = (level, node_idx)
+            
+            # Find parent - FIXED CALCULATION
+            parent_idx = node_idx // 2
+            # Parent is at level-1, and its node_id is the sum of all previous levels + parent_idx
+            parent_id = sum(2**i for i in range(level - 1)) + parent_idx if level > 0 else None
+            
+            if parent_id is not None:
+                # Determine which child this is (0 or 1)
+                child_position = node_idx % 2
+                
+                # Get alpha value for this edge
+                alpha_idx = n_layers - level
+                if 0 <= alpha_idx < len(alpha_values):
+                    alpha_tensor = alpha_values[alpha_idx]
+                    
+                    if parent_idx < alpha_tensor.shape[0]:
+                        alpha_val = alpha_tensor[parent_idx, 0]
+                        if child_position == 1:
+                            alpha_val = 1.0 - alpha_val
+                        
+                        edges.append((parent_id, node_id))
+                        edge_labels[(parent_id, node_id)] = f"α={alpha_val:.3f}"
+                    else:
+                        edges.append((parent_id, node_id))
+                        edge_labels[(parent_id, node_id)] = ""
+                else:
+                    edges.append((parent_id, node_id))
+                    edge_labels[(parent_id, node_id)] = ""
+        
+        node_counter += num_nodes
+    
+    # Pre-render all filter thumbnails to avoid expensive inline rendering
+    filter_thumbnails = {}
+    print(f"  Pre-rendering {len(positions)} filter thumbnails...")
+    for node_id, (x, y) in positions.items():
+        level_idx, filter_idx = node_filter_indices[node_id]
+        
+        if level_idx < len(hierarchy_weights):
+            w_np = hierarchy_weights[level_idx].detach().cpu().numpy()
+            
+            # Handle different weight shapes
+            if len(w_np.shape) == 4:
+                if filter_idx >= w_np.shape[0]:
+                    filter_idx = 0
+                
+                # Get filter and average across input channels
+                filt = w_np[filter_idx, :, :, :]
+                filt = filt.mean(axis=0)
+            else:
+                filt = w_np[0] if len(w_np.shape) > 0 else w_np
+            
+            # Normalize to [0, 1]
+            fmin, fmax = filt.min(), filt.max()
+            if fmax > fmin:
+                filt_norm = (filt - fmin) / (fmax - fmin)
+            else:
+                filt_norm = np.zeros_like(filt)
+            
+            filter_thumbnails[node_id] = filt_norm
+    
+    # Draw edges first (so they appear behind nodes)
+    print(f"  Drawing {len(edges)} edges...")
+    for (parent_id, child_id) in edges:
+        px, py = positions[parent_id]
+        cx, cy = positions[child_id]
+        
+        # Draw line with minimal thickness
+        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)  # Reduced from 1.5 to 0.5
+        
+        # Add alpha label at midpoint
+        mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
+        label = edge_labels[(parent_id, child_id)]
+        
+        if label:  # Only draw label if it exists
+            bbox_props = dict(boxstyle='round,pad=0.6', facecolor='lightyellow', 
+                             edgecolor='gray', alpha=0.9, linewidth=1.0)  # Even larger padding and border
+            ax.text(mid_x, mid_y, label, ha='center', va='center', 
+                    fontsize=14, fontweight='bold', bbox=bbox_props, zorder=2)  # Increased from 12 to 14
+    
+    # Draw nodes with filter visualizations using OffsetImage for better control
+    print(f"  Drawing {len(positions)} nodes with filters...")
+    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+    
+    zoom = 35.0  # Increased from 25.0 to 35.0 for even bigger filters
+    
+    for node_id, (x, y) in positions.items():
+        if node_id in filter_thumbnails:
+            # Create OffsetImage from the filter data
+            imagebox = OffsetImage(filter_thumbnails[node_id], cmap='viridis', zoom=zoom)
+            imagebox.image.axes = ax
+            
+            # Create AnnotationBbox to place the image
+            ab = AnnotationBbox(imagebox, (x, y),
+                               frameon=True,
+                               pad=0.0,
+                               bboxprops=dict(edgecolor='black', linewidth=1.5, facecolor='none'))  # Increased from 1.0 to 1.5
+            ax.add_artist(ab)
+            
+            # Add label below (estimate image height for positioning)
+            label_offset = 0.18  # Increased from 0.15 to account for bigger filters
+            ax.text(x, y - label_offset, node_labels[node_id], 
+                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)  # Increased from 8 to 11
+        else:
+            # Fallback: draw circle
+            circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black', linewidth=2, zorder=3)
+            ax.add_patch(circle)
+            ax.text(x, y - 0.03, node_labels[node_id], 
+                    ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
+    
+    # Add title with layer info
+    print(f"  Adding title and saving...")
+    title = f"{layer_name} Taxonomy Tree\n"
+    if actual_depth < n_layers + 1:
+        title += f"(Showing first {actual_depth} levels, truncated from {n_layers + 1})"
+    else:
+        title += f"(Full hierarchy: {actual_depth} levels)"
+    
+    ax.set_title(title, fontsize=18, fontweight='bold', pad=20)  # Increased from 14 to 18
+    
+    # Add legend
+    legend_text = (
+        f"Total layers: {n_layers}\n"
+        f"Nodes at each level: 1, 2, 4, 8, ...\n"
+        f"α = Sigmoid weight for child selection"
+    )
+    ax.text(0.02, 0.98, legend_text, transform=ax.transAxes,
+            fontsize=11, verticalalignment='top',  # Increased from 9 to 11
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Save with lower DPI for faster rendering
+    tree_dir = os.path.join(save_dir, 'taxonomy_trees')
+    os.makedirs(tree_dir, exist_ok=True)
+    save_path = os.path.join(tree_dir, f'{layer_name}_tree.png')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    
+    print(f"  Saved taxonomy tree to {save_path}")
+
+
 def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50):
     """Analyze sparsity and statistics of the latent space."""
     
@@ -199,6 +428,13 @@ def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50
     
     all_latents = np.concatenate(all_latents, axis=0)
     print(f"Collected {all_latents.shape[0]} latent vectors")
+    
+    # Handle spatial latent representations (flatten if needed)
+    if all_latents.ndim > 2:
+        print(f"Spatial latent shape detected: {all_latents.shape}")
+        batch_size = all_latents.shape[0]
+        all_latents = all_latents.reshape(batch_size, -1)
+        print(f"Flattened to: {all_latents.shape}")
     
     # Compute statistics
     mean_activation = np.mean(np.abs(all_latents), axis=0)
@@ -381,59 +617,47 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             # Encoder activations
             x = img
             
-            # TaxonConv1
-            x = model.encoder.taxon_conv1(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'encoder_taxon_conv1.png'), 'Encoder TaxonConv1', max_maps=16)
-            x = F.relu(x)
-            if model.encoder.use_maxpool:
-                x = F.max_pool2d(x, model.encoder.pool_stride1)
-            else:
-                x = F.avg_pool2d(x, model.encoder.pool_stride1)
+            # Process each encoder layer
+            for i, conv_layer in enumerate(model.encoder.conv_layers):
+                x = conv_layer(x)
+                visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'), f'Encoder Layer {i+1}', max_maps=16)
+                x = F.relu(x)
+                if i < len(model.encoder.strides) and model.encoder.strides[i] > 1:
+                    if model.encoder.use_maxpool:
+                        x = F.max_pool2d(x, model.encoder.strides[i])
+                    else:
+                        x = F.avg_pool2d(x, model.encoder.strides[i])
             
-            # TaxonConv2
-            x = model.encoder.taxon_conv2(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'encoder_taxon_conv2.png'), 'Encoder TaxonConv2', max_maps=16)
-            x = F.relu(x)
-            if model.encoder.use_maxpool:
-                x = F.max_pool2d(x, model.encoder.pool_stride2)
-            else:
-                x = F.avg_pool2d(x, model.encoder.pool_stride2)
-            
-            # TaxonConv3
-            x = model.encoder.taxon_conv3(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'encoder_taxon_conv3.png'), 'Encoder TaxonConv3', max_maps=16)
-            
-            # Latent (flattened, so visualize as 1D)
+            # Latent (may be spatial or flat, so flatten for visualization)
             latent = model.encode(img)
+            
+            # Flatten if spatial
+            if latent.ndim > 2:
+                latent_flat = latent.view(latent.size(0), -1)
+            else:
+                latent_flat = latent
+            
             plt.figure(figsize=(12, 3))
-            plt.bar(range(latent.shape[1]), latent.cpu().squeeze().numpy())
+            plt.bar(range(latent_flat.shape[1]), latent_flat.cpu().squeeze().numpy())
             plt.xlabel('Latent Dimension')
             plt.ylabel('Activation')
-            plt.title(f'Latent Space (dim={latent.shape[1]})')
+            plt.title(f'Latent Space (dim={latent_flat.shape[1]})')
             plt.tight_layout()
             plt.savefig(os.path.join(img_dir, 'latent.png'), dpi=150, bbox_inches='tight')
             plt.close()
             
-            # Decoder activations - need to check decoder structure
-            # Get latent and reconstruct through decoder layers
-            x = model.decoder.fc(latent)
+            # Decoder activations - latent is already spatial (B, C, H, W)
+            x = latent
             
-            # Reshape to initial spatial dimensions
-            x = x.view(-1, model.decoder.initial_channels, model.decoder.initial_spatial_size, model.decoder.initial_spatial_size)
+            # Process each decoder layer
+            for i, deconv_layer in enumerate(model.decoder.deconv_layers):
+                x = deconv_layer(x)
+                visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'), f'Decoder Layer {i+1}', max_maps=16)
+                x = F.relu(x)
             
-            # TaxonDeconv1 (includes upsampling via transposed conv)
-            x = model.decoder.taxon_deconv1(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'decoder_taxon_deconv1.png'), 'Decoder TaxonDeconv1', max_maps=16)
-            x = F.relu(x)
-            
-            # TaxonDeconv2 (includes upsampling via transposed conv)
-            x = model.decoder.taxon_deconv2(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'decoder_taxon_deconv2.png'), 'Decoder TaxonDeconv2', max_maps=16)
-            x = F.relu(x)
-            
-            # TaxonDeconv3 (final layer to RGB)
-            x = model.decoder.taxon_deconv3(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'decoder_taxon_deconv3.png'), 'Decoder TaxonDeconv3 (RGB)', max_maps=3)
+            # Final Conv2D layer to RGB
+            x = model.decoder.final_conv(x)
+            visualize_feature_maps(x, os.path.join(img_dir, 'decoder_final_conv.png'), 'Final Conv (RGB)', max_maps=3)
             
             # Final reconstruction
             reconstructed = model(img)
@@ -544,6 +768,83 @@ def load_config(config_path):
         return json.load(f)
 
 
+def parse_layer_config(config):
+    """Parse layer-by-layer config format and auto-infer parameters.
+    
+    Supports both legacy format (separate lists) and new layer-by-layer format.
+    """
+    model_config = config['model']
+    
+    # Check if using new layer-by-layer format
+    if 'encoder_layers' in model_config:
+        encoder_layers = model_config['encoder_layers']
+        decoder_layers = model_config['decoder_layers']
+        
+        # Extract parameters from layer configs
+        encoder_kernel_sizes = [layer['kernel_size'] for layer in encoder_layers]
+        encoder_strides = [layer['stride'] for layer in encoder_layers]
+        
+        # Check for n_layers (taxonomic) or n_filters (regular)
+        encoder_n_layers = [layer.get('n_layers') for layer in encoder_layers] if 'n_layers' in encoder_layers[0] else None
+        encoder_n_filters = [layer.get('n_filters') for layer in encoder_layers] if 'n_filters' in encoder_layers[0] else None
+        encoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in encoder_layers]
+        
+        decoder_kernel_sizes = [layer['kernel_size'] for layer in decoder_layers]
+        decoder_strides = [layer['stride'] for layer in decoder_layers]
+        decoder_n_layers = [layer.get('n_layers') for layer in decoder_layers] if 'n_layers' in decoder_layers[0] else None
+        decoder_n_filters = [layer.get('n_filters') for layer in decoder_layers] if 'n_filters' in decoder_layers[0] else None
+        decoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in decoder_layers]
+        
+        # Auto-infer decoder paddings if not specified
+        decoder_paddings = []
+        for layer in decoder_layers:
+            if 'padding' in layer:
+                decoder_paddings.append(layer['padding'])
+            else:
+                # Auto-calculate: for kernel k, use k//2
+                k = layer['kernel_size']
+                decoder_paddings.append(k // 2)
+        
+        # Auto-infer decoder output_paddings if not specified
+        decoder_output_paddings = []
+        for layer in decoder_layers:
+            if 'output_padding' in layer:
+                decoder_output_paddings.append(layer['output_padding'])
+            else:
+                # Default: 1 for stride>1, 0 for stride=1
+                decoder_output_paddings.append(1 if layer['stride'] > 1 else 0)
+    else:
+        # Legacy format - use separate lists
+        encoder_kernel_sizes = model_config.get('encoder_kernel_sizes')
+        encoder_strides = model_config.get('encoder_strides')
+        encoder_n_layers = model_config.get('encoder_n_layers', None)
+        encoder_n_filters = model_config.get('encoder_n_filters', None)
+        encoder_layer_types = model_config.get('encoder_layer_types', None)
+        
+        decoder_kernel_sizes = model_config.get('decoder_kernel_sizes')
+        decoder_strides = model_config.get('decoder_strides')
+        decoder_n_layers = model_config.get('decoder_n_layers', None)
+        decoder_n_filters = model_config.get('decoder_n_filters', None)
+        decoder_layer_types = model_config.get('decoder_layer_types', None)
+        decoder_paddings = model_config.get('decoder_paddings', None)
+        decoder_output_paddings = model_config.get('decoder_output_paddings', None)
+    
+    return {
+        'encoder_kernel_sizes': encoder_kernel_sizes,
+        'encoder_strides': encoder_strides,
+        'encoder_n_layers': encoder_n_layers,
+        'encoder_n_filters': encoder_n_filters,
+        'encoder_layer_types': encoder_layer_types,
+        'decoder_kernel_sizes': decoder_kernel_sizes,
+        'decoder_strides': decoder_strides,
+        'decoder_n_layers': decoder_n_layers,
+        'decoder_n_filters': decoder_n_filters,
+        'decoder_layer_types': decoder_layer_types,
+        'decoder_paddings': decoder_paddings,
+        'decoder_output_paddings': decoder_output_paddings
+    }
+
+
 def main():
     import argparse
     
@@ -582,13 +883,22 @@ def main():
         data_root = config['data']['data_root']
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
-        encoder_kernel_sizes = config['model']['encoder_kernel_sizes']
-        decoder_kernel_sizes = config['model']['decoder_kernel_sizes']
-        encoder_strides = config['model']['encoder_strides']
-        decoder_strides = config['model']['decoder_strides']
-        encoder_n_layers = config['model'].get('encoder_n_layers', None)
-        decoder_n_layers = config['model'].get('decoder_n_layers', None)
         use_maxpool = config['model']['use_maxpool']
+        
+        # Parse layer configurations (supports both formats)
+        layer_params = parse_layer_config(config)
+        encoder_kernel_sizes = layer_params['encoder_kernel_sizes']
+        encoder_strides = layer_params['encoder_strides']
+        encoder_n_layers = layer_params['encoder_n_layers']
+        encoder_n_filters = layer_params['encoder_n_filters']
+        encoder_layer_types = layer_params['encoder_layer_types']
+        decoder_kernel_sizes = layer_params['decoder_kernel_sizes']
+        decoder_strides = layer_params['decoder_strides']
+        decoder_n_layers = layer_params['decoder_n_layers']
+        decoder_n_filters = layer_params['decoder_n_filters']
+        decoder_layer_types = layer_params['decoder_layer_types']
+        decoder_paddings = layer_params['decoder_paddings']
+        decoder_output_paddings = layer_params['decoder_output_paddings']
         
         # Analysis-specific parameters (optional)
         checkpoint_path = config.get('analysis', {}).get('checkpoint_path', None)
@@ -597,7 +907,13 @@ def main():
         num_multiple_recon_images = config.get('analysis', {}).get('num_multiple_recon_images', 8)
         num_reconstructions_per_image = config.get('analysis', {}).get('num_reconstructions_per_image', 8)
         num_activation_images = config.get('analysis', {}).get('num_activation_images', 3)
-        save_dir_prefix = config.get('output', {}).get('analysis_save_dir', 'outputs/analysis')
+        
+        # Use experiment_name from config, or fall back to analysis_save_dir
+        experiment_name = config.get('experiment_name', None)
+        if experiment_name:
+            save_dir_prefix = f"outputs/analysis/{experiment_name}"
+        else:
+            save_dir_prefix = config.get('output', {}).get('analysis_save_dir', 'outputs/analysis')
     else:
         # Defaults
         checkpoint_path = None
@@ -611,6 +927,12 @@ def main():
         decoder_strides = None
         encoder_n_layers = None
         decoder_n_layers = None
+        encoder_n_filters = None
+        decoder_n_filters = None
+        encoder_layer_types = None
+        decoder_layer_types = None
+        decoder_paddings = None
+        decoder_output_paddings = None
         use_maxpool = True
         num_latent_batches = 50
         num_reconstruction_batches = 20
@@ -650,7 +972,11 @@ def main():
         raise ValueError("Checkpoint path must be provided via --checkpoint or config file")
     
     # Create output directory
-    save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    # Use experiment name if provided in config, otherwise use timestamp
+    if args.config and 'experiment_name' in config:
+        save_dir = save_dir_prefix
+    else:
+        save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     os.makedirs(save_dir, exist_ok=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -681,6 +1007,12 @@ def main():
         decoder_strides=decoder_strides,
         encoder_n_layers=encoder_n_layers,
         decoder_n_layers=decoder_n_layers,
+        encoder_n_filters=encoder_n_filters,
+        decoder_n_filters=decoder_n_filters,
+        encoder_layer_types=encoder_layer_types,
+        decoder_layer_types=decoder_layer_types,
+        decoder_paddings=decoder_paddings,
+        decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool
     )
     
@@ -693,41 +1025,72 @@ def main():
     print("\n" + "=" * 60)
     print("1. Visualizing Encoder TaxonConv Filters")
     print("=" * 60)
-    for layer_name in ['taxon_conv1', 'taxon_conv2', 'taxon_conv3']:
+    for i in range(len(model.encoder.conv_layers)):
+        layer_name = f'encoder_layer_{i+1}'
         print(f"\nProcessing {layer_name}...")
         visualize_taxonconv_filters(model, save_dir, layer_name=layer_name)
     
-    # Analysis 2: Visualize decoder Deconv filters
+    # Analysis 2: Visualize taxonomy trees for encoder
     print("\n" + "=" * 60)
-    print("2. Visualizing Decoder TaxonDeconv Filters")
+    print("2. Visualizing Encoder Taxonomy Trees")
     print("=" * 60)
-    for layer_name in ['taxon_deconv1', 'taxon_deconv2', 'taxon_deconv3']:
+    encoder_layers = []
+    for i, layer in enumerate(model.encoder.conv_layers):
+        layer_name = f'encoder_layer_{i+1}'
+        encoder_layers.append((layer, layer_name))
+    
+    for layer, layer_name in encoder_layers:
+        print(f"\nProcessing {layer_name}...")
+        visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4)
+    
+    # Analysis 3: Visualize decoder Deconv filters
+    print("\n" + "=" * 60)
+    print("3. Visualizing Decoder TaxonDeconv Filters")
+    print("=" * 60)
+    for i in range(len(model.decoder.deconv_layers)):
+        layer_name = f'decoder_layer_{i+1}'
         print(f"\nProcessing {layer_name}...")
         visualize_taxondeconv_filters(model, save_dir, layer_name=layer_name)
     
-    # Analysis 3: Latent space sparsity
+    # Analysis 4: Visualize taxonomy trees for decoder
     print("\n" + "=" * 60)
-    print("3. Analyzing Latent Space")
+    print("4. Visualizing Decoder Taxonomy Trees")
+    print("=" * 60)
+    decoder_layers = []
+    for i, layer in enumerate(model.decoder.deconv_layers):
+        layer_name = f'decoder_layer_{i+1}'
+        decoder_layers.append((layer, layer_name))
+    
+    for layer, layer_name in decoder_layers:
+        print(f"\nProcessing {layer_name}...")
+        visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4)
+    
+    # Note: final_conv is now a regular Conv2D, not a TaxonConv, so we skip its visualization
+    print(f"\nSkipping final_conv - it's a regular Conv2D for RGB projection")
+    
+    # Analysis 5: Latent space sparsity
+    print("\n" + "=" * 60)
+    print("5. Analyzing Latent Space")
     print("=" * 60)
     analyze_latent_sparsity(model, test_loader, device, save_dir, num_batches=num_latent_batches)
     
-    # Analysis 4: Reconstruction quality
+    # Analysis 6: Reconstruction quality
     print("\n" + "=" * 60)
-    print("4. Analyzing Reconstruction Quality")
+    print("6. Analyzing Reconstruction Quality")
     print("=" * 60)
     analyze_reconstruction_quality(model, test_loader, device, save_dir, num_batches=num_reconstruction_batches)
     
-    # Analysis 5: Multiple reconstructions per image
+    # Analysis 7: Multiple reconstructions per image
     print("\n" + "=" * 60)
-    print("5. Visualizing Multiple Reconstructions")
+    print("7. Visualizing Multiple Reconstructions")
     print("=" * 60)
     visualize_multiple_reconstructions(model, test_loader, device, save_dir, 
                                       num_images=num_multiple_recon_images, 
                                       num_reconstructions=num_reconstructions_per_image)
     
-    # Analysis 6: Layer activations for random images
+    # Analysis 8: Layer activations for random images
     print("\n" + "=" * 60)
-    print("6. Visualizing Layer Activations")
+    print("8. Visualizing Layer Activations")
     print("=" * 60)
     visualize_layer_activations(model, test_loader, device, save_dir, num_images=num_activation_images)
     
