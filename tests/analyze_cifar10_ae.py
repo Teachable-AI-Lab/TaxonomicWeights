@@ -268,7 +268,6 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
 
     node_counter = 1
     cumulative_start = per_node_channels  # next available channel start
-    cumulative_filter_idx = 0  # For decoder filters, track cumulative count across hierarchy levels
     vertical_spacing = 0.55 / actual_depth  # Condensed vertical spacing
     
     # Process each level
@@ -302,11 +301,8 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
                 end_ch = start_ch + per_node_channels
                 node_image_indices[node_id] = (start_ch, end_ch)
             else:
-                # For filters: use cumulative index for deconv, level-based for conv
-                if is_deconv:
-                    node_image_indices[node_id] = (level, cumulative_filter_idx + node_idx)
-                else:
-                    node_image_indices[node_id] = (level, node_idx)
+                # For filters: use node_idx for both conv and deconv (indexed per level)
+                node_image_indices[node_id] = (level, node_idx)
             
             # Find parent - FIXED CALCULATION
             parent_idx = node_idx // 2
@@ -338,9 +334,7 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         
         if image_type == "activations":
             cumulative_start += per_node_channels * num_nodes
-        elif is_deconv and image_type == "filters":
-            # Update cumulative filter count for next level
-            cumulative_filter_idx += num_nodes
+        
         node_counter += num_nodes
     
     # Pre-render all image thumbnails to avoid expensive inline rendering

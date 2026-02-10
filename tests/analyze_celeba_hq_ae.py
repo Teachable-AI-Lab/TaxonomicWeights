@@ -15,6 +15,8 @@ import argparse
 from datetime import datetime
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
@@ -207,11 +209,21 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n
         axes = axes.flatten()
         
         for i in range(n_filters):
-            # Average across input channels
-            filter_img = w_norm[i].mean(axis=0)
-            axes[i].imshow(filter_img, cmap='viridis')
+            filt = w_norm[i]
+            
+            if in_ch == 1:
+                filt = filt.squeeze()
+                cmap = 'gray'
+            elif in_ch == 3:
+                filt = np.transpose(filt, (1, 2, 0))
+                cmap = None
+            else:
+                # Too many channels - average across all input channels
+                filt = filt.mean(axis=0)
+                cmap = 'viridis'
+            
+            axes[i].imshow(filt, cmap=cmap)
             axes[i].axis('off')
-            axes[i].set_title(f'F{i}', fontsize=8)
         
         # Turn off extra axes
         for ax in axes[n_filters:]:
@@ -355,7 +367,6 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
 
     node_counter = 1
     cumulative_start = per_node_channels  # next available channel start
-    cumulative_filter_idx = 0  # For decoder filters, track cumulative count across hierarchy levels
     vertical_spacing = 0.55 / actual_depth  # Condensed vertical spacing
     
     # Process each level
@@ -373,57 +384,56 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         
         for node_idx in range(num_nodes):
             node_id = node_counter + node_idx
-            parent_id = (node_id - 1) // 2
             
-            # Position: evenly distribute across available width
+            # Evenly space nodes horizontally
             if num_nodes == 1:
                 x_pos = 0.5
             else:
-                x_pos = padding + (node_idx / (num_nodes - 1)) * available_width
+                x_pos = padding + available_width * node_idx / (num_nodes - 1)
             
             positions[node_id] = (x_pos, y_pos)
-            node_labels[node_id] = f"N{node_id}"
-            
-            # Track image indices
+            node_labels[node_id] = f"L{level}N{node_idx}"
+
+            # Store image index differently based on type
             if image_type == "activations":
-                # For activations: each node gets equal channel slices
-                start_ch = cumulative_start
-                end_ch = cumulative_start + per_node_channels
+                start_ch = cumulative_start + node_idx * per_node_channels
+                end_ch = start_ch + per_node_channels
                 node_image_indices[node_id] = (start_ch, end_ch)
-                cumulative_start = end_ch
             else:
-                # For filters: use cumulative index for deconv, level-based for conv
-                if is_deconv:
-                    node_image_indices[node_id] = (level - 1, cumulative_filter_idx + node_idx)
-                else:
-                    node_image_indices[node_id] = (level - 1, node_idx)
+                # For filters: use node_idx for both conv and deconv (indexed per level)
+                node_image_indices[node_id] = (level, node_idx)
             
-            # Edge from parent
-            edges.append((parent_id, node_id))
+            # Find parent - FIXED CALCULATION
+            parent_idx = node_idx // 2
+            # Parent is at level-1, and its node_id is the sum of all previous levels + parent_idx
+            parent_id = sum(2**i for i in range(level - 1)) + parent_idx if level > 0 else None
             
-            # Alpha label (which child branch this is: 0 or 1)
-            if level > 0:
-                parent_node_in_level = parent_id - (2 ** (level - 1) - 1)
-                child_branch = node_idx % 2
+            if parent_id is not None:
+                # Determine which child this is (0 or 1)
+                child_position = node_idx % 2
                 
-                if level - 1 < len(alpha_values):
-                    alpha_array = alpha_values[level - 1]
-                    if parent_node_in_level < alpha_array.shape[0]:
-                        alpha_val = alpha_array[parent_node_in_level, 0]
-                        if child_branch == 0:
-                            edge_labels[(parent_id, node_id)] = f"α={alpha_val:.2f}"
-                        else:
-                            edge_labels[(parent_id, node_id)] = f"1-α={1-alpha_val:.2f}"
+                # Get alpha value for this edge
+                alpha_idx = n_layers - level
+                if 0 <= alpha_idx < len(alpha_values):
+                    alpha_tensor = alpha_values[alpha_idx]
+                    
+                    if parent_idx < alpha_tensor.shape[0]:
+                        alpha_val = alpha_tensor[parent_idx, 0]
+                        if child_position == 1:
+                            alpha_val = 1.0 - alpha_val
+                        
+                        edges.append((parent_id, node_id))
+                        edge_labels[(parent_id, node_id)] = f"α={alpha_val:.3f}"
                     else:
+                        edges.append((parent_id, node_id))
                         edge_labels[(parent_id, node_id)] = ""
                 else:
+                    edges.append((parent_id, node_id))
                     edge_labels[(parent_id, node_id)] = ""
         
         if image_type == "activations":
-            cumulative_start = cumulative_start
-        elif is_deconv and image_type == "filters":
-            # Update cumulative filter count for next level
-            cumulative_filter_idx += num_nodes
+            cumulative_start += per_node_channels * num_nodes
+        
         node_counter += num_nodes
     
     # Pre-render all image thumbnails to avoid expensive inline rendering
@@ -434,34 +444,60 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         img_idx = node_image_indices[node_id]
         
         if image_type == "activations":
+            # img_idx is a channel slice (start, end)
             start_ch, end_ch = img_idx
             if end_ch <= acts.shape[0]:
-                act_slice = acts[start_ch:end_ch]
-                if act_slice.shape[0] > 0:
-                    img = act_slice.mean(axis=0)
-                    img = (img - img.min()) / (img.max() - img.min() + 1e-5)
-                else:
-                    img = np.zeros((8, 8))
-            else:
-                img = np.zeros((8, 8))
-            image_thumbnails[node_id] = img
-            image_sizes[node_id] = img.shape
-        else:
-            level, filter_idx = img_idx
-            if level < len(hierarchy_weights):
-                w_tensor = hierarchy_weights[level]
-                w_np = w_tensor.detach().cpu().numpy()
+                # Aggregate across the slice (mean over channels within the node)
+                img_data = acts[start_ch:end_ch, :, :].mean(axis=0)
                 
-                if filter_idx < w_np.shape[0]:
-                    filter_img = w_np[filter_idx].mean(axis=0)
-                    filter_img = (filter_img - filter_img.min()) / (filter_img.max() - filter_img.min() + 1e-5)
+                # Store original size
+                image_sizes[node_id] = img_data.shape
+                
+                # Normalize to [0, 1] - NO RESIZING, keep original resolution
+                img_min, img_max = img_data.min(), img_data.max()
+                if img_max > img_min:
+                    img_norm = (img_data - img_min) / (img_max - img_min)
                 else:
-                    filter_img = np.zeros((3, 3))
-            else:
-                filter_img = np.zeros((3, 3))
-            image_thumbnails[node_id] = filter_img
-            image_sizes[node_id] = filter_img.shape
+                    img_norm = np.zeros_like(img_data)
+                
+                image_thumbnails[node_id] = img_norm
+        else:
+            # img_idx is (level, filter_idx) for filters
+            level_idx, filter_idx = img_idx
             
+            if level_idx < len(hierarchy_weights):
+                w_np = hierarchy_weights[level_idx].detach().cpu().numpy()
+                
+                # Handle Conv vs Deconv shapes
+                if len(w_np.shape) == 4 and w_np.shape[0] == layer.in_channels:
+                    # Deconv: (in_ch, out_ch * nodes, k, k)
+                    nodes = 2 ** level_idx
+                    out_ch = layer.out_channels
+                    w_np = w_np.transpose(1, 0, 2, 3)  # (out_ch*nodes, in_ch, k, k)
+                    w_np = w_np.reshape(nodes, out_ch, layer.in_channels, w_np.shape[2], w_np.shape[3])
+                    if filter_idx >= nodes:
+                        filter_idx = 0
+                    img_data = w_np[filter_idx].mean(axis=0).mean(axis=0)
+                elif len(w_np.shape) == 4:
+                    # Conv: (num_filters, in_ch, k, k)
+                    if filter_idx >= w_np.shape[0]:
+                        filter_idx = 0
+                    img_data = w_np[filter_idx, :, :, :]
+                    img_data = img_data.mean(axis=0)
+                else:
+                    img_data = w_np[0] if len(w_np.shape) > 0 else w_np
+                
+                # Store original size
+                image_sizes[node_id] = img_data.shape
+                
+                # Normalize to [0, 1]
+                img_min, img_max = img_data.min(), img_data.max()
+                if img_max > img_min:
+                    img_norm = (img_data - img_min) / (img_max - img_min)
+                else:
+                    img_norm = np.zeros_like(img_data)
+                
+                image_thumbnails[node_id] = img_norm
     
     # Determine zoom based on image size to maintain consistent visual size
     # Target visual size in inches (adjust as needed)
@@ -494,10 +530,11 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
         label = edge_labels[(parent_id, child_id)]
         
-        if label:
-            ax.text(mid_x, mid_y, label, fontsize=8, ha='center', 
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7), zorder=2)
-                
+        if label:  # Only draw label if it exists
+                bbox_props = dict(boxstyle='round,pad=0.7', facecolor='lightyellow', 
+                         edgecolor='gray', alpha=0.9, linewidth=1.3)
+                ax.text(mid_x, mid_y, label, ha='center', va='center', 
+                    fontsize=16, fontweight='bold', bbox=bbox_props, zorder=2)
     
     # Draw nodes with image visualizations using OffsetImage for better control
     print(f"  Drawing {len(positions)} nodes with {image_type}...")
@@ -505,20 +542,28 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
     
     for node_id, (x, y) in positions.items():
         if node_id in image_thumbnails:
-            img = image_thumbnails[node_id]
-            imagebox = OffsetImage(img, zoom=base_zoom, cmap='viridis')
-            ab = AnnotationBbox(imagebox, (x, y), frameon=True, pad=0.1,
-                               bboxprops=dict(edgecolor='blue', linewidth=1.5, facecolor='white'))
+            # Use nearest-neighbor interpolation to preserve pixel boundaries
+            imagebox = OffsetImage(image_thumbnails[node_id], cmap='viridis', 
+                                 zoom=base_zoom, interpolation='nearest')
+            imagebox.image.axes = ax
+            
+            # Create AnnotationBbox to place the image
+            ab = AnnotationBbox(imagebox, (x, y),
+                               frameon=True,
+                               pad=0.0,
+                               bboxprops=dict(edgecolor='black', linewidth=1.5, facecolor='none'))
             ax.add_artist(ab)
             
-            # Add node label below the image
-            ax.text(x, y - 0.04, node_labels[node_id], fontsize=9, ha='center', va='top',
-                   bbox=dict(boxstyle='round,pad=0.2', facecolor='lightblue', alpha=0.8), zorder=3)
+            # Add label below
+            label_offset = 0.08  # Reduced to bring labels closer to images
+            ax.text(x, y - label_offset, node_labels[node_id], 
+                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)
         else:
-            # Fallback circle if no image
-            ax.plot(x, y, 'o', markersize=10, color='gray', zorder=3)
-            ax.text(x, y, node_labels[node_id], fontsize=9, ha='center', va='center', zorder=4)
-            
+            # Fallback: draw circle
+            circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black', linewidth=2, zorder=3)
+            ax.add_patch(circle)
+            ax.text(x, y - 0.03, node_labels[node_id], 
+                    ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
     
     # Add title with layer info and extra padding
     print(f"  Adding title and saving...")
@@ -562,22 +607,22 @@ def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50
     
     print(f"Encoding {num_batches} batches for latent space analysis...")
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(tqdm(data_loader, desc="Encoding")):
-            if batch_idx >= num_batches:
+        for i, (images, _) in enumerate(tqdm(data_loader)):
+            if i >= num_batches:
                 break
             images = images.to(device)
-            latent = model.encode(images)
-            all_latents.append(latent.cpu().numpy())
+            latents = model.encode(images)
+            all_latents.append(latents.cpu().numpy())
     
     all_latents = np.concatenate(all_latents, axis=0)
     print(f"Collected {all_latents.shape[0]} latent vectors")
     
     # Handle spatial latent representations (flatten if needed)
     if all_latents.ndim > 2:
-        print(f"  Spatial latent shape: {all_latents.shape}")
-        original_shape = all_latents.shape
-        all_latents = all_latents.reshape(all_latents.shape[0], -1)
-        print(f"  Flattened to: {all_latents.shape}")
+        print(f"Spatial latent shape detected: {all_latents.shape}")
+        batch_size = all_latents.shape[0]
+        all_latents = all_latents.reshape(batch_size, -1)
+        print(f"Flattened to: {all_latents.shape}")
     
     # Compute statistics
     mean_activation = np.mean(np.abs(all_latents), axis=0)
@@ -626,18 +671,17 @@ def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50
     # Visualizations
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
-    # Mean activation per dimension (sample first 1000 dims if too many)
-    dims_to_show = min(1000, len(mean_activation))
-    axes[0, 0].bar(range(dims_to_show), mean_activation[:dims_to_show])
+    # Mean activation per dimension
+    axes[0, 0].bar(range(len(mean_activation)), mean_activation)
     axes[0, 0].set_xlabel('Latent Dimension')
     axes[0, 0].set_ylabel('Mean |Activation|')
-    axes[0, 0].set_title(f'Mean Activation per Dimension (first {dims_to_show})')
+    axes[0, 0].set_title('Mean Activation per Dimension')
     
     # Std activation per dimension
-    axes[0, 1].bar(range(dims_to_show), std_activation[:dims_to_show])
+    axes[0, 1].bar(range(len(std_activation)), std_activation)
     axes[0, 1].set_xlabel('Latent Dimension')
     axes[0, 1].set_ylabel('Std Activation')
-    axes[0, 1].set_title(f'Activation Std per Dimension (first {dims_to_show})')
+    axes[0, 1].set_title('Activation Std per Dimension')
     
     # Sparsity distribution
     axes[0, 2].hist(sparsity_per_sample, bins=50, edgecolor='black')
@@ -695,39 +739,39 @@ def visualize_multiple_reconstructions(model, data_loader, device, save_dir, num
         try:
             images, _ = next(data_iter)
         except StopIteration:
+            # Reset iterator if we run out
             data_iter = iter(data_loader)
             images, _ = next(data_iter)
         
         images = images[:num_images].to(device)
         
+        # Create figure: 2 rows (originals + reconstructions), num_images columns
+        fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2.5, 5))
+        
         with torch.no_grad():
-            reconstructed = model(images)
+            for i in range(num_images):
+                img = images[i:i+1]
+                
+                # Original image (unnormalize from [-1, 1] to [0, 1])
+                img_display = (img.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+                axes[0, i].imshow(img_display)
+                axes[0, i].axis('off')
+                if i == 0:
+                    axes[0, i].set_title('Original', fontsize=12, fontweight='bold')
+                
+                # Generate single reconstruction
+                reconstructed = model(img)
+                recon_display = (reconstructed.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+                axes[1, i].imshow(recon_display)
+                axes[1, i].axis('off')
+                if i == 0:
+                    axes[1, i].set_title('Reconstruction', fontsize=12, fontweight='bold')
         
-        # Move to CPU
-        images = images.cpu()
-        reconstructed = reconstructed.cpu()
-        
-        # Create figure with 2 rows (original, reconstructed)
-        fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2, 4))
-        
-        for i in range(num_images):
-            # Original
-            axes[0, i].imshow(images[i].permute(1, 2, 0).clamp(0, 1))
-            axes[0, i].axis('off')
-            if i == 0:
-                axes[0, i].set_title('Original', fontsize=10)
-            
-            # Reconstructed
-            axes[1, i].imshow(reconstructed[i].permute(1, 2, 0).clamp(0, 1))
-            axes[1, i].axis('off')
-            if i == 0:
-                axes[1, i].set_title('Reconstructed', fontsize=10)
-        
-        plt.suptitle(f'Reconstruction Set {set_idx + 1}', fontsize=12)
         plt.tight_layout()
-        plt.savefig(os.path.join(recon_dir, f'reconstruction_set_{set_idx + 1}.png'), 
-                    dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(recon_dir, f'reconstructions_set_{set_idx+1}.png'), dpi=150, bbox_inches='tight')
         plt.close()
+        
+        print(f"  Saved reconstruction set {set_idx+1}/{num_reconstructions} with {num_images} images")
     
     print(f"Reconstructions saved to {recon_dir}")
 
@@ -741,73 +785,55 @@ def analyze_reconstruction_quality(model, data_loader, device, save_dir, num_bat
     
     print(f"Computing reconstruction metrics on {num_batches} batches...")
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(tqdm(data_loader, desc="Analyzing")):
-            if batch_idx >= num_batches:
+        for i, (images, _) in enumerate(tqdm(data_loader)):
+            if i >= num_batches:
                 break
             images = images.to(device)
             reconstructed = model(images)
             
-            mse = torch.mean((reconstructed - images) ** 2, dim=[1, 2, 3])
-            mae = torch.mean(torch.abs(reconstructed - images), dim=[1, 2, 3])
+            mse = ((images - reconstructed) ** 2).mean(dim=(1, 2, 3)).cpu().numpy()
+            mae = torch.abs(images - reconstructed).mean(dim=(1, 2, 3)).cpu().numpy()
             
-            mse_losses.extend(mse.cpu().numpy())
-            mae_losses.extend(mae.cpu().numpy())
+            mse_losses.extend(mse)
+            mae_losses.extend(mae)
     
     mse_losses = np.array(mse_losses)
     mae_losses = np.array(mae_losses)
     
-    # Compute PSNR (Peak Signal-to-Noise Ratio)
-    # Assuming pixel values in [0, 1]
-    psnr = 10 * np.log10(1.0 / (mse_losses + 1e-10))
+    print(f"\nReconstruction Quality:")
+    print(f"  Mean MSE: {np.mean(mse_losses):.6f}")
+    print(f"  Mean MAE: {np.mean(mae_losses):.6f}")
     
-    print(f"\nReconstruction Quality Metrics:")
-    print(f"  MSE - Mean: {mse_losses.mean():.6f}, Std: {mse_losses.std():.6f}")
-    print(f"  MAE - Mean: {mae_losses.mean():.6f}, Std: {mae_losses.std():.6f}")
-    print(f"  PSNR - Mean: {psnr.mean():.2f} dB, Std: {psnr.std():.2f} dB")
+    # Plot distributions
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
-    # Save metrics
-    np.savez(
-        os.path.join(save_dir, 'reconstruction_metrics.npz'),
-        mse=mse_losses,
-        mae=mae_losses,
-        psnr=psnr
-    )
-    
-    # Visualizations
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    
-    # MSE distribution
     axes[0].hist(mse_losses, bins=50, edgecolor='black')
-    axes[0].axvline(mse_losses.mean(), color='red', linestyle='--', 
-                    label=f'Mean: {mse_losses.mean():.6f}')
-    axes[0].set_xlabel('MSE')
+    axes[0].axvline(np.mean(mse_losses), color='red', linestyle='--', 
+                    label=f'Mean: {np.mean(mse_losses):.4f}')
+    axes[0].set_xlabel('MSE Loss')
     axes[0].set_ylabel('Count')
     axes[0].set_title('MSE Distribution')
     axes[0].legend()
     
-    # MAE distribution
     axes[1].hist(mae_losses, bins=50, edgecolor='black')
-    axes[1].axvline(mae_losses.mean(), color='red', linestyle='--',
-                    label=f'Mean: {mae_losses.mean():.6f}')
-    axes[1].set_xlabel('MAE')
+    axes[1].axvline(np.mean(mae_losses), color='red', linestyle='--',
+                    label=f'Mean: {np.mean(mae_losses):.4f}')
+    axes[1].set_xlabel('MAE Loss')
     axes[1].set_ylabel('Count')
     axes[1].set_title('MAE Distribution')
     axes[1].legend()
     
-    # PSNR distribution
-    axes[2].hist(psnr, bins=50, edgecolor='black')
-    axes[2].axvline(psnr.mean(), color='red', linestyle='--',
-                    label=f'Mean: {psnr.mean():.2f} dB')
-    axes[2].set_xlabel('PSNR (dB)')
-    axes[2].set_ylabel('Count')
-    axes[2].set_title('PSNR Distribution')
-    axes[2].legend()
-    
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'reconstruction_quality.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, 'reconstruction_metrics.png'), dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"Reconstruction quality analysis saved to {save_dir}")
+    np.savez(
+        os.path.join(save_dir, 'reconstruction_metrics.npz'),
+        mse_losses=mse_losses,
+        mae_losses=mae_losses
+    )
+    
+    print(f"Reconstruction metrics saved to {save_dir}")
 
 
 def visualize_layer_activations(model, data_loader, device, save_dir, num_images=3):
@@ -828,7 +854,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             os.makedirs(img_dir, exist_ok=True)
             
             # Save original image
-            img_display = img.cpu().squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+            img_display = (img.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
             plt.figure(figsize=(4, 4))
             plt.imshow(img_display)
             plt.axis('off')
@@ -852,12 +878,12 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
                                          f'Encoder Layer {i+1}', max_maps=16)
                 
-                x = torch.nn.functional.relu(x)
+                x = F.relu(x)
                 if i < len(model.encoder.strides) and model.encoder.strides[i] > 1:
                     if model.encoder.use_maxpool:
-                        x = torch.nn.functional.max_pool2d(x, model.encoder.strides[i])
+                        x = F.max_pool2d(x, model.encoder.strides[i])
                     else:
-                        x = torch.nn.functional.avg_pool2d(x, model.encoder.strides[i])
+                        x = F.avg_pool2d(x, model.encoder.strides[i])
             
             # Latent (may be spatial or flat, so flatten for visualization)
             latent = model.encode(img)
@@ -893,7 +919,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
                                          f'Decoder Layer {i+1}', max_maps=16)
                 
-                x = torch.nn.functional.relu(x)
+                x = F.relu(x)
             
             # Final Conv2D layer to RGB
             x = model.decoder.final_conv(x)
@@ -901,7 +927,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             
             # Final reconstruction
             reconstructed = model(img)
-            recon_display = reconstructed.cpu().squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+            recon_display = (reconstructed.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
             plt.figure(figsize=(4, 4))
             plt.imshow(recon_display)
             plt.axis('off')
@@ -925,10 +951,12 @@ def visualize_feature_maps(feature_tensor, save_path, title, max_maps=16, nrow=4
     axes = axes.flatten()
     
     for i in range(num_maps):
+        ax = axes[i]
         fmap = maps[i].numpy()
-        axes[i].imshow(fmap, cmap='viridis')
-        axes[i].axis('off')
-        axes[i].set_title(f'Ch{i}', fontsize=8)
+        # Normalize for visualization
+        fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
+        ax.imshow(fmap, cmap='viridis')
+        ax.axis('off')
     
     # Turn off extra axes
     for ax in axes[num_maps:]:

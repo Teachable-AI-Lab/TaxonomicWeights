@@ -137,24 +137,6 @@ class CIFAR10TaxonAutoencoder(nn.Module):
         return features
 
 
-def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
-    """Two Conv2d + ReLU layers with padding=1 to preserve spatial size."""
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-    )
-
-
-def _upsample_block(in_ch: int, out_ch: int) -> nn.Sequential:
-    """ConvTranspose2d stride=2 followed by Conv2d to match the spec."""
-    return nn.Sequential(
-        nn.ConvTranspose2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-    )
 class CelebAHQTaxonAutoencoder(nn.Module):
     """
     Taxonomic Autoencoder for CelebA-HQ (256x256x3).
