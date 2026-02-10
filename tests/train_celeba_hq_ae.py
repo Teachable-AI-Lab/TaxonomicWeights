@@ -11,6 +11,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -65,7 +66,7 @@ def load_config(config_path):
         return json.load(f)
 
 
-def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8):
+def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8, epoch=None):
     model.eval()
     images, _ = next(iter(data_loader))
     images = images[:num_images].to(device)
@@ -90,7 +91,8 @@ def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, 'reconstructions.png'), dpi=150, bbox_inches='tight')
+    filename = f'reconstructions_epoch_{epoch}.png' if epoch is not None else 'reconstructions.png'
+    plt.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -107,7 +109,8 @@ def train(
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss()
+    criterion = nn.L1Loss()
 
     train_losses = []
     val_losses = []
@@ -115,7 +118,7 @@ def train(
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
-        for images, _ in train_loader:
+        for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             optimizer.zero_grad()
             recons = model(images)
@@ -131,7 +134,7 @@ def train(
             model.eval()
             val_running = 0.0
             with torch.no_grad():
-                for images, _ in val_loader:
+                for images, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                     images = images.to(device)
                     recons = model(images)
                     loss = criterion(recons, images)
@@ -143,6 +146,9 @@ def train(
 
         print(f"Epoch {epoch+1}/{epochs} - train MSE: {epoch_train_loss:.6f}" +
               (f", val MSE: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
+
+        # Save reconstructions every epoch
+        visualize_reconstructions(model, val_loader or train_loader, device, save_dir, epoch=epoch+1)
 
         if (epoch + 1) % 5 == 0:
             checkpoint = {
@@ -202,6 +208,8 @@ def main():
         data_root = config['data']['data_root']
         image_size = config['data'].get('image_size', 256)
         val_split = config['data'].get('val_split', 0.05)
+        train_subset = config['data'].get('train_subset', None)
+        val_subset = config['data'].get('val_subset', None)
         epochs = config['training'].get('epochs', 20)
         lr = config['training'].get('learning_rate', 1e-4)
         experiment_name = config.get('experiment_name', None)
@@ -216,6 +224,8 @@ def main():
         data_root = './data/celeba_hq'
         image_size = 256
         val_split = 0.05
+        train_subset = None
+        val_subset = None
         epochs = 20
         lr = 1e-4
         experiment_name = None
@@ -250,18 +260,30 @@ def main():
     print(f'Data root: {data_root}')
     print(f'Image size: {image_size}')
     print(f'Val split: {val_split}')
+    print(f'Train subset: {train_subset if train_subset else "Full dataset"}')
+    print(f'Val subset: {val_subset if val_subset else "Full dataset"}')
     print(f'Save dir: {save_dir}')
     print('=' * 60)
 
+    print("\nLoading CelebA-HQ dataset...")
     loader = CelebAHQLoader(
         data_root=data_root,
         batch_size=batch_size,
         num_workers=num_workers,
         image_size=image_size,
         val_split=val_split,
+        train_subset=train_subset,
+        val_subset=val_subset,
     )
     train_loader, val_loader = loader.get_loaders()
+    
+    print(f"Train samples: {len(train_loader.dataset)}")
+    if val_loader is not None:
+        print(f"Val samples: {len(val_loader.dataset)}")
+    else:
+        print("Val samples: 0 (no validation split)")
 
+    print("\nCreating CelebAHQTaxonAutoencoder...")
     # Parse encoder and decoder layers from config
     encoder_layers = model_config.get('encoder_layers', [])
     decoder_layers = model_config.get('decoder_layers', [])
@@ -303,8 +325,9 @@ def main():
         alpha_init_seed=alpha_init_seed,
         output_activation=output_activation
     )
+    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
-    print('\nStarting training...')
+    print('\nStarting training...\n')
     model, train_losses, val_losses = train(
         model=model,
         train_loader=train_loader,
@@ -315,14 +338,13 @@ def main():
         save_dir=save_dir,
     )
 
-    print('\nSaving reconstructions sample...')
-    visualize_reconstructions(model, val_loader or train_loader, device, save_dir)
-
-    print('\nTraining complete!')
+    print('\n' + '=' * 60)
+    print('Training complete!')
     print(f'Final train MSE: {train_losses[-1]:.6f}')
     if val_losses[-1] is not None:
         print(f'Final val MSE: {val_losses[-1]:.6f}')
     print(f'Outputs saved to: {save_dir}')
+    print('=' * 60)
 
 
 if __name__ == '__main__':

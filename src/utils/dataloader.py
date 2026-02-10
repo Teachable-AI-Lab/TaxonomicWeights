@@ -229,11 +229,15 @@ class CelebAHQLoader:
         val_split: float = 0.05,
         seed: int = 42,
         pin_memory: bool = True,
+        train_subset: int = None,
+        val_subset: int = None,
     ):
         self.data_root = Path(data_root)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.train_subset = train_subset
+        self.val_subset = val_subset
 
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -315,6 +319,21 @@ class CelebAHQLoader:
             else:
                 self.trainset = full_dataset
                 self.valset = None
+        
+        # Apply subsets if specified
+        if self.train_subset is not None and self.train_subset < len(self.trainset):
+            indices = list(range(len(self.trainset)))
+            random.seed(seed)
+            random.shuffle(indices)
+            self.trainset = Subset(self.trainset, indices[:self.train_subset])
+            print(f"Using train subset: {self.train_subset} samples")
+        
+        if self.valset is not None and self.val_subset is not None and self.val_subset < len(self.valset):
+            indices = list(range(len(self.valset)))
+            random.seed(seed)
+            random.shuffle(indices)
+            self.valset = Subset(self.valset, indices[:self.val_subset])
+            print(f"Using val subset: {self.val_subset} samples")
 
         self.train_loader = DataLoader(
             self.trainset,

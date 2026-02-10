@@ -19,21 +19,20 @@ cd ~/flash/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Usage:
-#   sbatch scripts/analyze_celeba_hq_ae.sh /path/to/checkpoint.pt [optional_config.json]
+#   sbatch scripts/analyze_celeba_hq_ae.sh [optional_config.json]
 # If no args are provided, defaults are used.
+# Checkpoint path should be specified in the config file under analysis.checkpoint_path
 
-CHECKPOINT_PATH=${1:-"outputs/celebahq/training/celebahq_baseline/final_model.pt"}
-CONFIG_FILE=${2:-"configs/celebahq_ae.json"}
+CONFIG_FILE=${1:-"configs/celebahq_ae.json"}
 
-if [[ ! -f "$CHECKPOINT_PATH" ]]; then
-  echo "Checkpoint not found: $CHECKPOINT_PATH" >&2
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Config file not found: $CONFIG_FILE" >&2
   exit 1
 fi
 
 echo "Starting CelebA-HQ Autoencoder analysis at $(date)"
-echo "Using checkpoint: $CHECKPOINT_PATH"
 echo "Using config: $CONFIG_FILE"
 
-srun python tests/analyze_celeba_hq_ae.py --config "$CONFIG_FILE" --checkpoint "$CHECKPOINT_PATH"
+srun python tests/analyze_celeba_hq_ae.py --config "$CONFIG_FILE"
 
 echo "Analysis script completed at $(date)"
