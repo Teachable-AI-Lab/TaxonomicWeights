@@ -244,7 +244,8 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1',
     layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
     os.makedirs(layer_dir, exist_ok=True)
     
-    # Visualize each level
+    # Visualize each level with cumulative filter indices
+    cumulative_filter_count = 0
     for level_idx, w_tensor in enumerate(weights):
         w_np = w_tensor.detach().cpu().numpy()
         in_ch, out_ch, k, _ = w_np.shape
@@ -271,7 +272,10 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1',
         for i in range(max_filters):
             axes[i].imshow(w_norm[i], cmap='viridis')
             axes[i].axis('off')
-            axes[i].set_title(f'F{i}', fontsize=8)
+            axes[i].set_title(f'F{cumulative_filter_count + i}', fontsize=8)
+        
+        # Update cumulative count
+        cumulative_filter_count += out_ch
         
         # Turn off extra axes
         for ax in axes[max_filters:]:
@@ -351,6 +355,7 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
 
     node_counter = 1
     cumulative_start = per_node_channels  # next available channel start
+    cumulative_filter_idx = 0  # For decoder filters, track cumulative count across hierarchy levels
     vertical_spacing = 0.55 / actual_depth  # Condensed vertical spacing
     
     # Process each level
@@ -387,8 +392,11 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
                 node_image_indices[node_id] = (start_ch, end_ch)
                 cumulative_start = end_ch
             else:
-                # For filters: (level, filter_idx)
-                node_image_indices[node_id] = (level - 1, node_idx)
+                # For filters: use cumulative index for deconv, level-based for conv
+                if is_deconv:
+                    node_image_indices[node_id] = (level - 1, cumulative_filter_idx + node_idx)
+                else:
+                    node_image_indices[node_id] = (level - 1, node_idx)
             
             # Edge from parent
             edges.append((parent_id, node_id))
@@ -413,6 +421,9 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         
         if image_type == "activations":
             cumulative_start = cumulative_start
+        elif is_deconv and image_type == "filters":
+            # Update cumulative filter count for next level
+            cumulative_filter_idx += num_nodes
         node_counter += num_nodes
     
     # Pre-render all image thumbnails to avoid expensive inline rendering
