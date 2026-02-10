@@ -62,7 +62,7 @@
     "learning_rate": 0.001
   },
   "analysis": {
-    "checkpoint_path": "outputs/training/large_kernel_k7/final_model.pt",
+    "checkpoint_path": "outputs/cifar10/training/large_kernel_k7/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -70,7 +70,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/training/large_kernel_k7",
-    "analysis_save_dir": "outputs/analysis/large_kernel_k7"
+    "training_save_dir": "outputs/cifar10/training/large_kernel_k7",
+    "analysis_save_dir": "outputs/cifar10/analysis/large_kernel_k7"
   }
 }

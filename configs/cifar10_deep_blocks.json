@@ -104,7 +104,7 @@
     "learning_rate": 0.001
   },
   "analysis": {
-    "checkpoint_path": "outputs/training/deep_blocks_taxonomic/final_model.pt",
+    "checkpoint_path": "outputs/cifar10/training/deep_blocks_taxonomic/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -112,7 +112,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/training/deep_blocks_taxonomic",
-    "analysis_save_dir": "outputs/analysis/deep_blocks_taxonomic"
+    "training_save_dir": "outputs/cifar10/training/deep_blocks_taxonomic",
+    "analysis_save_dir": "outputs/cifar10/analysis/deep_blocks_taxonomic"
   }
 }

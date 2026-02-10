@@ -7,8 +7,8 @@
     "batch_size": 64,
     "num_workers": 4,
     "val_split": 0.1,
-    "train_subset": 5000,
-    "val_subset": 1000,
+    "train_subset": null,
+    "val_subset": null,
     "_comment_subset": "Using full dataset now - 5k was too small for learning color diversity. Reduced batch_size to 64 to fit in memory."
   },
   "model": {

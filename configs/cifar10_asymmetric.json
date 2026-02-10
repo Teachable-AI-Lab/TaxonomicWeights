@@ -62,7 +62,7 @@
     "learning_rate": 0.001
   },
   "analysis": {
-    "checkpoint_path": "outputs/training/asymmetric_no_linear/final_model.pt",
+    "checkpoint_path": "outputs/cifar10/training/asymmetric_no_linear/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -70,7 +70,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/training/asymmetric_no_linear",
-    "analysis_save_dir": "outputs/analysis/asymmetric_no_linear"
+    "training_save_dir": "outputs/cifar10/training/asymmetric_no_linear",
+    "analysis_save_dir": "outputs/cifar10/analysis/asymmetric_no_linear"
   }
 }

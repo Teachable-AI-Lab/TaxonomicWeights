@@ -79,7 +79,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/training/minimal_one_layer",
-    "analysis_save_dir": "outputs/analysis/minimal_one_layer"
+    "training_save_dir": "outputs/cifar10/training/minimal_one_layer",
+    "analysis_save_dir": "outputs/cifar10/analysis/minimal_one_layer"
   }
 }

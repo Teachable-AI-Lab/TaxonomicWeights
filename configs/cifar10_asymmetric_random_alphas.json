@@ -66,7 +66,7 @@
     "learning_rate": 0.001
   },
   "analysis": {
-    "checkpoint_path": "outputs/training/asymmetric_no_linear_random_alphas/final_model.pt",
+    "checkpoint_path": "outputs/cifar10/training/asymmetric_no_linear_random_alphas/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -74,7 +74,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/training/asymmetric_no_linear_random_alphas",
-    "analysis_save_dir": "outputs/analysis/asymmetric_no_linear_random_alphas"
+    "training_save_dir": "outputs/cifar10/training/asymmetric_no_linear_random_alphas",
+    "analysis_save_dir": "outputs/cifar10/analysis/asymmetric_no_linear_random_alphas"
   }
 }
