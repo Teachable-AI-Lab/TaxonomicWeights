@@ -160,6 +160,9 @@ class CIFAR10TaxonEncoder(nn.Module):
         self.final_size = final_size
         
     def forward(self, x):
+        total_kl = 0.0
+        has_kl_layers = False
+        
         for i, conv in enumerate(self.conv_layers):
             # KL layers may return either a tensor or (tensor, dkl). Accept both.
             if isinstance(conv, TaxonConvKL):
@@ -170,6 +173,11 @@ class CIFAR10TaxonEncoder(nn.Module):
                     x = res
                     # attempt to retrieve stored KL if available
                     dkl = getattr(conv, '_last_dkl', None)
+                
+                # Accumulate KL divergence
+                if dkl is not None:
+                    total_kl = total_kl + dkl
+                    has_kl_layers = True
                 # KL layers output log-probabilities (always negative); skip ReLU
             else:
                 x = conv(x)
@@ -178,8 +186,11 @@ class CIFAR10TaxonEncoder(nn.Module):
             if self.use_maxpool and self.strides[i] > 1:
                 x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
-        # Return spatial features (B, C, H, W)
-        return x
+        # Return spatial features and KL divergence (if any KL layers present)
+        if has_kl_layers:
+            return x, total_kl
+        else:
+            return x
 
 
 class CelebAHQTaxonEncoder(nn.Module):
@@ -311,6 +322,9 @@ class CelebAHQTaxonEncoder(nn.Module):
         self.final_size = final_size
         
     def forward(self, x):
+        total_kl = 0.0
+        has_kl_layers = False
+        
         for i, conv in enumerate(self.conv_layers):
             # KL layers may return either a tensor or (tensor, dkl). Accept both.
             if isinstance(conv, TaxonConvKL):
@@ -320,6 +334,11 @@ class CelebAHQTaxonEncoder(nn.Module):
                 else:
                     x = res
                     dkl = getattr(conv, '_last_dkl', None)
+                
+                # Accumulate KL divergence
+                if dkl is not None:
+                    total_kl = total_kl + dkl
+                    has_kl_layers = True
                 # KL layers output log-probabilities (always negative); skip ReLU
             else:
                 x = conv(x)
@@ -330,5 +349,8 @@ class CelebAHQTaxonEncoder(nn.Module):
                 else:
                     x = F.avg_pool2d(x, self.strides[i])
         
-        # Return spatial features (B, C, H, W)
-        return x
+        # Return spatial features and KL divergence (if any KL layers present)
+        if has_kl_layers:
+            return x, total_kl
+        else:
+            return x

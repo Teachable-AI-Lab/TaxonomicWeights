@@ -241,6 +241,8 @@ class CIFAR10TaxonDecoder(nn.Module):
     def forward(self, z):
         # z is spatial input from encoder (B, C, H, W)
         x = z
+        total_kl = 0.0
+        has_kl_layers = False
         
         for i, deconv in enumerate(self.deconv_layers):
             
@@ -252,6 +254,11 @@ class CIFAR10TaxonDecoder(nn.Module):
                 else:
                     x = res
                     dkl = getattr(deconv, '_last_dkl', None)
+                
+                # Accumulate KL divergence
+                if dkl is not None:
+                    total_kl = total_kl + dkl
+                    has_kl_layers = True
                 # KL layers output log-probabilities (always negative); skip ReLU
             else:
                 x = deconv(x)
@@ -263,7 +270,11 @@ class CIFAR10TaxonDecoder(nn.Module):
         # Apply tanh activation for output in [-1, 1] range
         x = torch.tanh(x)
         
-        return x
+        # Return reconstruction and KL divergence (if any KL layers present)
+        if has_kl_layers:
+            return x, total_kl
+        else:
+            return x
 
 
 class CelebAHQTaxonDecoder(nn.Module):
@@ -479,6 +490,8 @@ class CelebAHQTaxonDecoder(nn.Module):
     def forward(self, z):
         # z is spatial input from encoder (B, C, H, W)
         x = z
+        total_kl = 0.0
+        has_kl_layers = False
         
         for i, deconv in enumerate(self.deconv_layers):
             
@@ -490,6 +503,11 @@ class CelebAHQTaxonDecoder(nn.Module):
                 else:
                     x = res
                     dkl = getattr(deconv, '_last_dkl', None)
+                
+                # Accumulate KL divergence
+                if dkl is not None:
+                    total_kl = total_kl + dkl
+                    has_kl_layers = True
                 # KL layers output log-probabilities (always negative); skip ReLU
             else:
                 x = deconv(x)
@@ -504,4 +522,8 @@ class CelebAHQTaxonDecoder(nn.Module):
         elif self.output_activation == 'tanh':
             x = torch.tanh(x)
         
-        return x
+        # Return reconstruction and KL divergence (if any KL layers present)
+        if has_kl_layers:
+            return x, total_kl
+        else:
+            return x

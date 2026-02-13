@@ -73,7 +73,12 @@ def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8
     images = images[:num_images].to(device)
 
     with torch.no_grad():
-        recons = model(images)
+        result = model(images)
+        # Handle both (reconstruction, kl) and just reconstruction returns
+        if isinstance(result, tuple):
+            recons = result[0]
+        else:
+            recons = result
 
     images = images.cpu()
     recons = recons.cpu()
@@ -111,7 +116,13 @@ def train(
     lr,
     device,
     save_dir,
+    kl_weight=1.0
 ):
+    """Train the autoencoder.
+    
+    Args:
+        kl_weight: Weight for KL divergence loss (default 1.0). Set to 0 to ignore KL.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     model = model.to(device)
@@ -128,19 +139,41 @@ def train(
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
+        running_recon_loss = 0.0
+        running_kl_loss = 0.0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             optimizer.zero_grad()
             if scaler is not None:
                 with autocast():
-                    recons = model(images)
-                    loss = criterion(recons, images)
+                    result = model(images)
+                    # Handle both (reconstruction, kl) and just reconstruction returns
+                    if isinstance(result, tuple):
+                        recons, kl = result
+                        recon_loss = criterion(recons, images)
+                        kl_loss = kl if kl_weight > 0 else 0.0
+                        loss = recon_loss + kl_weight * kl_loss
+                        running_kl_loss += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                    else:
+                        recons = result
+                        loss = criterion(recons, images)
+                    running_recon_loss += criterion(recons, images).item() * images.size(0)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                recons = model(images)
-                loss = criterion(recons, images)
+                result = model(images)
+                # Handle both (reconstruction, kl) and just reconstruction returns
+                if isinstance(result, tuple):
+                    recons, kl = result
+                    recon_loss = criterion(recons, images)
+                    kl_loss = kl if kl_weight > 0 else 0.0
+                    loss = recon_loss + kl_weight * kl_loss
+                    running_kl_loss += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                else:
+                    recons = result
+                    loss = criterion(recons, images)
+                running_recon_loss += criterion(recons, images).item() * images.size(0)
                 loss.backward()
                 optimizer.step()
             running_loss += loss.item() * images.size(0)
@@ -153,21 +186,43 @@ def train(
                     pass
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
+        epoch_train_recon_loss = running_recon_loss / len(train_loader.dataset)
+        epoch_train_kl_loss = running_kl_loss / len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
 
         if val_loader is not None:
             model.eval()
             val_running = 0.0
+            val_running_recon = 0.0
+            val_running_kl = 0.0
             with torch.no_grad():
                 for images, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                     images = images.to(device)
                     if scaler is not None:
                         with autocast():
-                            recons = model(images)
-                            loss = criterion(recons, images)
+                            result = model(images)
+                            if isinstance(result, tuple):
+                                recons, kl = result
+                                recon_loss = criterion(recons, images)
+                                kl_loss = kl if kl_weight > 0 else 0.0
+                                loss = recon_loss + kl_weight * kl_loss
+                                val_running_kl += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                            else:
+                                recons = result
+                                loss = criterion(recons, images)
+                            val_running_recon += criterion(recons, images).item() * images.size(0)
                     else:
-                        recons = model(images)
-                        loss = criterion(recons, images)
+                        result = model(images)
+                        if isinstance(result, tuple):
+                            recons, kl = result
+                            recon_loss = criterion(recons, images)
+                            kl_loss = kl if kl_weight > 0 else 0.0
+                            loss = recon_loss + kl_weight * kl_loss
+                            val_running_kl += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                        else:
+                            recons = result
+                            loss = criterion(recons, images)
+                        val_running_recon += criterion(recons, images).item() * images.size(0)
                     val_running += loss.item() * images.size(0)
 
                     if device.type == 'cuda':
@@ -176,12 +231,21 @@ def train(
                         except Exception:
                             pass
             epoch_val_loss = val_running / len(val_loader.dataset)
+            epoch_val_recon_loss = val_running_recon / len(val_loader.dataset)
+            epoch_val_kl_loss = val_running_kl / len(val_loader.dataset)
         else:
             epoch_val_loss = None
+            epoch_val_recon_loss = None
+            epoch_val_kl_loss = None
         val_losses.append(epoch_val_loss)
 
-        print(f"Epoch {epoch+1}/{epochs} - train MSE: {epoch_train_loss:.6f}" +
-              (f", val MSE: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
+        # Print losses with KL if present
+        if epoch_train_kl_loss > 0 or (epoch_val_kl_loss and epoch_val_kl_loss > 0):
+            print(f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f} (recon: {epoch_train_recon_loss:.6f}, KL: {epoch_train_kl_loss:.6f})" +
+                  (f", val loss: {epoch_val_loss:.6f} (recon: {epoch_val_recon_loss:.6f}, KL: {epoch_val_kl_loss:.6f})" if epoch_val_loss is not None else ""))
+        else:
+            print(f"Epoch {epoch+1}/{epochs} - train MSE: {epoch_train_loss:.6f}" +
+                  (f", val MSE: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
 
         # Save reconstructions every epoch
         visualize_reconstructions(model, val_loader or train_loader, device, save_dir, epoch=epoch+1)
@@ -248,6 +312,7 @@ def main():
         val_subset = config['data'].get('val_subset', None)
         epochs = config['training'].get('epochs', 20)
         lr = config['training'].get('learning_rate', 1e-4)
+        kl_weight = config['training'].get('kl_weight', 1.0)
         experiment_name = config.get('experiment_name', None)
         save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/celebahq/training')
         
@@ -264,6 +329,7 @@ def main():
         val_subset = None
         epochs = 20
         lr = 1e-4
+        kl_weight = 1.0
         experiment_name = None
         save_dir_prefix = 'outputs/celebahq/training'
         use_taxonomic = False
@@ -372,6 +438,7 @@ def main():
         lr=lr,
         device=device,
         save_dir=save_dir,
+        kl_weight=kl_weight
     )
 
     print('\n' + '=' * 60)

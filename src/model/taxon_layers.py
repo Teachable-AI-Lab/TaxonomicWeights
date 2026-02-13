@@ -562,8 +562,8 @@ class TaxonConvKL(nn.Module):
                 reduction='none',
                 log_target=False
             )
-            # keep accumulation as a tensor
-            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            # Normalize by averaging over all dimensions (batch, channels, H, W)
+            dkl = dkl + dkl_raw.mean()
             
             outputs.append(out)
             prev = out
@@ -583,7 +583,9 @@ class TaxonConvKL(nn.Module):
 
     def num_output_channels(self):
         """Calculate total number of output channels."""
-        return sum(2**i for i in range(self.n_layers))
+        # Each depth i produces 2^(i+1) channels due to binary splitting
+        # Depths go from 0 to n_layers-1, producing 2^1, 2^2, ..., 2^n_layers
+        return sum(2**i for i in range(1, self.n_layers + 1))
 
     def get_hierarchy_weights(self):
         """
@@ -711,7 +713,8 @@ class TaxonDeconvKL(nn.Module):
                 reduction='none',
                 log_target=False
             )
-            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            # Normalize by averaging over all dimensions (batch, channels, H, W)
+            dkl = dkl + dkl_raw.mean()
             
             outputs.append(out)
             prev = out
@@ -729,7 +732,9 @@ class TaxonDeconvKL(nn.Module):
 
     def num_output_channels(self):
         """Calculate total number of output channels."""
-        return self.out_channels * sum(2**i for i in range(self.n_layers))
+        # Each depth i produces 2^(i+1) channels due to binary splitting
+        # Depths go from 0 to n_layers-1, producing 2^1, 2^2, ..., 2^n_layers
+        return self.out_channels * sum(2**i for i in range(1, self.n_layers + 1))
 
     def get_hierarchy_weights(self):
         """

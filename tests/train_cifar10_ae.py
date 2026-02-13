@@ -31,9 +31,14 @@ def train_autoencoder(
     epochs=50,
     lr=0.001,
     device='cuda',
-    save_dir='outputs/cifar10/training'
+    save_dir='outputs/cifar10/training',
+    kl_weight=1.0
 ):
-    """Train the autoencoder and save checkpoints."""
+    """Train the autoencoder and save checkpoints.
+    
+    Args:
+        kl_weight: Weight for KL divergence loss (default 1.0). Set to 0 to ignore KL.
+    """
     
     os.makedirs(save_dir, exist_ok=True)
     
@@ -52,34 +57,74 @@ def train_autoencoder(
         # Training
         model.train()
         train_loss = 0.0
+        train_recon_loss = 0.0
+        train_kl_loss = 0.0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             
             optimizer.zero_grad()
-            reconstructed = model(images)
-            loss = criterion(reconstructed, images)
+            
+            # Handle both (reconstruction, kl) and just reconstruction returns
+            result = model(images)
+            if isinstance(result, tuple):
+                reconstructed, kl = result
+                recon_loss = criterion(reconstructed, images)
+                kl_loss = kl if kl_weight > 0 else 0.0
+                loss = recon_loss + kl_weight * kl_loss
+                train_kl_loss += (kl.item() if hasattr(kl, 'item') else kl)
+            else:
+                reconstructed = result
+                loss = criterion(reconstructed, images)
+            
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
+            train_recon_loss += criterion(reconstructed, images).item()
         
         train_loss /= len(train_loader)
+        train_recon_loss /= len(train_loader)
+        train_kl_loss /= len(train_loader)
         train_losses.append(train_loss)
         
         # Testing
         model.eval()
         test_loss = 0.0
+        test_recon_loss = 0.0
+        test_kl_loss = 0.0
         with torch.no_grad():
             for images, _ in test_loader:
                 images = images.to(device)
-                reconstructed = model(images)
-                loss = criterion(reconstructed, images)
+                
+                # Handle both (reconstruction, kl) and just reconstruction returns
+                result = model(images)
+                if isinstance(result, tuple):
+                    reconstructed, kl = result
+                    recon_loss = criterion(reconstructed, images)
+                    kl_loss = kl if kl_weight > 0 else 0.0
+                    loss = recon_loss + kl_weight * kl_loss
+                    test_kl_loss += (kl.item() if hasattr(kl, 'item') else kl)
+                else:
+                    reconstructed = result
+                    loss = criterion(reconstructed, images)
+                
                 test_loss += loss.item()
+                test_recon_loss += criterion(reconstructed, images).item()
         
         test_loss /= len(test_loader)
+        test_recon_loss /= len(test_loader)
+        test_kl_loss /= len(test_loader)
         test_losses.append(test_loss)
         
-        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
+        # Print losses with KL if present
+        if train_kl_loss > 0 or test_kl_loss > 0:
+            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f} (Recon: {train_recon_loss:.6f}, KL: {train_kl_loss:.6f}), "
+                  f"Test Loss: {test_loss:.6f} (Recon: {test_recon_loss:.6f}, KL: {test_kl_loss:.6f})")
+        else:
+            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
+        
+        # Generate reconstructions every epoch (or every 5 epochs for faster training)
+        visualize_reconstructions(model, test_loader, device, save_dir, num_images=8, epoch=epoch+1)
         
         # Save checkpoint every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -122,8 +167,12 @@ def train_autoencoder(
     return model, train_losses, test_losses
 
 
-def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8):
-    """Visualize original vs reconstructed images."""
+def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8, epoch=None):
+    """Visualize original vs reconstructed images.
+    
+    Args:
+        epoch: If provided, saves with epoch-specific filename (e.g., 'reconstructions_epoch_5.png')
+    """
     model.eval()
     
     # Get a batch
@@ -131,7 +180,12 @@ def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8
     images = images[:num_images].to(device)
     
     with torch.no_grad():
-        reconstructed = model(images)
+        result = model(images)
+        # Handle both (reconstruction, kl) and just reconstruction returns
+        if isinstance(result, tuple):
+            reconstructed = result[0]
+        else:
+            reconstructed = result
     
     # Unnormalize images (from [-1, 1] to [0, 1])
     images = images.cpu() * 0.5 + 0.5
@@ -153,9 +207,19 @@ def visualize_reconstructions(model, test_loader, device, save_dir, num_images=8
             axes[1, i].set_title('Reconstructed', fontsize=10)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'reconstructions.png'), dpi=150, bbox_inches='tight')
+    
+    # Save with epoch-specific filename if epoch is provided
+    if epoch is not None:
+        filename = f'reconstructions_epoch_{epoch}.png'
+    else:
+        filename = 'reconstructions.png'
+    
+    plt.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Reconstructions saved to {save_dir}/reconstructions.png")
+    
+    # Only print message for final reconstruction (without epoch number)
+    if epoch is None:
+        print(f"Reconstructions saved to {save_dir}/{filename}")
 
 
 def load_config(config_path):
@@ -284,6 +348,7 @@ def main():
         # Training-specific parameters (optional)
         epochs = config.get('training', {}).get('epochs', 20)
         lr = config.get('training', {}).get('learning_rate', 0.001)
+        kl_weight = config.get('training', {}).get('kl_weight', 1.0)
         
         # Use experiment_name from config, or fall back to training_save_dir
         experiment_name = config.get('experiment_name', None)
@@ -296,6 +361,7 @@ def main():
         batch_size = 128
         epochs = 20
         lr = 0.001
+        kl_weight = 1.0
         data_root = './data/cifar10'
         latent_dim = 256
         temperature = 1.0
@@ -392,7 +458,8 @@ def main():
         epochs=epochs,
         lr=lr,
         device=device,
-        save_dir=save_dir
+        save_dir=save_dir,
+        kl_weight=kl_weight
     )
     
     # Visualize reconstructions

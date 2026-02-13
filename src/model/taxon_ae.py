@@ -99,15 +99,44 @@ class CIFAR10TaxonAutoencoder(nn.Module):
         )
         
     def encode(self, x):
-        return self.encoder(x)
+        result = self.encoder(x)
+        # Handle both (features, kl) and just features returns
+        if isinstance(result, tuple):
+            return result  # (features, kl)
+        else:
+            return result  # just features
     
     def decode(self, z):
-        return self.decoder(z)
+        result = self.decoder(z)
+        # Handle both (reconstruction, kl) and just reconstruction returns
+        if isinstance(result, tuple):
+            return result  # (reconstruction, kl)
+        else:
+            return result  # just reconstruction
     
     def forward(self, x):
-        z = self.encode(x)
-        x_recon = self.decode(z)
-        return x_recon
+        # Encode
+        enc_result = self.encode(x)
+        if isinstance(enc_result, tuple):
+            z, enc_kl = enc_result
+        else:
+            z = enc_result
+            enc_kl = 0.0
+        
+        # Decode
+        dec_result = self.decode(z)
+        if isinstance(dec_result, tuple):
+            x_recon, dec_kl = dec_result
+        else:
+            x_recon = dec_result
+            dec_kl = 0.0
+        
+        # Return reconstruction and total KL (if any)
+        total_kl = enc_kl + dec_kl
+        if isinstance(total_kl, float) and total_kl == 0.0:
+            return x_recon
+        else:
+            return x_recon, total_kl
     
     def get_hierarchical_features(self, x):
         """
@@ -249,13 +278,42 @@ class CelebAHQTaxonAutoencoder(nn.Module):
         )
         
     def encode(self, x):
-        return self.encoder(x)
+        result = self.encoder(x)
+        # Handle both (features, kl) and just features returns
+        if isinstance(result, tuple):
+            return result  # (features, kl)
+        else:
+            return result  # just features
     
     def decode(self, z):
-        return self.decoder(z)
+        result = self.decoder(z)
+        # Handle both (reconstruction, kl) and just reconstruction returns
+        if isinstance(result, tuple):
+            return result  # (reconstruction, kl)
+        else:
+            return result  # just reconstruction
     
     def forward(self, x):
-        z = self.encode(x)
-        x_recon = self.decode(z)
-        return x_recon
+        # Encode
+        enc_result = self.encode(x)
+        if isinstance(enc_result, tuple):
+            z, enc_kl = enc_result
+        else:
+            z = enc_result
+            enc_kl = 0.0
+        
+        # Decode
+        dec_result = self.decode(z)
+        if isinstance(dec_result, tuple):
+            x_recon, dec_kl = dec_result
+        else:
+            x_recon = dec_result
+            dec_kl = 0.0
+        
+        # Return reconstruction and total KL (if any)
+        total_kl = enc_kl + dec_kl
+        if isinstance(total_kl, float) and total_kl == 0.0:
+            return x_recon
+        else:
+            return x_recon, total_kl
 
