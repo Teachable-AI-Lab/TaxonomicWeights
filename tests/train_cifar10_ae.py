@@ -31,7 +31,7 @@ def train_autoencoder(
     epochs=50,
     lr=0.001,
     device='cuda',
-    save_dir='outputs/training'
+    save_dir='outputs/cifar10/training'
 ):
     """Train the autoencoder and save checkpoints."""
     
@@ -288,9 +288,9 @@ def main():
         # Use experiment_name from config, or fall back to training_save_dir
         experiment_name = config.get('experiment_name', None)
         if experiment_name:
-            save_dir_prefix = f"outputs/training/{experiment_name}"
+            save_dir_prefix = f"outputs/cifar10/training/{experiment_name}"
         else:
-            save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/training')
+            save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/cifar10/training')
     else:
         # Default configuration
         batch_size = 128
@@ -312,7 +312,7 @@ def main():
         alpha_init_distribution = 'uniform'
         alpha_init_range = None
         alpha_init_seed = None
-        save_dir_prefix = 'outputs/training'
+        save_dir_prefix = 'outputs/cifar10/training'
     
     # Command line args override config
     if args.batch_size is not None:

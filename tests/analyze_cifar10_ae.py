@@ -1022,9 +1022,9 @@ def main():
         # Use experiment_name from config, or fall back to analysis_save_dir
         experiment_name = config.get('experiment_name', None)
         if experiment_name:
-            save_dir_prefix = f"outputs/analysis/{experiment_name}"
+            save_dir_prefix = f"outputs/cifar10/analysis/{experiment_name}"
         else:
-            save_dir_prefix = config.get('output', {}).get('analysis_save_dir', 'outputs/analysis')
+            save_dir_prefix = config.get('output', {}).get('analysis_save_dir', 'outputs/cifar10/analysis')
     else:
         # Defaults
         checkpoint_path = None
@@ -1054,7 +1054,7 @@ def main():
         num_multiple_recon_images = 8
         num_reconstructions_per_image = 8
         num_activation_images = 3
-        save_dir_prefix = 'outputs/analysis'
+        save_dir_prefix = 'outputs/cifar10/analysis'
     
     # Command line args override config
     if args.checkpoint is not None:

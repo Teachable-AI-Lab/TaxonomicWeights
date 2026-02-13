@@ -1,0 +1,116 @@
+{
+  "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout, using 511 filters at latent",
+  "description": "Asymmetric CelebA-HQ Taxonomic Autoencoder with KL: 5 encoder layers (256x256->16x16) and 4 decoder layers (16x16->256x256) with no linear bottleneck",
+  "experiment_name": "celebahq_asymmetric_kl_511",
+  "data": {
+    "data_root": "./data/celeba_hq",
+    "batch_size": 16,
+    "num_workers": 4,
+    "val_split": 0.1,
+    "train_subset": null,
+    "val_subset": null,
+    "_comment_subset": "Set train_subset/val_subset to an integer (e.g., 5000) to train on a smaller subset for faster iteration. null = use full dataset"
+  },
+  "model": {
+    "latent_dim": 256,
+    "temperature": 1.0,
+    "use_maxpool": true,
+    "output_activation": "sigmoid",
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "256x256x3 -> 128x128x(2^5-2^1) = 128x128x30"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "128x128x30 -> 64x64x(2^6-2^1) = 64x64x62"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "64x64x62 -> 32x32x(2^7-2^1) = 32x32x126"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "32x32x126 -> 16x16x(2^8-2^1) = 16x16x254"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 9,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "16x16x254 -> 16x16x(2^9-2^1) = 16x16x510 (latent space)"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 8,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "16x16x510 -> 32x32x(2^8-2^1) = 32x32x254"
+      },
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "32x32x254 -> 64x64x(2^7-2^1) = 64x64x126"
+      },
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "64x64x126 -> 128x128x(2^6-2^1) = 128x128x62"
+      },
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "128x128x62 -> 256x256x(2^5-2^1) = 256x256x30, then final conv to 256x256x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 10,
+    "learning_rate": 0.001
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/celebahq/training/celebahq_asymmetric_kl_511/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/celebahq/training/celebahq_asymmetric_kl_511",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_asymmetric_kl_511"
+  }
+}

@@ -12,6 +12,23 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def stable_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable sigmoid implementation.
+
+    This avoids overflow for large magnitude inputs by computing the
+    sigmoid piecewise for positive and negative values.
+    """
+    pos = x >= 0
+    neg = ~pos
+    out = torch.empty_like(x)
+    # safe for large positive x
+    out[pos] = 1.0 / (1.0 + torch.exp(-x[pos]))
+    # safe for large negative x
+    exp_x = torch.exp(x[neg])
+    out[neg] = exp_x / (1.0 + exp_x)
+    return out
+
+
 class TaxonConv(nn.Module):
     """
     Taxonomic Convolutional Layer
@@ -439,3 +456,290 @@ class TaxonDeconv(nn.Module):
     def num_output_channels(self):
         """Calculate total number of output channels."""
         return self.out_channels * sum(2**i for i in range(self.n_layers + 1))
+
+
+class TaxonConvKL(nn.Module):
+    """
+    Taxonomic Convolutional Layer with KL Divergence Loss
+    
+    This variant computes KL divergence between the learned distribution and a uniform
+    distribution at each layer. The layer outputs log probabilities that sum to 1 across
+    channels at each pixel, encouraging a more probabilistic interpretation.
+    
+    Key Differences from TaxonConv:
+    --------------------------------
+    1. Outputs log probabilities instead of raw activations
+    2. Computes KL divergence against uniform distribution
+    3. Returns tuple: (output, dkl_loss)
+    4. Each depth creates 2× channels via binary splits
+    
+    Parameters:
+    -----------
+    in_channels : int
+        Number of input channels
+    kernel_size : int
+        Size of the convolutional kernel (k×k)
+    n_layers : int
+        Depth of the taxonomic tree
+    temperature : float
+        Controls the sharpness of probabilities
+        
+    Forward Pass:
+    -------------
+    Input: (batch, in_channels, H, W)
+    Output: (tensor, float)
+            tensor: (batch, sum(2^i for i in range(1, n_layers+1)), H, W) log probabilities
+            float: KL divergence loss
+    """
+    
+    def __init__(self, in_channels=1, kernel_size=7, n_layers=3, temperature=1.0,
+                 random_init_alphas=False, alpha_init_distribution="uniform",
+                 alpha_init_range=None, alpha_init_seed=None):
+        super(TaxonConvKL, self).__init__()
+        self.in_channels = in_channels
+        self.temperature = temperature
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+
+        # Some code expects `.alphas` on taxon layers; provide an empty list
+        # so callers that iterate `for alpha in layer.alphas` will simply skip.
+        self.alphas = nn.ParameterList([])
+
+        # Create a conv for each depth i=1..n_layers, out_channels=2**i
+        self.convs = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=self.in_channels,
+                out_channels=(1 << i),  # 2**i
+                kernel_size=kernel_size,
+                stride=1,
+                padding=int(kernel_size // 2),
+            )
+            for i in range(self.n_layers)
+        ])
+
+    def forward(self, x):
+        """
+        Forward pass computing hierarchical log probabilities and KL divergence.
+        
+        Returns:
+        --------
+        output : torch.Tensor
+            Concatenated log probabilities from all depths
+        dkl : float
+            Total KL divergence summed across all layers
+        """
+        outputs = []
+        prev = None
+        # initialize dkl as a tensor on the same device/dtype as the input
+        dkl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+        for idx, conv in enumerate(self.convs):
+            # Compute log-likelihood
+            ll = conv(x) / self.temperature
+            # use numerically-stable sigmoid
+            ll = stable_sigmoid(ll)
+            
+            # Clamp to avoid numerical issues
+            ll = torch.clamp(ll, 1e-6, 1 - 1e-6)
+            
+            # Stack [p, 1-p] and flatten to create binary splits
+            ll = torch.stack([ll, 1 - ll], dim=2).flatten(1, 2)  # (B, 2*C, H, W)
+            logp = ll.log()  # Convert to log-probabilities
+            
+            # If not root, add the parent log-probs, repeating to match 2× expansion
+            if idx == 0:
+                out = logp
+            else:
+                out = logp + prev.repeat_interleave(2, dim=1)
+            
+            # Expected uniform distribution at this depth
+            out_expected = torch.full_like(out, 0.5 / (2**idx))
+            
+            # Compute KL divergence: KL(out || out_expected)
+            dkl_raw = F.kl_div(
+                input=out,
+                target=out_expected,
+                reduction='none',
+                log_target=False
+            )
+            # keep accumulation as a tensor
+            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            
+            outputs.append(out)
+            prev = out
+
+        # Concatenate all depths. For backward compatibility with code that
+        # expects a plain tensor (not a (tensor, dkl) tuple), return only
+        # the concatenated tensor and store the KL on the module.
+        out_tensor = torch.cat(outputs, dim=1)
+        try:
+            # Ensure dkl is a tensor
+            if not isinstance(dkl, torch.Tensor):
+                dkl = torch.tensor(dkl, device=out_tensor.device, dtype=out_tensor.dtype)
+        except Exception:
+            dkl = torch.tensor(0.0, device=out_tensor.device, dtype=out_tensor.dtype)
+        self._last_dkl = dkl
+        return out_tensor, dkl
+
+    def num_output_channels(self):
+        """Calculate total number of output channels."""
+        return sum(2**i for i in range(self.n_layers))
+
+    def get_hierarchy_weights(self):
+        """
+        Return the convolution weight tensors for each depth ordered from root
+        (coarsest) to leaves (finest).
+
+        Returns:
+        --------
+        list of torch.Tensor
+            Each element is the `.weight` tensor from the corresponding
+            `nn.Conv2d` in `self.convs` (root -> leaves).
+        """
+        return [conv.weight.detach() for conv in self.convs]
+
+
+class TaxonDeconvKL(nn.Module):
+    """
+    Taxonomic Deconvolutional Layer with KL Divergence Loss
+    
+    Transposed convolution version of TaxonConvKL. Uses the same probabilistic
+    formulation with KL divergence but performs upsampling.
+    
+    Parameters:
+    -----------
+    in_channels : int
+        Number of input channels
+    out_channels : int
+        Number of output channels per depth (will be multiplied)
+    kernel_size : int
+        Size of the deconvolutional kernel
+    n_layers : int
+        Depth of the taxonomic tree
+    stride : int
+        Stride for upsampling
+    padding : int
+        Padding for transposed convolution
+    output_padding : int
+        Additional output padding
+    temperature : float
+        Controls the sharpness of probabilities
+        
+    Forward Pass:
+    -------------
+    Input: (batch, in_channels, H, W)
+    Output: (tensor, float)
+            tensor: Upsampled log probabilities
+            float: KL divergence loss
+    """
+    
+    def __init__(self, in_channels, out_channels=1, kernel_size=4, n_layers=3,
+                 stride=2, padding=1, output_padding=0, temperature=1.0,
+                 random_init_alphas=False, alpha_init_distribution="uniform",
+                 alpha_init_range=None, alpha_init_seed=None):
+        super(TaxonDeconvKL, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.temperature = temperature
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+
+        # Provide an empty `.alphas` for compatibility with visualization helpers
+        self.alphas = nn.ParameterList([])
+
+        # Create a deconv for each depth i=1..n_layers, out_channels=2**i
+        self.deconvs = nn.ModuleList([
+            nn.ConvTranspose2d(
+                in_channels=self.in_channels,
+                out_channels=self.out_channels * (1 << i),  # out_channels * 2**i
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                output_padding=output_padding,
+            )
+            for i in range(self.n_layers)
+        ])
+
+    def forward(self, x):
+        """
+        Forward pass computing hierarchical log probabilities and KL divergence.
+        
+        Returns:
+        --------
+        output : torch.Tensor
+            Concatenated upsampled log probabilities from all depths
+        dkl : float
+            Total KL divergence summed across all layers
+        """
+        outputs = []
+        prev = None
+        # initialize dkl as a tensor on the same device/dtype as the input
+        dkl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+        for idx, deconv in enumerate(self.deconvs):
+            # Compute log-likelihood
+            ll = deconv(x) / self.temperature
+            # use numerically-stable sigmoid
+            ll = stable_sigmoid(ll)
+            
+            # Clamp to avoid numerical issues
+            ll = torch.clamp(ll, 1e-6, 1 - 1e-6)
+            
+            # Stack [p, 1-p] and flatten to create binary splits
+            ll = torch.stack([ll, 1 - ll], dim=2).flatten(1, 2)
+            logp = ll.log()  # Convert to log-probabilities
+            
+            # If not root, add the parent log-probs, repeating to match 2× expansion
+            if idx == 0:
+                out = logp
+            else:
+                # Upsample previous-level log-probs to match current spatial dims,
+                # then repeat-interleave channels to match binary expansion.
+                prev_upsampled = F.interpolate(prev, size=logp.shape[2:], mode='nearest')
+                out = logp + prev_upsampled.repeat_interleave(2, dim=1)
+            
+            # Expected uniform distribution at this depth
+            out_expected = torch.full_like(out, 0.5 / (2**idx))
+            
+            # Compute KL divergence
+            dkl_raw = F.kl_div(
+                input=out,
+                target=out_expected,
+                reduction='none',
+                log_target=False
+            )
+            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            
+            outputs.append(out)
+            prev = out
+
+        # Concatenate all depths. Return only the tensor for compatibility and
+        # store the KL divergence on the module as `_last_dkl`.
+        out_tensor = torch.cat(outputs, dim=1)
+        try:
+            if not isinstance(dkl, torch.Tensor):
+                dkl = torch.tensor(dkl, device=out_tensor.device, dtype=out_tensor.dtype)
+        except Exception:
+            dkl = torch.tensor(0.0, device=out_tensor.device, dtype=out_tensor.dtype)
+        self._last_dkl = dkl
+        return out_tensor, dkl
+
+    def num_output_channels(self):
+        """Calculate total number of output channels."""
+        return self.out_channels * sum(2**i for i in range(self.n_layers))
+
+    def get_hierarchy_weights(self):
+        """
+        Return the transposed-convolution weight tensors for each depth ordered
+        from root (coarsest) to leaves (finest).
+
+        Returns:
+        --------
+        list of torch.Tensor
+            Each element is the `.weight` tensor from the corresponding
+            `nn.ConvTranspose2d` in `self.deconvs` (root -> leaves).
+        """
+        return [deconv.weight.detach() for deconv in self.deconvs]

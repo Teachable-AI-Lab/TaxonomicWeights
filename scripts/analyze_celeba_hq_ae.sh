@@ -6,7 +6,8 @@
 #SBATCH --exclude=spot,heistotron,clippy
 #SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_celeba_hq_ae.out
 #SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_celeba_hq_ae.err
-#SBATCH --partition="tail-lab"
+#SBATCH --account="overcap"
+#SBATCH --partition="overcap"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8

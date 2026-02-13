@@ -10,6 +10,7 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -76,6 +77,12 @@ def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8
 
     images = images.cpu()
     recons = recons.cpu()
+    # Attempt to release CUDA cache after moving tensors to CPU
+    if device.type == 'cuda':
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2, 4))
     for i in range(num_images):
@@ -115,17 +122,35 @@ def train(
     train_losses = []
     val_losses = []
 
+    # Setup AMP scaler if CUDA is available
+    use_amp = device.type == 'cuda'
+    scaler = GradScaler() if use_amp else None
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             optimizer.zero_grad()
-            recons = model(images)
-            loss = criterion(recons, images)
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                with autocast():
+                    recons = model(images)
+                    loss = criterion(recons, images)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                recons = model(images)
+                loss = criterion(recons, images)
+                loss.backward()
+                optimizer.step()
             running_loss += loss.item() * images.size(0)
+
+            # Free CUDA cache where possible to reduce fragmentation/peak memory
+            if device.type == 'cuda':
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
@@ -136,9 +161,20 @@ def train(
             with torch.no_grad():
                 for images, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                     images = images.to(device)
-                    recons = model(images)
-                    loss = criterion(recons, images)
+                    if scaler is not None:
+                        with autocast():
+                            recons = model(images)
+                            loss = criterion(recons, images)
+                    else:
+                        recons = model(images)
+                        loss = criterion(recons, images)
                     val_running += loss.item() * images.size(0)
+
+                    if device.type == 'cuda':
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
             epoch_val_loss = val_running / len(val_loader.dataset)
         else:
             epoch_val_loss = None

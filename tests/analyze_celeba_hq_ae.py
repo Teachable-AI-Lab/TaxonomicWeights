@@ -317,13 +317,19 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
     
     # Get alpha parameters and apply sigmoid (alphas is a ParameterList)
     # Each element in alphas has shape (2^i, 1) where i is the level
+    # Determine whether this layer exposes alpha parameters. KL variants provide
+    # an empty `alphas` list for compatibility; when absent we skip alpha visuals.
+    has_alphas = (hasattr(layer, 'alphas') and len(layer.alphas) > 0)
     alpha_values = []
-    for i, alpha in enumerate(layer.alphas):
-        # Apply sigmoid to get mixing coefficients in [0, 1]
-        alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
-        alpha_values.append(alpha_sig)
-        print(f"  Alpha level {i}: shape {alpha_sig.shape}, mean={alpha_sig.mean():.4f}, "
-              f"min={alpha_sig.min():.4f}, max={alpha_sig.max():.4f}")
+    if has_alphas:
+        for i, alpha in enumerate(layer.alphas):
+            # Apply sigmoid to get mixing coefficients in [0, 1]
+            alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
+            alpha_values.append(alpha_sig)
+            print(f"  Alpha level {i}: shape {alpha_sig.shape}, mean={alpha_sig.mean():.4f}, "
+                  f"min={alpha_sig.min():.4f}, max={alpha_sig.max():.4f}")
+    else:
+        print(f"  No alpha parameters present for {layer_name}; skipping alpha visualization.")
     
     # Get hierarchy weights (filters at each level) or use activations
     is_deconv = isinstance(layer, TaxonDeconv)
@@ -578,12 +584,12 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
             transform=ax.transAxes, fontsize=18, fontweight='bold')
     
     # Add legend
-    legend_text = (
-        f"Total layers: {n_layers}\n"
-        f"Nodes at each level: 1, 2, 4, 8, ...\n"
-        f"α = Sigmoid weight for child selection\n"
-        f"{'Brighter = Higher activation' if image_type == 'activations' else 'Filter weights shown'}"
-    )
+    # Legend: omit alpha explanation when this is a KL-layer without alphas
+    legend_lines = [f"Total layers: {n_layers}", f"Nodes at each level: 1, 2, 4, 8, ..."]
+    if has_alphas:
+        legend_lines.append("α = Sigmoid weight for child selection")
+    legend_lines.append('Brighter = Higher activation' if image_type == 'activations' else 'Filter weights shown')
+    legend_text = "\n".join(legend_lines)
     ax.text(0.02, 0.98, legend_text, transform=ax.transAxes,
             fontsize=11, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))

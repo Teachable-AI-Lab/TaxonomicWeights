@@ -5,7 +5,7 @@ Decoder architectures using Taxonomic or Regular Deconvolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonDeconv, TaxonConv
+from .taxon_layers import TaxonDeconv, TaxonConv, TaxonDeconvKL, TaxonConvKL
 
 
 class CIFAR10TaxonDecoder(nn.Module):
@@ -37,18 +37,19 @@ class CIFAR10TaxonDecoder(nn.Module):
     def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None, 
                  strides=None, paddings=None, output_paddings=None, n_layers=None, 
                  n_filters=None, layer_types=None, initial_spatial_size=4,
-                 encoder_final_channels=None, random_init_alphas=False,
+                 encoder_final_channels=None, use_maxpool=True, random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None):
         super(CIFAR10TaxonDecoder, self).__init__()
         self.latent_dim = latent_dim
         self.initial_spatial_size = initial_spatial_size
+        self.use_maxpool = use_maxpool
         
         # Determine number of layers
         if n_layers is None and n_filters is None:
             num_layers = 3
             n_layers = [6, 5, 4]
-            layer_types = ['taxonomic'] * 3 if layer_types is None else layer_types
+            layer_types = ['taxonomic_deconv'] * 3 if layer_types is None else layer_types
         elif isinstance(n_layers, int):
             num_layers = 3
             n_layers = [n_layers] * 3
@@ -61,7 +62,7 @@ class CIFAR10TaxonDecoder(nn.Module):
         
         # Handle layer_types
         if layer_types is None:
-            layer_types = ['taxonomic'] * num_layers
+            layer_types = ['taxonomic_deconv'] * num_layers
         elif isinstance(layer_types, str):
             layer_types = [layer_types] * num_layers
         
@@ -121,6 +122,7 @@ class CIFAR10TaxonDecoder(nn.Module):
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.layer_types = layer_types
+        self.strides = strides
         
         # Spatial input from encoder - no linear layer needed
         initial_channels = encoder_final_channels if encoder_final_channels else (
@@ -141,7 +143,7 @@ class CIFAR10TaxonDecoder(nn.Module):
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
             
             if layer_type == 'taxonomic_deconv' or layer_type == 'taxonomic':
-                # Use TaxonDeconv for transposed convolution
+                # Always use TaxonDeconv for decoder upsampling
                 layer = TaxonDeconv(
                     in_channels=in_ch, 
                     out_channels=1, 
@@ -157,6 +159,23 @@ class CIFAR10TaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_deconv_kl':
+                # Always use TaxonDeconvKL for decoder upsampling
+                layer = TaxonDeconvKL(
+                    in_channels=in_ch, 
+                    out_channels=1, 
+                    kernel_size=kernel_sizes[i], 
+                    n_layers=n_layers[i] if n_layers else 4, 
+                    stride=strides[i], 
+                    padding=paddings[i],
+                    output_padding=output_paddings[i], 
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'taxonomic_conv':
                 # Use TaxonConv for regular convolution
                 layer = TaxonConv(
@@ -170,9 +189,22 @@ class CIFAR10TaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_conv_kl':
+                # Use TaxonConvKL (returns output, dkl)
+                layer = TaxonConvKL(
+                    in_channels=in_ch,
+                    kernel_size=kernel_sizes[i],
+                    n_layers=n_layers[i] if n_layers else 4,
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'deconv':
-                # Use regular ConvTranspose2d
                 out_ch = n_filters[i] if n_filters else 64
+                # Always use ConvTranspose2d for decoder upsampling
                 layer = nn.ConvTranspose2d(
                     in_channels=in_ch,
                     out_channels=out_ch,
@@ -211,8 +243,19 @@ class CIFAR10TaxonDecoder(nn.Module):
         x = z
         
         for i, deconv in enumerate(self.deconv_layers):
-            x = deconv(x)
-            x = F.relu(x)
+            
+            # KL layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL)):
+                res = deconv(x)
+                if isinstance(res, tuple) and len(res) == 2:
+                    x, dkl = res
+                else:
+                    x = res
+                    dkl = getattr(deconv, '_last_dkl', None)
+                # KL layers output log-probabilities (always negative); skip ReLU
+            else:
+                x = deconv(x)
+                x = F.relu(x)
         
         # Final conv to RGB (outputs exactly 3 channels)
         x = self.final_conv(x)
@@ -229,13 +272,14 @@ class CelebAHQTaxonDecoder(nn.Module):
     def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None, 
                  strides=None, paddings=None, output_paddings=None, n_layers=None, 
                  n_filters=None, layer_types=None, initial_spatial_size=16,
-                 encoder_final_channels=None, random_init_alphas=False,
+                 encoder_final_channels=None, use_maxpool=True, random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None, output_activation='sigmoid'):
         super(CelebAHQTaxonDecoder, self).__init__()
         self.latent_dim = latent_dim
         self.initial_spatial_size = initial_spatial_size
         self.output_activation = output_activation
+        self.use_maxpool = use_maxpool
         
         # Determine number of layers
         if n_layers is None and n_filters is None:
@@ -316,6 +360,7 @@ class CelebAHQTaxonDecoder(nn.Module):
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.layer_types = layer_types
+        self.strides = strides
         
         # Spatial input from encoder - no linear layer needed
         initial_channels = encoder_final_channels if encoder_final_channels else (
@@ -336,7 +381,7 @@ class CelebAHQTaxonDecoder(nn.Module):
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
             
             if layer_type == 'taxonomic_deconv' or layer_type == 'taxonomic':
-                # Use TaxonDeconv for transposed convolution
+                # Always use TaxonDeconv for decoder upsampling
                 layer = TaxonDeconv(
                     in_channels=in_ch, 
                     out_channels=1, 
@@ -352,6 +397,23 @@ class CelebAHQTaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_deconv_kl':
+                # Always use TaxonDeconvKL for decoder upsampling
+                layer = TaxonDeconvKL(
+                    in_channels=in_ch, 
+                    out_channels=1, 
+                    kernel_size=kernel_sizes[i], 
+                    n_layers=n_layers[i] if n_layers else 4, 
+                    stride=strides[i], 
+                    padding=paddings[i],
+                    output_padding=output_paddings[i], 
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'taxonomic_conv':
                 # Use TaxonConv for regular convolution
                 layer = TaxonConv(
@@ -365,9 +427,22 @@ class CelebAHQTaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_conv_kl':
+                # Use TaxonConvKL (returns output, dkl)
+                layer = TaxonConvKL(
+                    in_channels=in_ch,
+                    kernel_size=kernel_sizes[i],
+                    n_layers=n_layers[i] if n_layers else 4,
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'deconv':
-                # Use regular ConvTranspose2d
                 out_ch = n_filters[i] if n_filters else 64
+                # Always use ConvTranspose2d for decoder upsampling
                 layer = nn.ConvTranspose2d(
                     in_channels=in_ch,
                     out_channels=out_ch,
@@ -406,8 +481,19 @@ class CelebAHQTaxonDecoder(nn.Module):
         x = z
         
         for i, deconv in enumerate(self.deconv_layers):
-            x = deconv(x)
-            x = F.relu(x)
+            
+            # KL layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL)):
+                res = deconv(x)
+                if isinstance(res, tuple) and len(res) == 2:
+                    x, dkl = res
+                else:
+                    x = res
+                    dkl = getattr(deconv, '_last_dkl', None)
+                # KL layers output log-probabilities (always negative); skip ReLU
+            else:
+                x = deconv(x)
+                x = F.relu(x)
         
         # Final conv to RGB (outputs exactly 3 channels)
         x = self.final_conv(x)

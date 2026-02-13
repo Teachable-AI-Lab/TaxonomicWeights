@@ -1,0 +1,76 @@
+{
+  "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout",
+  "description": "Asymmetric CIFAR-10 Taxonomic Autoencoder with KL: 3 encoder layers (32x32->8x8) and 2 decoder layers (8x8->32x32) with no linear bottleneck",
+  "experiment_name": "asymmetric_kl_no_linear",
+  "data": {
+    "batch_size": 128,
+    "data_root": "./data/cifar10"
+  },
+  "model": {
+    "latent_dim": 256,
+    "temperature": 1.0,
+    "use_maxpool": true,
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "32x32x3 -> 16x16x(2^5-2^1) = 16x16x62"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "16x16x62 -> 8x8x(2^6-2^1) = 8x8x126"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 7,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "_comment": "8x8x126 -> 8x8x(2^7-2^1) = 8x8x254 (latent space)"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 6,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "8x8x254 -> 16x16x(2^6-2^1) = 16x16x126"
+      },
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 5,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "16x16x126 -> 32x32x(2^5-2^1) = 32x32x62, then final conv to 32x32x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 20,
+    "learning_rate": 0.001
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/cifar10/training/asymmetric_kl_no_linear/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/cifar10/training/asymmetric_kl_no_linear",
+    "analysis_save_dir": "outputs/cifar10/analysis/asymmetric_kl_no_linear"
+  }
+}

@@ -5,7 +5,7 @@ Encoder architectures using Taxonomic or Regular Convolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonConv
+from .taxon_layers import TaxonConv, TaxonConvKL
 
 
 class CIFAR10TaxonEncoder(nn.Module):
@@ -102,6 +102,12 @@ class CIFAR10TaxonEncoder(nn.Module):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
             
+            # Determine stride for layer (only used by regular Conv2d)
+            layer_stride = 1 if use_maxpool else strides[i]
+            
+            # Determine stride for layer (only used by regular Conv2d)
+            layer_stride = 1 if use_maxpool else strides[i]
+            
             if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
                 # Use TaxonConv
                 conv = TaxonConv(
@@ -115,6 +121,19 @@ class CIFAR10TaxonEncoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_conv_kl':
+                # Use TaxonConvKL (returns output, dkl)
+                conv = TaxonConvKL(
+                    in_channels=in_ch, 
+                    kernel_size=kernel_sizes[i], 
+                    n_layers=n_layers[i] if n_layers else 4, 
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'conv':
                 # Use regular Conv2d
                 out_ch = n_filters[i] if n_filters else 64
@@ -122,6 +141,7 @@ class CIFAR10TaxonEncoder(nn.Module):
                     in_channels=in_ch,
                     out_channels=out_ch,
                     kernel_size=kernel_sizes[i],
+                    stride=layer_stride,
                     padding=kernel_sizes[i] // 2,
                     bias=True
                 )
@@ -141,13 +161,22 @@ class CIFAR10TaxonEncoder(nn.Module):
         
     def forward(self, x):
         for i, conv in enumerate(self.conv_layers):
-            x = conv(x)
-            x = F.relu(x)
-            if self.strides[i] > 1:
-                if self.use_maxpool:
-                    x = F.max_pool2d(x, self.strides[i])
+            # KL layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(conv, TaxonConvKL):
+                res = conv(x)
+                if isinstance(res, tuple) and len(res) == 2:
+                    x, dkl = res
                 else:
-                    x = F.avg_pool2d(x, self.strides[i])
+                    x = res
+                    # attempt to retrieve stored KL if available
+                    dkl = getattr(conv, '_last_dkl', None)
+                # KL layers output log-probabilities (always negative); skip ReLU
+            else:
+                x = conv(x)
+                x = F.relu(x)
+            # Apply pooling for downsampling if use_maxpool is True
+            if self.use_maxpool and self.strides[i] > 1:
+                x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
         # Return spatial features (B, C, H, W)
         return x
@@ -226,6 +255,9 @@ class CelebAHQTaxonEncoder(nn.Module):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
             
+            # Determine stride for layer
+            layer_stride = 1 if use_maxpool else strides[i]
+            
             if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
                 # Use TaxonConv
                 conv = TaxonConv(
@@ -239,6 +271,19 @@ class CelebAHQTaxonEncoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_conv_kl':
+                # Use TaxonConvKL (returns output, dkl)
+                conv = TaxonConvKL(
+                    in_channels=in_ch, 
+                    kernel_size=kernel_sizes[i], 
+                    n_layers=n_layers[i] if n_layers else 4, 
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
             elif layer_type == 'conv':
                 # Use regular Conv2d
                 out_ch = n_filters[i] if n_filters else 64
@@ -246,6 +291,7 @@ class CelebAHQTaxonEncoder(nn.Module):
                     in_channels=in_ch,
                     out_channels=out_ch,
                     kernel_size=kernel_sizes[i],
+                    stride=layer_stride,
                     padding=kernel_sizes[i] // 2,
                     bias=True
                 )
@@ -266,8 +312,18 @@ class CelebAHQTaxonEncoder(nn.Module):
         
     def forward(self, x):
         for i, conv in enumerate(self.conv_layers):
-            x = conv(x)
-            x = F.relu(x)
+            # KL layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(conv, TaxonConvKL):
+                res = conv(x)
+                if isinstance(res, tuple) and len(res) == 2:
+                    x, dkl = res
+                else:
+                    x = res
+                    dkl = getattr(conv, '_last_dkl', None)
+                # KL layers output log-probabilities (always negative); skip ReLU
+            else:
+                x = conv(x)
+                x = F.relu(x)
             if self.strides[i] > 1:
                 if self.use_maxpool:
                     x = F.max_pool2d(x, self.strides[i])
