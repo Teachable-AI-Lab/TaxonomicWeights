@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_cifar10_ae
 #SBATCH --time=12:00:00
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --gpus-per-node=a40
 #SBATCH --exclude=spot,heistotron,clippy
 #SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/train_cifar10_ae.out

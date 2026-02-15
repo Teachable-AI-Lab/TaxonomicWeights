@@ -617,7 +617,12 @@ def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50
             if i >= num_batches:
                 break
             images = images.to(device)
-            latents = model.encode(images)
+            result = model.encode(images)
+            # Handle tuple return (latents, kl) from KL layers
+            if isinstance(result, tuple):
+                latents = result[0]
+            else:
+                latents = result
             all_latents.append(latents.cpu().numpy())
     
     all_latents = np.concatenate(all_latents, axis=0)
@@ -892,7 +897,12 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                         x = F.avg_pool2d(x, model.encoder.strides[i])
             
             # Latent (may be spatial or flat, so flatten for visualization)
-            latent = model.encode(img)
+            result = model.encode(img)
+            # Handle tuple return (latents, kl) from KL layers
+            if isinstance(result, tuple):
+                latent = result[0]
+            else:
+                latent = result
             
             # Flatten if spatial
             if latent.ndim > 2:

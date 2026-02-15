@@ -144,18 +144,33 @@ def test_model_loading(config_path):
     
     with torch.no_grad():
         # Test encoder
-        latent = model.encode(dummy_input)
+        enc_result = model.encode(dummy_input)
+        # Handle tuple return (latents, kl) from KL layers
+        if isinstance(enc_result, tuple):
+            latent = enc_result[0]
+        else:
+            latent = enc_result
         print(f"  Encoder output shape: {latent.shape}")
         
         # Verify encoder output is spatial (4D tensor: B, C, H, W)
         assert latent.ndim == 4, f"Encoder should output 4D tensor, got {latent.ndim}D"
         
         # Test decoder
-        reconstructed = model.decode(latent)
+        dec_result = model.decode(latent)
+        # Handle tuple return (reconstruction, kl) from KL layers
+        if isinstance(dec_result, tuple):
+            reconstructed = dec_result[0]
+        else:
+            reconstructed = dec_result
         print(f"  Decoder output shape: {reconstructed.shape} (expected: [{batch_size}, 3, 32, 32])")
         
         # Test full forward
-        output = model(dummy_input)
+        fwd_result = model(dummy_input)
+        # Handle tuple return (reconstruction, kl) from KL layers
+        if isinstance(fwd_result, tuple):
+            output = fwd_result[0]
+        else:
+            output = fwd_result
         print(f"  Full model output shape: {output.shape} (expected: [{batch_size}, 3, 32, 32])")
     
     # Verify shapes

@@ -4,7 +4,7 @@
   "experiment_name": "celebahq_asymmetric_kl_511",
   "data": {
     "data_root": "./data/celeba_hq",
-    "batch_size": 16,
+    "batch_size": 128,
     "num_workers": 4,
     "val_split": 0.1,
     "train_subset": null,
@@ -100,7 +100,7 @@
   "training": {
     "epochs": 10,
     "learning_rate": 0.001,
-    "kl_weight": 0.01,
+    "kl_weight": 0.005,
     "_comment": "kl_weight controls the weight of KL divergence in the total loss. CelebA-HQ uses smaller weight (0.01) to prevent overwhelming reconstruction loss."
   },
   "analysis": {

@@ -230,6 +230,16 @@ class CIFAR10TaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
+        # Check if any KL layers are used
+        has_kl = any('kl' in str(lt).lower() for lt in (layer_types if layer_types else []))
+        
+        # Add batch normalization before final conv if KL layers are present
+        # This normalizes log-probability features to a learnable range
+        if has_kl:
+            self.pre_final_norm = nn.BatchNorm2d(in_ch)
+        else:
+            self.pre_final_norm = None
+        
         # Final Conv2D layer to project to RGB (3 channels)
         self.final_conv = nn.Conv2d(
             in_channels=in_ch,
@@ -259,12 +269,17 @@ class CIFAR10TaxonDecoder(nn.Module):
                 if dkl is not None:
                     total_kl = total_kl + dkl
                     has_kl_layers = True
-                # KL layers output log-probabilities (always negative); skip ReLU
+                # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
                 x = F.relu(x)
         
+        # Apply batch norm before final conv if present (for KL layers)
+        if self.pre_final_norm is not None:
+            x = self.pre_final_norm(x)
+        
         # Final conv to RGB (outputs exactly 3 channels)
+        # For KL layers: log-probs are treated as features, final conv learns RGB mapping
         x = self.final_conv(x)
         
         # Apply tanh activation for output in [-1, 1] range
@@ -479,6 +494,16 @@ class CelebAHQTaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
+        # Check if any KL layers are used
+        has_kl = any('kl' in str(lt).lower() for lt in (layer_types if layer_types else []))
+        
+        # Add batch normalization before final conv if KL layers are present
+        # This normalizes log-probability features to a learnable range
+        if has_kl:
+            self.pre_final_norm = nn.BatchNorm2d(in_ch)
+        else:
+            self.pre_final_norm = None
+        
         # Final Conv2D layer to project to RGB (3 channels)
         self.final_conv = nn.Conv2d(
             in_channels=in_ch,
@@ -508,12 +533,17 @@ class CelebAHQTaxonDecoder(nn.Module):
                 if dkl is not None:
                     total_kl = total_kl + dkl
                     has_kl_layers = True
-                # KL layers output log-probabilities (always negative); skip ReLU
+                # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
                 x = F.relu(x)
         
+        # Apply batch norm before final conv if present (for KL layers)
+        if self.pre_final_norm is not None:
+            x = self.pre_final_norm(x)
+        
         # Final conv to RGB (outputs exactly 3 channels)
+        # For KL layers: log-probs are treated as features, final conv learns RGB mapping
         x = self.final_conv(x)
         
         # Apply activation based on config

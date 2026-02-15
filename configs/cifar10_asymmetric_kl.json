@@ -58,10 +58,10 @@
     ]
   },
   "training": {
-    "epochs": 20,
+    "epochs": 50,
     "learning_rate": 0.001,
-    "kl_weight": 1.0,
-    "_comment": "kl_weight controls the weight of KL divergence in the total loss. Set to 0 to ignore KL, 1.0 for equal weighting with reconstruction loss."
+    "kl_weight": 0.001,
+    "_comment": "kl_weight controls the weight of KL divergence in the total loss. Lower weight (0.01) allows model to focus on reconstruction quality first."
   },
   "analysis": {
     "checkpoint_path": "outputs/cifar10/training/asymmetric_kl_no_linear/final_model.pt",
