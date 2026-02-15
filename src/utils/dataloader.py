@@ -38,7 +38,7 @@ class CIFAR10Loader:
         self.testset = datasets.CIFAR10(root=self.root, train=False, download=True, transform=self.transform)
         
         self.train_loader = DataLoader(self.trainset, batch_size=self.batch_size, shuffle=True)
-        self.test_loader = DataLoader(self.testset, batch_size=self.batch_size, shuffle=True)
+        self.test_loader = DataLoader(self.testset, batch_size=self.batch_size, shuffle=False)
     
     def get_loaders(self):
         """Returns train and test loaders."""

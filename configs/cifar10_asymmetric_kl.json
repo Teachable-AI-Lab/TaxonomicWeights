@@ -1,7 +1,7 @@
 {
   "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout",
   "description": "Asymmetric CIFAR-10 Taxonomic Autoencoder with KL: 3 encoder layers (32x32->8x8) and 2 decoder layers (8x8->32x32) with no linear bottleneck",
-  "experiment_name": "asymmetric_kl_no_linear",
+  "experiment_name": "asymmetric_kl_no_linear_ar",
   "data": {
     "batch_size": 128,
     "data_root": "./data/cifar10"
@@ -64,7 +64,7 @@
     "_comment": "kl_weight controls the weight of KL divergence in the total loss. Lower weight (0.01) allows model to focus on reconstruction quality first."
   },
   "analysis": {
-    "checkpoint_path": "outputs/cifar10/training/asymmetric_kl_no_linear/final_model.pt",
+    "checkpoint_path": "outputs/cifar10/training/asymmetric_kl_no_linear_ar/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -72,7 +72,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/cifar10/training/asymmetric_kl_no_linear",
-    "analysis_save_dir": "outputs/cifar10/analysis/asymmetric_kl_no_linear"
+    "training_save_dir": "outputs/cifar10/training/asymmetric_kl_no_linear_ar",
+    "analysis_save_dir": "outputs/cifar10/analysis/asymmetric_kl_no_linear_ar"
   }
 }
