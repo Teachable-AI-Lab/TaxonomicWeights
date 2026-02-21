@@ -1,0 +1,99 @@
+{
+  "_comment": "Multi-hierarchy CelebA-HQ Taxonomic Autoencoder: 5 independent hierarchies per layer, each with 4 hierarchy levels (n_layers=4), kernel_size=13. Each block outputs 5*(2^0+2^1+2^2+2^3+2^4)=5*31=155 channels. Same 3-encoder + 3-decoder spatial structure as celebahq_large_kernel.",
+  "description": "CelebA-HQ Taxonomic AE with n_hierarchies=5, n_layers=4 per hierarchy, kernel_size=13. 155 channels per block (5 independent taxonomic trees × 31 channels each). Spatial chain: 256->128->64->32 (encoder), 32->64->128->256 (decoder).",
+  "experiment_name": "celebahq_multi_hierarchy",
+  "data": {
+    "data_root": "./data/celeba_hq",
+    "batch_size": 32,
+    "num_workers": 4,
+    "val_split": 0.1,
+    "train_subset": null,
+    "val_subset": null,
+    "_comment_subset": "Set train_subset/val_subset to an integer (e.g., 5000) to train on a smaller subset for faster iteration. null = use full dataset"
+  },
+  "model": {
+    "latent_dim": 155,
+    "temperature": 1.0,
+    "use_maxpool": false,
+    "output_activation": "sigmoid",
+    "_comment_n_hierarchies": "n_hierarchies=5 means 5 independent TaxonConv trees per layer, each with n_layers=4 levels. Outputs are concatenated: 5 * sum(2^j for j=0..4) = 5 * 31 = 155 channels per block.",
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "_comment": "256x256x3 -> 128x128x155 (5 hierarchies * 31 channels each)"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "_comment": "128x128x155 -> 64x64x155"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "_comment": "64x64x155 -> 32x32x155 (latent space: 32x32x155)"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "output_padding": 1,
+        "_comment": "32x32x155 -> 64x64x155"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "output_padding": 1,
+        "_comment": "64x64x155 -> 128x128x155"
+      },
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "output_padding": 1,
+        "_comment": "128x128x155 -> 256x256x155, then final conv to 256x256x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 20,
+    "learning_rate": 0.0003,
+    "kl_weight": 1.0
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/celebahq/training/celebahq_multi_hierarchy/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/celebahq/training/celebahq_multi_hierarchy",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_multi_hierarchy"
+  }
+}

@@ -44,8 +44,9 @@ class CIFAR10TaxonAutoencoder(nn.Module):
                  encoder_n_layers=None, decoder_n_layers=None,
                  encoder_n_filters=None, decoder_n_filters=None,
                  encoder_layer_types=None, decoder_layer_types=None,
-                 decoder_paddings=None, decoder_output_paddings=None, 
-                 use_maxpool=True, random_init_alphas=False,
+                 decoder_paddings=None, decoder_output_paddings=None,
+                 use_maxpool=True, encoder_n_hierarchies=None, decoder_n_hierarchies=None,
+                 random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None):
         super(CIFAR10TaxonAutoencoder, self).__init__()
@@ -62,7 +63,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             initial_size = initial_size // encoder_strides[0] // encoder_strides[1]
         
         self.encoder = CIFAR10TaxonEncoder(
-            latent_dim=latent_dim, 
+            latent_dim=latent_dim,
             temperature=temperature,
             kernel_sizes=encoder_kernel_sizes,
             strides=encoder_strides,
@@ -70,17 +71,18 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
             use_maxpool=use_maxpool,
+            n_hierarchies=encoder_n_hierarchies,
             random_init_alphas=random_init_alphas,
             alpha_init_distribution=alpha_init_distribution,
             alpha_init_range=alpha_init_range,
             alpha_init_seed=alpha_init_seed
         )
-        
+
         # Get encoder's final channels for decoder input
         encoder_final_channels = self.encoder.final_channels
-        
+
         self.decoder = CIFAR10TaxonDecoder(
-            latent_dim=latent_dim, 
+            latent_dim=latent_dim,
             temperature=temperature,
             kernel_sizes=decoder_kernel_sizes,
             strides=decoder_strides,
@@ -92,6 +94,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
             use_maxpool=use_maxpool,
+            n_hierarchies=decoder_n_hierarchies,
             random_init_alphas=random_init_alphas,
             alpha_init_distribution=alpha_init_distribution,
             alpha_init_range=alpha_init_range,
@@ -216,8 +219,9 @@ class CelebAHQTaxonAutoencoder(nn.Module):
                  encoder_n_layers=None, decoder_n_layers=None,
                  encoder_n_filters=None, decoder_n_filters=None,
                  encoder_layer_types=None, decoder_layer_types=None,
-                 decoder_paddings=None, decoder_output_paddings=None, 
-                 use_maxpool=True, random_init_alphas=False,
+                 decoder_paddings=None, decoder_output_paddings=None,
+                 use_maxpool=True, encoder_n_hierarchies=None, decoder_n_hierarchies=None,
+                 random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None, output_activation='sigmoid'):
         super(CelebAHQTaxonAutoencoder, self).__init__()
@@ -240,7 +244,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             initial_size = 16
         
         self.encoder = CelebAHQTaxonEncoder(
-            latent_dim=latent_dim, 
+            latent_dim=latent_dim,
             temperature=temperature,
             kernel_sizes=encoder_kernel_sizes,
             strides=encoder_strides,
@@ -248,17 +252,18 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
             use_maxpool=use_maxpool,
+            n_hierarchies=encoder_n_hierarchies,
             random_init_alphas=random_init_alphas,
             alpha_init_distribution=alpha_init_distribution,
             alpha_init_range=alpha_init_range,
             alpha_init_seed=alpha_init_seed
         )
-        
+
         # Get encoder's final channels for decoder input
         encoder_final_channels = self.encoder.final_channels
-        
+
         self.decoder = CelebAHQTaxonDecoder(
-            latent_dim=latent_dim, 
+            latent_dim=latent_dim,
             temperature=temperature,
             kernel_sizes=decoder_kernel_sizes,
             strides=decoder_strides,
@@ -270,6 +275,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
             use_maxpool=use_maxpool,
+            n_hierarchies=decoder_n_hierarchies,
             random_init_alphas=random_init_alphas,
             alpha_init_distribution=alpha_init_distribution,
             alpha_init_range=alpha_init_range,

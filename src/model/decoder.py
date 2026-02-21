@@ -5,7 +5,7 @@ Decoder architectures using Taxonomic or Regular Deconvolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonDeconv, TaxonConv, TaxonDeconvKL, TaxonConvKL
+from .taxon_layers import TaxonDeconv, TaxonConv, TaxonDeconvKL, TaxonConvKL, MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv
 
 
 class CIFAR10TaxonDecoder(nn.Module):
@@ -34,10 +34,11 @@ class CIFAR10TaxonDecoder(nn.Module):
         Number of channels from encoder output
     """
     
-    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None, 
-                 strides=None, paddings=None, output_paddings=None, n_layers=None, 
+    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None,
+                 strides=None, paddings=None, output_paddings=None, n_layers=None,
                  n_filters=None, layer_types=None, initial_spatial_size=4,
-                 encoder_final_channels=None, use_maxpool=True, random_init_alphas=False,
+                 encoder_final_channels=None, use_maxpool=True, n_hierarchies=None,
+                 random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None):
         super(CIFAR10TaxonDecoder, self).__init__()
@@ -118,12 +119,20 @@ class CIFAR10TaxonDecoder(nn.Module):
             elif isinstance(n_filters, list) and len(n_filters) < num_layers:
                 while len(n_filters) < num_layers:
                     n_filters = n_filters + [n_filters[-1]]
-        
+
+        # Handle n_hierarchies
+        if n_hierarchies is not None:
+            if isinstance(n_hierarchies, int):
+                n_hierarchies = [n_hierarchies] * num_layers
+            elif isinstance(n_hierarchies, list) and len(n_hierarchies) < num_layers:
+                while len(n_hierarchies) < num_layers:
+                    n_hierarchies = n_hierarchies + [1]
+
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.layer_types = layer_types
         self.strides = strides
-        
+
         # Spatial input from encoder - no linear layer needed
         initial_channels = encoder_final_channels if encoder_final_channels else (
             sum(2**i for i in range((n_layers[0] if n_layers else 6) + 1))
@@ -131,64 +140,94 @@ class CIFAR10TaxonDecoder(nn.Module):
                 n_filters[0] if n_filters else 128
             )
         )
-        
+
         self.initial_channels = initial_channels
         self.initial_spatial_size = initial_spatial_size
-        
+
         # Build decoder layers dynamically based on layer_type
         self.deconv_layers = nn.ModuleList()
         in_ch = initial_channels
         for i in range(self.num_layers):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
-            
+            n_hier = n_hierarchies[i] if n_hierarchies else 1
+            _n_lay = n_layers[i] if n_layers else 4
+
             if layer_type == 'taxonomic_deconv' or layer_type == 'taxonomic':
-                # Always use TaxonDeconv for decoder upsampling
-                layer = TaxonDeconv(
-                    in_channels=in_ch, 
-                    out_channels=1, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    stride=strides[i], 
-                    padding=paddings[i],
-                    output_padding=output_paddings[i], 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
             elif layer_type == 'taxonomic_deconv_kl':
                 # Always use TaxonDeconvKL for decoder upsampling
                 layer = TaxonDeconvKL(
-                    in_channels=in_ch, 
-                    out_channels=1, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    stride=strides[i], 
-                    padding=paddings[i],
-                    output_padding=output_paddings[i], 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
-            elif layer_type == 'taxonomic_conv':
-                # Use TaxonConv for regular convolution
-                layer = TaxonConv(
                     in_channels=in_ch,
+                    out_channels=1,
                     kernel_size=kernel_sizes[i],
-                    n_layers=n_layers[i] if n_layers else 4,
+                    n_layers=_n_lay,
+                    stride=strides[i],
+                    padding=paddings[i],
+                    output_padding=output_paddings[i],
                     temperature=temperature,
                     random_init_alphas=random_init_alphas,
                     alpha_init_distribution=alpha_init_distribution,
                     alpha_init_range=alpha_init_range,
                     alpha_init_seed=layer_seed
                 )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+                out_ch = sum(2**j for j in range(1, _n_lay + 1))
+            elif layer_type == 'taxonomic_conv':
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
             elif layer_type == 'taxonomic_conv_kl':
                 # Use TaxonConvKL (returns output, dkl)
                 layer = TaxonConvKL(
@@ -295,10 +334,11 @@ class CIFAR10TaxonDecoder(nn.Module):
 class CelebAHQTaxonDecoder(nn.Module):
     """Decoder for CelebA-HQ images (256x256x3) supporting Taxonomic and Regular layers."""
     
-    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None, 
-                 strides=None, paddings=None, output_paddings=None, n_layers=None, 
+    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=None,
+                 strides=None, paddings=None, output_paddings=None, n_layers=None,
                  n_filters=None, layer_types=None, initial_spatial_size=16,
-                 encoder_final_channels=None, use_maxpool=True, random_init_alphas=False,
+                 encoder_final_channels=None, use_maxpool=True, n_hierarchies=None,
+                 random_init_alphas=False,
                  alpha_init_distribution="uniform", alpha_init_range=None,
                  alpha_init_seed=None, output_activation='sigmoid'):
         super(CelebAHQTaxonDecoder, self).__init__()
@@ -382,12 +422,20 @@ class CelebAHQTaxonDecoder(nn.Module):
             elif isinstance(n_filters, list) and len(n_filters) < num_layers:
                 while len(n_filters) < num_layers:
                     n_filters = n_filters + [n_filters[-1]]
-        
+
+        # Handle n_hierarchies
+        if n_hierarchies is not None:
+            if isinstance(n_hierarchies, int):
+                n_hierarchies = [n_hierarchies] * num_layers
+            elif isinstance(n_hierarchies, list) and len(n_hierarchies) < num_layers:
+                while len(n_hierarchies) < num_layers:
+                    n_hierarchies = n_hierarchies + [1]
+
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.layer_types = layer_types
         self.strides = strides
-        
+
         # Spatial input from encoder - no linear layer needed
         initial_channels = encoder_final_channels if encoder_final_channels else (
             sum(2**i for i in range((n_layers[0] if n_layers else 9) + 1))
@@ -395,64 +443,94 @@ class CelebAHQTaxonDecoder(nn.Module):
                 n_filters[0] if n_filters else 512
             )
         )
-        
+
         self.initial_channels = initial_channels
         self.initial_spatial_size = initial_spatial_size
-        
+
         # Build decoder layers dynamically based on layer_type
         self.deconv_layers = nn.ModuleList()
         in_ch = initial_channels
         for i in range(self.num_layers):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
-            
+            n_hier = n_hierarchies[i] if n_hierarchies else 1
+            _n_lay = n_layers[i] if n_layers else 4
+
             if layer_type == 'taxonomic_deconv' or layer_type == 'taxonomic':
-                # Always use TaxonDeconv for decoder upsampling
-                layer = TaxonDeconv(
-                    in_channels=in_ch, 
-                    out_channels=1, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    stride=strides[i], 
-                    padding=paddings[i],
-                    output_padding=output_paddings[i], 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
             elif layer_type == 'taxonomic_deconv_kl':
                 # Always use TaxonDeconvKL for decoder upsampling
                 layer = TaxonDeconvKL(
-                    in_channels=in_ch, 
-                    out_channels=1, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    stride=strides[i], 
-                    padding=paddings[i],
-                    output_padding=output_paddings[i], 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
-            elif layer_type == 'taxonomic_conv':
-                # Use TaxonConv for regular convolution
-                layer = TaxonConv(
                     in_channels=in_ch,
+                    out_channels=1,
                     kernel_size=kernel_sizes[i],
-                    n_layers=n_layers[i] if n_layers else 4,
+                    n_layers=_n_lay,
+                    stride=strides[i],
+                    padding=paddings[i],
+                    output_padding=output_paddings[i],
                     temperature=temperature,
                     random_init_alphas=random_init_alphas,
                     alpha_init_distribution=alpha_init_distribution,
                     alpha_init_range=alpha_init_range,
                     alpha_init_seed=layer_seed
                 )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+                out_ch = sum(2**j for j in range(1, _n_lay + 1))
+            elif layer_type == 'taxonomic_conv':
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
             elif layer_type == 'taxonomic_conv_kl':
                 # Use TaxonConvKL (returns output, dkl)
                 layer = TaxonConvKL(

@@ -26,15 +26,53 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CelebAHQTaxonAutoencoder
-from src.model.taxon_layers import TaxonConv, TaxonDeconv
+from src.model.taxon_layers import (TaxonConv, TaxonDeconv,
+                                     MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv)
 from src.utils.dataloader import CelebAHQLoader
+
+
+# ---------------------------------------------------------------------------
+# Multi-hierarchy utilities
+# ---------------------------------------------------------------------------
+
+def _is_multi_hierarchy(layer):
+    """Return True if layer is a multi-hierarchy wrapper."""
+    return isinstance(layer, (MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv))
+
+
+def _is_any_taxon_layer(layer):
+    """Return True for any taxonomic layer type (single or multi)."""
+    return isinstance(layer, (TaxonConv, TaxonDeconv,
+                               MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv))
+
+
+def _get_sub_layers(layer):
+    """Return list of (sub_layer, hierarchy_index) pairs.
+
+    For single-hierarchy layers returns ``[(layer, 0)]``.
+    For multi-hierarchy wrappers returns
+    ``[(layer.hierarchies[h], h) for h in range(n_hierarchies)]``.
+    """
+    if _is_multi_hierarchy(layer):
+        return [(sub, h) for h, sub in enumerate(layer.hierarchies)]
+    return [(layer, 0)]
+
+
+def _channels_per_single_hierarchy(layer):
+    """Return the number of output channels produced by one hierarchy tree."""
+    if _is_multi_hierarchy(layer):
+        return layer.hierarchies[0].num_output_channels()
+    return layer.num_output_channels()
+
+
+# ---------------------------------------------------------------------------
 
 
 def parse_layer_config(config_layers):
     """Parse layer configuration from JSON into model parameters."""
     if not config_layers:
-        return None, None, None, None, None, None
-    
+        return None, None, None, None, None, None, None, None
+
     n_layers_list = []
     n_filters_list = []
     layer_types_list = []
@@ -42,33 +80,37 @@ def parse_layer_config(config_layers):
     strides_list = []
     paddings_list = []
     output_paddings_list = []
-    
+    n_hierarchies_list = []
+
     for layer in config_layers:
         layer_type = layer.get('layer_type', 'taxonomic_conv')
         layer_types_list.append(layer_type)
-        
+
         if 'n_layers' in layer:
             n_layers_list.append(layer['n_layers'])
         else:
             n_layers_list.append(None)
-        
+
         if 'n_filters' in layer:
             n_filters_list.append(layer['n_filters'])
         else:
             n_filters_list.append(None)
-        
+
         kernel_sizes_list.append(layer.get('kernel_size', 3))
         strides_list.append(layer.get('stride', 1))
         paddings_list.append(layer.get('padding', None))
         output_paddings_list.append(layer.get('output_padding', 0))
-    
+        n_hierarchies_list.append(layer.get('n_hierarchies', 1))
+
     # Clean up None lists
     n_layers_out = n_layers_list if any(x is not None for x in n_layers_list) else None
     n_filters_out = n_filters_list if any(x is not None for x in n_filters_list) else None
     paddings_out = paddings_list if any(x is not None for x in paddings_list) else None
-    
-    return (n_layers_out, n_filters_out, layer_types_list, 
-            kernel_sizes_list, strides_list, paddings_out, output_paddings_list)
+    n_hierarchies_out = n_hierarchies_list if any(x != 1 for x in n_hierarchies_list) else None
+
+    return (n_layers_out, n_filters_out, layer_types_list,
+            kernel_sizes_list, strides_list, paddings_out, output_paddings_list,
+            n_hierarchies_out)
 
 
 def load_config(config_path):
@@ -122,11 +164,11 @@ def load_model(checkpoint_path, device, config=None):
     encoder_layers = model_config.get('encoder_layers', [])
     decoder_layers = model_config.get('decoder_layers', [])
     
-    (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes, 
-        enc_strides, enc_paddings, enc_output_paddings) = parse_layer_config(encoder_layers)
-    
-    (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes, 
-        dec_strides, dec_paddings, dec_output_paddings) = parse_layer_config(decoder_layers)
+    (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes,
+        enc_strides, enc_paddings, enc_output_paddings, enc_n_hierarchies) = parse_layer_config(encoder_layers)
+
+    (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes,
+        dec_strides, dec_paddings, dec_output_paddings, dec_n_hierarchies) = parse_layer_config(decoder_layers)
     
     # Get taxonomic-specific settings
     temperature = model_config.get('temperature', 1.0)
@@ -153,6 +195,8 @@ def load_model(checkpoint_path, device, config=None):
         decoder_paddings=dec_paddings,
         decoder_output_paddings=dec_output_paddings,
         use_maxpool=use_maxpool,
+        encoder_n_hierarchies=enc_n_hierarchies,
+        decoder_n_hierarchies=dec_n_hierarchies,
         random_init_alphas=random_init_alphas,
         alpha_init_distribution=alpha_init_distribution,
         alpha_init_range=alpha_init_range,
@@ -171,136 +215,164 @@ def load_model(checkpoint_path, device, config=None):
 
 
 def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n_cols=8):
-    """Visualize hierarchical filters from a TaxonConv layer."""
-    
-    # Get the TaxonConv layer
+    """Visualize hierarchical filters from a TaxonConv layer, covering all hierarchies."""
+
+    # Get the layer (may be TaxonConv or MultiHierarchyTaxonConv)
     if layer_name.startswith('encoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
-        taxon_conv = model.encoder.conv_layers[layer_idx]
+        layer = model.encoder.conv_layers[layer_idx]
     elif layer_name == 'final_conv':
         # final_conv is now a regular Conv2D, skip visualization
         print(f"  Skipping {layer_name} - it's a regular Conv2D, not a TaxonConv")
         return
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
-    
-    # Get hierarchy weights
-    weights = taxon_conv.get_hierarchy_weights()
-    
-    # Create subdirectory for this layer
-    layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
-    os.makedirs(layer_dir, exist_ok=True)
-    
-    # Visualize each level
-    for level_idx, w_tensor in enumerate(weights):
-        w_np = w_tensor.detach().cpu().numpy()
-        n_filters, in_ch, k, _ = w_np.shape
-        
-        # Normalize per filter
-        mins = w_np.min(axis=(1, 2, 3), keepdims=True)
-        maxs = w_np.max(axis=(1, 2, 3), keepdims=True)
-        w_norm = (w_np - mins) / (maxs - mins + 1e-5)
-        
-        # Grid setup
-        n_rows = int(np.ceil(n_filters / n_cols))
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
-        if n_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-        
-        for i in range(n_filters):
-            filt = w_norm[i]
-            
-            if in_ch == 1:
-                filt = filt.squeeze()
-                cmap = 'gray'
-            elif in_ch == 3:
-                filt = np.transpose(filt, (1, 2, 0))
-                cmap = None
-            else:
-                # Too many channels - average across all input channels
-                filt = filt.mean(axis=0)
-                cmap = 'viridis'
-            
-            axes[i].imshow(filt, cmap=cmap)
-            axes[i].axis('off')
-        
-        # Turn off extra axes
-        for ax in axes[n_filters:]:
-            ax.axis('off')
-        
-        plt.suptitle(f'{layer_name} Level {level_idx} ({n_filters} filters, {in_ch}ch, {k}×{k})')
-        plt.tight_layout()
-        plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  Saved {layer_name} level {level_idx} ({n_filters} filters)")
-    
-    print(f"Conv filter visualizations saved to {layer_dir}")
+
+    # Base directory for this layer's filter visualizations
+    base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
+
+    sub_layers = _get_sub_layers(layer)
+    multi = len(sub_layers) > 1
+    if multi:
+        print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
+
+    for sub_layer, h_idx in sub_layers:
+        # Per-hierarchy subdirectory for multi-hierarchy; flat dir for single
+        if multi:
+            layer_dir = os.path.join(base_layer_dir, f'hierarchy_{h_idx:02d}')
+            h_label = f" (hierarchy {h_idx})"
+        else:
+            layer_dir = base_layer_dir
+            h_label = ""
+        os.makedirs(layer_dir, exist_ok=True)
+
+        # Get hierarchy weights from this individual sub-layer
+        weights = sub_layer.get_hierarchy_weights()
+
+        # Visualize each level
+        for level_idx, w_tensor in enumerate(weights):
+            w_np = w_tensor.detach().cpu().numpy()
+            n_filters, in_ch, k, _ = w_np.shape
+
+            # Normalize per filter
+            mins = w_np.min(axis=(1, 2, 3), keepdims=True)
+            maxs = w_np.max(axis=(1, 2, 3), keepdims=True)
+            w_norm = (w_np - mins) / (maxs - mins + 1e-5)
+
+            # Grid setup
+            n_rows = int(np.ceil(n_filters / n_cols))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            axes = axes.flatten()
+
+            for i in range(n_filters):
+                filt = w_norm[i]
+
+                if in_ch == 1:
+                    filt = filt.squeeze()
+                    cmap = 'gray'
+                elif in_ch == 3:
+                    filt = np.transpose(filt, (1, 2, 0))
+                    cmap = None
+                else:
+                    # Too many channels - average across all input channels
+                    filt = filt.mean(axis=0)
+                    cmap = 'viridis'
+
+                axes[i].imshow(filt, cmap=cmap)
+                axes[i].axis('off')
+
+            # Turn off extra axes
+            for ax in axes[n_filters:]:
+                ax.axis('off')
+
+            plt.suptitle(f'{layer_name}{h_label} Level {level_idx} ({n_filters} filters, {in_ch}ch, {k}×{k})')
+            plt.tight_layout()
+            plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"  Saved {layer_name}{h_label} level {level_idx} ({n_filters} filters)")
+
+        print(f"Conv filter visualizations saved to {layer_dir}")
 
 
 def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
-    """Visualize hierarchical filters from a TaxonDeconv layer."""
-    
-    # Get the TaxonDeconv layer
+    """Visualize hierarchical filters from a TaxonDeconv layer, covering all hierarchies."""
+
+    # Get the layer (may be TaxonDeconv or MultiHierarchyTaxonDeconv)
     if layer_name.startswith('decoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
-        taxon_deconv = model.decoder.deconv_layers[layer_idx]
+        layer = model.decoder.deconv_layers[layer_idx]
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
-    
-    # Get hierarchy weights
-    weights = taxon_deconv.get_hierarchy_weights()
-    
-    # Create subdirectory for this layer
-    layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
-    os.makedirs(layer_dir, exist_ok=True)
-    
-    # Visualize each level with cumulative filter indices
-    cumulative_filter_count = 0
-    for level_idx, w_tensor in enumerate(weights):
-        w_np = w_tensor.detach().cpu().numpy()
-        in_ch, out_ch, k, _ = w_np.shape
-        
-        # For deconv, visualize a subset of output filters
-        max_filters = min(out_ch, n_cols * 8)
-        w_subset = w_np[:, :max_filters, :, :]
-        
-        # Average across input channels for visualization
-        w_display = w_subset.mean(axis=0)
-        
-        # Normalize
-        mins = w_display.min(axis=(1, 2), keepdims=True)
-        maxs = w_display.max(axis=(1, 2), keepdims=True)
-        w_norm = (w_display - mins) / (maxs - mins + 1e-5)
-        
-        # Grid setup
-        n_rows = int(np.ceil(max_filters / n_cols))
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
-        if n_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-        
-        for i in range(max_filters):
-            axes[i].imshow(w_norm[i], cmap='viridis')
-            axes[i].axis('off')
-            axes[i].set_title(f'F{cumulative_filter_count + i}', fontsize=8)
-        
-        # Update cumulative count
-        cumulative_filter_count += out_ch
-        
-        # Turn off extra axes
-        for ax in axes[max_filters:]:
-            ax.axis('off')
-        
-        plt.suptitle(f'{layer_name} Level {level_idx} ({out_ch} filters, avg of {in_ch} in_ch, {k}×{k})')
-        plt.tight_layout()
-        plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  Saved {layer_name} level {level_idx} (showing {max_filters}/{out_ch} filters)")
-    
-    print(f"Deconv filter visualizations saved to {layer_dir}")
+
+    # Base directory for this layer's filter visualizations
+    base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
+
+    sub_layers = _get_sub_layers(layer)
+    multi = len(sub_layers) > 1
+    if multi:
+        print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
+
+    for sub_layer, h_idx in sub_layers:
+        # Per-hierarchy subdirectory for multi-hierarchy; flat dir for single
+        if multi:
+            layer_dir = os.path.join(base_layer_dir, f'hierarchy_{h_idx:02d}')
+            h_label = f" (hierarchy {h_idx})"
+        else:
+            layer_dir = base_layer_dir
+            h_label = ""
+        os.makedirs(layer_dir, exist_ok=True)
+
+        # Get hierarchy weights from this individual sub-layer
+        weights = sub_layer.get_hierarchy_weights()
+
+        # Visualize each level with cumulative filter indices (reset per hierarchy)
+        cumulative_filter_count = 0
+        for level_idx, w_tensor in enumerate(weights):
+            w_np = w_tensor.detach().cpu().numpy()
+            in_ch, out_ch, k, _ = w_np.shape
+
+            # For deconv, visualize a subset of output filters
+            max_filters = min(out_ch, n_cols * 8)
+            w_subset = w_np[:, :max_filters, :, :]
+
+            # Average across input channels for visualization
+            w_display = w_subset.mean(axis=0)
+
+            # Normalize
+            mins = w_display.min(axis=(1, 2), keepdims=True)
+            maxs = w_display.max(axis=(1, 2), keepdims=True)
+            w_norm = (w_display - mins) / (maxs - mins + 1e-5)
+
+            # Grid setup
+            n_rows = int(np.ceil(max_filters / n_cols))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            axes = axes.flatten()
+
+            for i in range(max_filters):
+                axes[i].imshow(w_norm[i], cmap='viridis')
+                axes[i].axis('off')
+                axes[i].set_title(f'F{cumulative_filter_count + i}', fontsize=8)
+
+            # Update cumulative count
+            cumulative_filter_count += out_ch
+
+            # Turn off extra axes
+            for ax in axes[max_filters:]:
+                ax.axis('off')
+
+            plt.suptitle(f'{layer_name}{h_label} Level {level_idx} ({out_ch} filters, avg of {in_ch} in_ch, {k}×{k})')
+            plt.tight_layout()
+            plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"  Saved {layer_name}{h_label} level {level_idx} (showing {max_filters}/{out_ch} filters)")
+
+        print(f"Deconv filter visualizations saved to {layer_dir}")
 
 
 def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activations=None):
@@ -605,6 +677,273 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
     print(f"  Saved taxonomy tree to {save_path} (full resolution preserved)")
 
 
+def visualize_taxonomy_subtree(layer, layer_name, save_dir, start_level, start_node_idx,
+                                subtree_depth=4, activations=None):
+    """Visualize a sub-hierarchy of the taxonomy tree rooted at a specific node.
+
+    Renders a tree of ``subtree_depth`` levels starting from the node at global
+    position ``(start_level, start_node_idx)`` and expanding downward toward the
+    leaves.  All filter images and alpha weights are looked up using the correct
+    *global* level and node index so the displayed content is exactly the portion
+    of the full hierarchy associated with that sub-tree.
+
+    Args:
+        layer: TaxonConv or TaxonDeconv layer
+        layer_name: Human-readable layer name
+        save_dir: Directory in which to save this sub-tree image
+        start_level: Global hierarchy level of the sub-tree root (0 = true root)
+        start_node_idx: Index of the root node within start_level
+        subtree_depth: Number of levels to render, including the root
+        activations: Optional activation tensor (1, C, H, W)
+    """
+    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+
+    has_alphas = (hasattr(layer, 'alphas') and len(layer.alphas) > 0)
+    alpha_values = []
+    if has_alphas:
+        for i, alpha in enumerate(layer.alphas):
+            alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
+            alpha_values.append(alpha_sig)
+
+    is_deconv = isinstance(layer, TaxonDeconv)
+    if activations is not None:
+        acts = activations[0].detach().cpu().numpy()  # (C, H, W)
+        image_type = "activations"
+    else:
+        hierarchy_weights = layer.get_hierarchy_weights()
+        image_type = "filters"
+
+    n_layers = layer.n_layers
+    # Cap depth so we never descend past the actual leaves
+    actual_depth = min(subtree_depth, n_layers - start_level + 1)
+
+    max_nodes = 2 ** (actual_depth - 1)
+    fig_width = max(30, max_nodes * 6.0)
+    fig_height = 30
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=100)
+    ax.axis('off')
+
+    positions = {}
+    node_labels = {}
+    node_image_indices = {}
+    edges = []
+    edge_labels = {}
+
+    # Channels per output node (Conv = 1, Deconv = out_channels)
+    per_node_channels = 1 if not is_deconv else layer.out_channels
+
+    # ---- Sub-tree root (sub-level 0) ----
+    positions[0] = (0.5, 0.88)
+    node_labels[0] = f"L{start_level}N{start_node_idx}"
+    if image_type == "activations":
+        # BFS channel offset: (2^GL - 1 + GN) * per_node_channels
+        root_ch = ((2 ** start_level - 1) + start_node_idx) * per_node_channels
+        node_image_indices[0] = (root_ch, root_ch + per_node_channels)
+    else:
+        node_image_indices[0] = (start_level, start_node_idx)
+
+    node_counter = 1
+    vertical_spacing = 0.55 / actual_depth
+
+    for sub_level in range(1, actual_depth):
+        global_level = start_level + sub_level
+        if global_level > n_layers:
+            break
+
+        num_nodes = 2 ** sub_level
+        y_pos = 0.88 - sub_level * vertical_spacing
+        padding = 0.10
+        available_width = 1.0 - 2 * padding
+
+        for sub_node_idx in range(num_nodes):
+            node_id = node_counter + sub_node_idx
+            x_pos = (0.5 if num_nodes == 1
+                     else padding + available_width * sub_node_idx / (num_nodes - 1))
+            positions[node_id] = (x_pos, y_pos)
+
+            # Global node index within global_level
+            global_node_idx = start_node_idx * (2 ** sub_level) + sub_node_idx
+            node_labels[node_id] = f"L{global_level}N{global_node_idx}"
+
+            if image_type == "activations":
+                chan_start = ((2 ** global_level - 1) + global_node_idx) * per_node_channels
+                node_image_indices[node_id] = (chan_start, chan_start + per_node_channels)
+            else:
+                node_image_indices[node_id] = (global_level, global_node_idx)
+
+            # Parent in sub-tree coordinate space
+            sub_parent_idx = sub_node_idx // 2
+            parent_id = sum(2 ** i for i in range(sub_level - 1)) + sub_parent_idx
+
+            child_position = sub_node_idx % 2
+            # Alpha lookup: same formula as the full-tree renderer, using global level
+            alpha_idx = n_layers - global_level
+            global_parent_node_idx = start_node_idx * (2 ** (sub_level - 1)) + sub_parent_idx
+
+            if has_alphas and 0 <= alpha_idx < len(alpha_values):
+                alpha_tensor = alpha_values[alpha_idx]
+                if global_parent_node_idx < alpha_tensor.shape[0]:
+                    alpha_val = float(alpha_tensor[global_parent_node_idx, 0])
+                    if child_position == 1:
+                        alpha_val = 1.0 - alpha_val
+                    edges.append((parent_id, node_id))
+                    edge_labels[(parent_id, node_id)] = f"α={alpha_val:.3f}"
+                else:
+                    edges.append((parent_id, node_id))
+                    edge_labels[(parent_id, node_id)] = ""
+            else:
+                edges.append((parent_id, node_id))
+                edge_labels[(parent_id, node_id)] = ""
+
+        node_counter += num_nodes
+
+    # ---- Pre-render thumbnails ----
+    image_thumbnails = {}
+    image_sizes = {}
+    for node_id in positions:
+        img_idx = node_image_indices[node_id]
+        if image_type == "activations":
+            start_ch, end_ch = img_idx
+            if end_ch <= acts.shape[0]:
+                img_data = acts[start_ch:end_ch].mean(axis=0)
+                image_sizes[node_id] = img_data.shape
+                img_min, img_max = img_data.min(), img_data.max()
+                img_norm = ((img_data - img_min) / (img_max - img_min + 1e-8)
+                            if img_max > img_min else np.zeros_like(img_data))
+                image_thumbnails[node_id] = img_norm
+        else:
+            global_level_idx, global_filter_idx = img_idx
+            if global_level_idx < len(hierarchy_weights):
+                w_np = hierarchy_weights[global_level_idx].detach().cpu().numpy()
+                if len(w_np.shape) == 4 and w_np.shape[0] == layer.in_channels:
+                    # Deconv: (in_ch, out_ch * nodes_at_level, k, k)
+                    nodes_at_level = 2 ** global_level_idx
+                    out_ch = layer.out_channels
+                    w_t = w_np.transpose(1, 0, 2, 3)
+                    w_t = w_t.reshape(nodes_at_level, out_ch, layer.in_channels,
+                                      w_t.shape[2], w_t.shape[3])
+                    fi = global_filter_idx if global_filter_idx < nodes_at_level else 0
+                    img_data = w_t[fi].mean(axis=0).mean(axis=0)
+                elif len(w_np.shape) == 4:
+                    # Conv: (num_filters_at_level, in_ch, k, k)
+                    fi = global_filter_idx if global_filter_idx < w_np.shape[0] else 0
+                    img_data = w_np[fi].mean(axis=0)
+                else:
+                    img_data = w_np[0] if w_np.ndim > 0 else w_np
+                image_sizes[node_id] = img_data.shape
+                img_min, img_max = img_data.min(), img_data.max()
+                img_norm = ((img_data - img_min) / (img_max - img_min + 1e-8)
+                            if img_max > img_min else np.zeros_like(img_data))
+                image_thumbnails[node_id] = img_norm
+
+    target_size_inches = 2.5
+    if image_sizes:
+        sample_pixels = max(list(image_sizes.values())[0])
+        base_zoom = (target_size_inches * 100) / sample_pixels
+    else:
+        base_zoom = 35.0
+
+    # ---- Draw edges ----
+    for (parent_id, child_id) in edges:
+        px, py = positions[parent_id]
+        cx, cy = positions[child_id]
+        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)
+        mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
+        label = edge_labels[(parent_id, child_id)]
+        if label:
+            bbox_props = dict(boxstyle='round,pad=0.7', facecolor='lightyellow',
+                              edgecolor='gray', alpha=0.9, linewidth=1.3)
+            ax.text(mid_x, mid_y, label, ha='center', va='center',
+                    fontsize=16, fontweight='bold', bbox=bbox_props, zorder=2)
+
+    # ---- Draw nodes ----
+    for node_id, (x, y) in positions.items():
+        if node_id in image_thumbnails:
+            imagebox = OffsetImage(image_thumbnails[node_id], cmap='viridis',
+                                   zoom=base_zoom, interpolation='nearest')
+            imagebox.image.axes = ax
+            ab = AnnotationBbox(imagebox, (x, y), frameon=True, pad=0.0,
+                                bboxprops=dict(edgecolor='black', linewidth=1.5,
+                                               facecolor='none'))
+            ax.add_artist(ab)
+            ax.text(x, y - 0.08, node_labels[node_id],
+                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)
+        else:
+            circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black',
+                                 linewidth=2, zorder=3)
+            ax.add_patch(circle)
+            ax.text(x, y - 0.03, node_labels[node_id],
+                    ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
+
+    title_text = (f"{layer_name} Sub-Hierarchy: Root at L{start_level}N{start_node_idx}\n"
+                  f"Global levels {start_level}–{min(start_level + actual_depth - 1, n_layers)} "
+                  f"of {n_layers}")
+    ax.text(0.5, 0.98, title_text, ha='center', va='top',
+            transform=ax.transAxes, fontsize=18, fontweight='bold')
+
+    legend_lines = [
+        f"Sub-tree root: L{start_level}N{start_node_idx}",
+        f"Showing {actual_depth} levels ({image_type})",
+        f"Total layers in model: {n_layers}",
+    ]
+    if has_alphas:
+        legend_lines.append("α = Sigmoid weight for child selection")
+    legend_lines.append('Brighter = Higher activation'
+                        if image_type == 'activations' else 'Filter weights shown')
+    ax.text(0.02, 0.98, "\n".join(legend_lines), transform=ax.transAxes,
+            fontsize=11, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'subtree_L{start_level}N{start_node_idx:04d}_tree.png')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    print(f"    Saved sub-tree L{start_level}N{start_node_idx} → {save_path}")
+
+
+def visualize_all_subtree_hierarchies(layer, layer_name, base_save_dir,
+                                       subtree_depth=4, activations=None):
+    """Visualize all bottom-up sub-hierarchies for a taxonomic layer.
+
+    Identifies the level that is (subtree_depth - 1) levels above the leaves
+    (the "4th from the bottom" when subtree_depth=4) and renders a separate
+    subtree_depth-level tree for every node at that level, expanding downward
+    to the leaves.  Each sub-tree is saved in its own subdirectory under
+    ``base_save_dir/sub_hierarchies/node_L{L}N{NNNN}/``.
+
+    For example, with n_layers=7 and subtree_depth=4 the function picks
+    start_level=4 and produces 2^4=16 sub-tree visualisations covering
+    global levels 4–7.
+    """
+    n_layers = layer.n_layers
+    start_level = max(0, n_layers - (subtree_depth - 1))
+
+    if start_level == 0:
+        print(f"  {layer_name}: hierarchy has only {n_layers} levels; bottom-up "
+              f"sub-hierarchies (subtree_depth={subtree_depth}) would cover the "
+              f"entire tree — skipping to avoid duplication.")
+        return
+
+    num_subtrees = 2 ** start_level
+    sub_dir = os.path.join(base_save_dir, 'sub_hierarchies')
+    os.makedirs(sub_dir, exist_ok=True)
+    print(f"  Generating {num_subtrees} bottom-up sub-hierarchies for {layer_name} "
+          f"(root level={start_level}, n_layers={n_layers}, subtree_depth={subtree_depth})...")
+
+    for node_idx in range(num_subtrees):
+        node_save_dir = os.path.join(sub_dir, f'node_L{start_level}N{node_idx:04d}')
+        visualize_taxonomy_subtree(
+            layer, layer_name, node_save_dir,
+            start_level=start_level,
+            start_node_idx=node_idx,
+            subtree_depth=subtree_depth,
+            activations=activations,
+        )
+
+    print(f"  All {num_subtrees} sub-hierarchies saved under {sub_dir}")
+
+
 def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50):
     """Analyze sparsity and statistics of the latent space."""
     
@@ -880,10 +1219,27 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             for i, conv_layer in enumerate(model.encoder.conv_layers):
                 x = conv_layer(x)
                 
-                # Check if this is a TaxonConv layer
-                if isinstance(conv_layer, TaxonConv):
-                    visualize_taxonomy_tree(conv_layer, f'Encoder Layer {i+1}', img_dir, 
-                                          max_depth=4, activations=x)
+                # Check if this is any taxonomic layer (single or multi-hierarchy)
+                if _is_any_taxon_layer(conv_layer):
+                    ch_per_h = _channels_per_single_hierarchy(conv_layer)
+                    sub_layers_enc = _get_sub_layers(conv_layer)
+                    multi_enc = len(sub_layers_enc) > 1
+                    for sub_layer, h_idx in sub_layers_enc:
+                        if multi_enc:
+                            h_name = f'Encoder Layer {i+1} H{h_idx:02d}'
+                            h_tree_dir = os.path.join(img_dir, f'encoder_layer_{i+1}',
+                                                      f'hierarchy_{h_idx:02d}')
+                            h_subtree_dir = h_tree_dir
+                        else:
+                            h_name = f'Encoder Layer {i+1}'
+                            h_tree_dir = img_dir
+                            h_subtree_dir = os.path.join(img_dir, f'encoder_layer_{i+1}')
+                        # Slice activation channels that belong to this hierarchy
+                        act_slice = x[:, h_idx * ch_per_h:(h_idx + 1) * ch_per_h, :, :]
+                        visualize_taxonomy_tree(sub_layer, h_name, h_tree_dir,
+                                                max_depth=4, activations=act_slice)
+                        visualize_all_subtree_hierarchies(
+                            sub_layer, h_name, h_subtree_dir, activations=act_slice)
                 else:
                     # Regular conv - use grid visualization
                     visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
@@ -926,10 +1282,27 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             for i, deconv_layer in enumerate(model.decoder.deconv_layers):
                 x = deconv_layer(x)
                 
-                # Check if this is a TaxonDeconv or TaxonConv layer
-                if isinstance(deconv_layer, (TaxonDeconv, TaxonConv)):
-                    visualize_taxonomy_tree(deconv_layer, f'Decoder Layer {i+1}', img_dir,
-                                          max_depth=4, activations=x)
+                # Check if this is any taxonomic layer (single or multi-hierarchy)
+                if _is_any_taxon_layer(deconv_layer):
+                    ch_per_h = _channels_per_single_hierarchy(deconv_layer)
+                    sub_layers_dec = _get_sub_layers(deconv_layer)
+                    multi_dec = len(sub_layers_dec) > 1
+                    for sub_layer, h_idx in sub_layers_dec:
+                        if multi_dec:
+                            h_name = f'Decoder Layer {i+1} H{h_idx:02d}'
+                            h_tree_dir = os.path.join(img_dir, f'decoder_layer_{i+1}',
+                                                      f'hierarchy_{h_idx:02d}')
+                            h_subtree_dir = h_tree_dir
+                        else:
+                            h_name = f'Decoder Layer {i+1}'
+                            h_tree_dir = img_dir
+                            h_subtree_dir = os.path.join(img_dir, f'decoder_layer_{i+1}')
+                        # Slice activation channels that belong to this hierarchy
+                        act_slice = x[:, h_idx * ch_per_h:(h_idx + 1) * ch_per_h, :, :]
+                        visualize_taxonomy_tree(sub_layer, h_name, h_tree_dir,
+                                                max_depth=4, activations=act_slice)
+                        visualize_all_subtree_hierarchies(
+                            sub_layer, h_name, h_subtree_dir, activations=act_slice)
                 else:
                     # Regular deconv - use grid visualization
                     visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
@@ -1077,7 +1450,19 @@ def main():
     for layer, layer_name in encoder_layers:
         print(f"\nProcessing {layer_name}...")
         layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
-        visualize_taxonomy_tree(layer, layer_name, layer_save_dir, max_depth=4)
+        sub_layers = _get_sub_layers(layer)
+        multi = len(sub_layers) > 1
+        if multi:
+            print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
+        for sub_layer, h_idx in sub_layers:
+            if multi:
+                h_name = f"{layer_name} H{h_idx:02d}"
+                h_save_dir = os.path.join(layer_save_dir, f'hierarchy_{h_idx:02d}')
+            else:
+                h_name = layer_name
+                h_save_dir = layer_save_dir
+            visualize_taxonomy_tree(sub_layer, h_name, h_save_dir, max_depth=4)
+            visualize_all_subtree_hierarchies(sub_layer, h_name, h_save_dir)
 
     # Analysis 3: Visualize decoder Deconv filters
     print("\n" + "=" * 80)
@@ -1100,7 +1485,19 @@ def main():
     for layer, layer_name in decoder_layers:
         print(f"\nProcessing {layer_name}...")
         layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
-        visualize_taxonomy_tree(layer, layer_name, layer_save_dir, max_depth=4)
+        sub_layers = _get_sub_layers(layer)
+        multi = len(sub_layers) > 1
+        if multi:
+            print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
+        for sub_layer, h_idx in sub_layers:
+            if multi:
+                h_name = f"{layer_name} H{h_idx:02d}"
+                h_save_dir = os.path.join(layer_save_dir, f'hierarchy_{h_idx:02d}')
+            else:
+                h_name = layer_name
+                h_save_dir = layer_save_dir
+            visualize_taxonomy_tree(sub_layer, h_name, h_save_dir, max_depth=4)
+            visualize_all_subtree_hierarchies(sub_layer, h_name, h_save_dir)
 
     # Note: final_conv is now a regular Conv2D, not a TaxonConv, so we skip its visualization
     print(f"\nSkipping final_conv - it's a regular Conv2D for RGB projection")

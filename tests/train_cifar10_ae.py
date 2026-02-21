@@ -255,6 +255,11 @@ def parse_layer_config(config):
         decoder_n_filters = [layer.get('n_filters') for layer in decoder_layers] if 'n_filters' in decoder_layers[0] else None
         decoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in decoder_layers]
         
+        encoder_n_hierarchies = [layer.get('n_hierarchies', 1) for layer in encoder_layers]
+        encoder_n_hierarchies = encoder_n_hierarchies if any(x != 1 for x in encoder_n_hierarchies) else None
+        decoder_n_hierarchies = [layer.get('n_hierarchies', 1) for layer in decoder_layers]
+        decoder_n_hierarchies = decoder_n_hierarchies if any(x != 1 for x in decoder_n_hierarchies) else None
+
         # Auto-infer decoder paddings if not specified
         decoder_paddings = []
         for layer in decoder_layers:
@@ -280,7 +285,8 @@ def parse_layer_config(config):
         encoder_n_layers = model_config.get('encoder_n_layers', None)
         encoder_n_filters = model_config.get('encoder_n_filters', None)
         encoder_layer_types = model_config.get('encoder_layer_types', None)
-        
+        encoder_n_hierarchies = None
+
         decoder_kernel_sizes = model_config.get('decoder_kernel_sizes')
         decoder_strides = model_config.get('decoder_strides')
         decoder_n_layers = model_config.get('decoder_n_layers', None)
@@ -288,6 +294,7 @@ def parse_layer_config(config):
         decoder_layer_types = model_config.get('decoder_layer_types', None)
         decoder_paddings = model_config.get('decoder_paddings', None)
         decoder_output_paddings = model_config.get('decoder_output_paddings', None)
+        decoder_n_hierarchies = None
     
     return {
         'encoder_kernel_sizes': encoder_kernel_sizes,
@@ -295,18 +302,16 @@ def parse_layer_config(config):
         'encoder_n_layers': encoder_n_layers,
         'encoder_n_filters': encoder_n_filters,
         'encoder_layer_types': encoder_layer_types,
+        'encoder_n_hierarchies': encoder_n_hierarchies,
         'decoder_kernel_sizes': decoder_kernel_sizes,
         'decoder_strides': decoder_strides,
         'decoder_n_layers': decoder_n_layers,
         'decoder_n_filters': decoder_n_filters,
         'decoder_layer_types': decoder_layer_types,
         'decoder_paddings': decoder_paddings,
-        'decoder_output_paddings': decoder_output_paddings
+        'decoder_output_paddings': decoder_output_paddings,
+        'decoder_n_hierarchies': decoder_n_hierarchies
     }
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Train CIFAR-10 Taxonomic Autoencoder')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to JSON config file')
     parser.add_argument('--batch-size', type=int, default=None)
@@ -344,6 +349,8 @@ def main():
         decoder_layer_types = layer_params['decoder_layer_types']
         decoder_paddings = layer_params['decoder_paddings']
         decoder_output_paddings = layer_params['decoder_output_paddings']
+        encoder_n_hierarchies = layer_params.get('encoder_n_hierarchies', None)
+        decoder_n_hierarchies = layer_params.get('decoder_n_hierarchies', None)
         
         # Training-specific parameters (optional)
         epochs = config.get('training', {}).get('epochs', 20)
@@ -373,6 +380,8 @@ def main():
         decoder_n_layers = None
         decoder_paddings = None
         decoder_output_paddings = None
+        encoder_n_hierarchies = None
+        decoder_n_hierarchies = None
         use_maxpool = True
         random_init_alphas = False
         alpha_init_distribution = 'uniform'
@@ -428,7 +437,7 @@ def main():
     # Create model
     print("\nCreating CIFAR10TaxonAutoencoder...")
     model = CIFAR10TaxonAutoencoder(
-        latent_dim=latent_dim, 
+        latent_dim=latent_dim,
         temperature=temperature,
         encoder_kernel_sizes=encoder_kernel_sizes,
         decoder_kernel_sizes=decoder_kernel_sizes,
@@ -443,6 +452,8 @@ def main():
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool,
+        encoder_n_hierarchies=encoder_n_hierarchies,
+        decoder_n_hierarchies=decoder_n_hierarchies,
         random_init_alphas=random_init_alphas,
         alpha_init_distribution=alpha_init_distribution,
         alpha_init_range=alpha_init_range,

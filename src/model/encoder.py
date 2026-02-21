@@ -5,7 +5,7 @@ Encoder architectures using Taxonomic or Regular Convolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonConv, TaxonConvKL
+from .taxon_layers import TaxonConv, TaxonConvKL, MultiHierarchyTaxonConv
 
 
 class CIFAR10TaxonEncoder(nn.Module):
@@ -32,8 +32,9 @@ class CIFAR10TaxonEncoder(nn.Module):
         If True, use maxpooling for downsampling. If False, use stride in conv layers.
     """
     
-    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=2, 
+    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=2,
                  n_layers=None, n_filters=None, layer_types=None, use_maxpool=True,
+                 n_hierarchies=None,
                  random_init_alphas=False, alpha_init_distribution="uniform",
                  alpha_init_range=None, alpha_init_seed=None):
         super(CIFAR10TaxonEncoder, self).__init__()
@@ -89,75 +90,63 @@ class CIFAR10TaxonEncoder(nn.Module):
             elif isinstance(n_filters, list) and len(n_filters) < num_layers:
                 while len(n_filters) < num_layers:
                     n_filters = n_filters + [n_filters[-1]]
-        
+
+        # Handle n_hierarchies
+        if n_hierarchies is not None:
+            if isinstance(n_hierarchies, int):
+                n_hierarchies = [n_hierarchies] * num_layers
+            elif isinstance(n_hierarchies, list) and len(n_hierarchies) < num_layers:
+                while len(n_hierarchies) < num_layers:
+                    n_hierarchies = n_hierarchies + [1]
+
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.strides = strides
         self.layer_types = layer_types
-        
+
         # Build conv layers dynamically (taxonomic or regular)
         self.conv_layers = nn.ModuleList()
         in_ch = 3
         for i in range(self.num_layers):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
-            
+
             # Determine stride for layer (only used by regular Conv2d)
             layer_stride = 1 if use_maxpool else strides[i]
-            
-            # Determine stride for layer (only used by regular Conv2d)
-            layer_stride = 1 if use_maxpool else strides[i]
-            
+
             if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
-                # Use TaxonConv
-                conv = TaxonConv(
-                    in_channels=in_ch, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
-            elif layer_type == 'taxonomic_conv_kl':
-                # Use TaxonConvKL (returns output, dkl)
-                conv = TaxonConvKL(
-                    in_channels=in_ch, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
-            elif layer_type == 'conv':
-                # Use regular Conv2d
-                out_ch = n_filters[i] if n_filters else 64
-                conv = nn.Conv2d(
-                    in_channels=in_ch,
-                    out_channels=out_ch,
-                    kernel_size=kernel_sizes[i],
-                    stride=layer_stride,
-                    padding=kernel_sizes[i] // 2,
-                    bias=True
-                )
-            else:
-                raise ValueError(f"Unknown layer_type in encoder: {layer_type}")
-            
-            self.conv_layers.append(conv)
-            in_ch = out_ch
-        
-        # Calculate final spatial size and channels (keep for decoder initialization)
-        final_size = 32
-        for stride in strides[:self.num_layers]:
-            final_size = final_size // stride
-        
-        self.final_channels = in_ch
-        self.final_size = final_size
+                n_hier = n_hierarchies[i] if n_hierarchies else 1
+                _n_lay = n_layers[i] if n_layers else 4
+                # When use_maxpool=False, bake the stride into TaxonConv directly.
+                # When use_maxpool=True, TaxonConv keeps stride=1 and MaxPool2d
+                # (applied in forward()) handles downsampling.
+                conv_stride = 1 if use_maxpool else layer_stride
+                if n_hier > 1:
+                    conv = MultiHierarchyTaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    conv = TaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
         
     def forward(self, x):
         total_kl = 0.0
@@ -196,8 +185,9 @@ class CIFAR10TaxonEncoder(nn.Module):
 class CelebAHQTaxonEncoder(nn.Module):
     """Encoder for CelebA-HQ images (256x256x3) supporting Taxonomic and Regular Conv layers."""
     
-    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=1, 
+    def __init__(self, latent_dim=256, temperature=1.0, kernel_sizes=3, strides=1,
                  n_layers=None, n_filters=None, layer_types=None, use_maxpool=True,
+                 n_hierarchies=None,
                  random_init_alphas=False, alpha_init_distribution="uniform",
                  alpha_init_range=None, alpha_init_seed=None):
         super(CelebAHQTaxonEncoder, self).__init__()
@@ -253,41 +243,69 @@ class CelebAHQTaxonEncoder(nn.Module):
             elif isinstance(n_filters, list) and len(n_filters) < num_layers:
                 while len(n_filters) < num_layers:
                     n_filters = n_filters + [n_filters[-1]]
-        
+
+        # Handle n_hierarchies
+        if n_hierarchies is not None:
+            if isinstance(n_hierarchies, int):
+                n_hierarchies = [n_hierarchies] * num_layers
+            elif isinstance(n_hierarchies, list) and len(n_hierarchies) < num_layers:
+                while len(n_hierarchies) < num_layers:
+                    n_hierarchies = n_hierarchies + [1]
+
         self.num_layers = num_layers
         self.n_layers = n_layers
         self.strides = strides
         self.layer_types = layer_types
-        
+
         # Build conv layers dynamically (taxonomic or regular)
         self.conv_layers = nn.ModuleList()
         in_ch = 3
         for i in range(self.num_layers):
             layer_type = layer_types[i]
             layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
-            
+
             # Determine stride for layer
             layer_stride = 1 if use_maxpool else strides[i]
-            
+
             if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
-                # Use TaxonConv
-                conv = TaxonConv(
-                    in_channels=in_ch, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range((n_layers[i] if n_layers else 4) + 1))
+                n_hier = n_hierarchies[i] if n_hierarchies else 1
+                _n_lay = n_layers[i] if n_layers else 4
+                # When use_maxpool=False, bake the stride into TaxonConv directly.
+                # When use_maxpool=True, TaxonConv keeps stride=1 and MaxPool2d
+                # (applied in forward()) handles downsampling.
+                conv_stride = 1 if use_maxpool else layer_stride
+                if n_hier > 1:
+                    conv = MultiHierarchyTaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    conv = TaxonConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
             elif layer_type == 'taxonomic_conv_kl':
                 # Use TaxonConvKL (returns output, dkl)
                 conv = TaxonConvKL(
-                    in_channels=in_ch, 
-                    kernel_size=kernel_sizes[i], 
-                    n_layers=n_layers[i] if n_layers else 4, 
+                    in_channels=in_ch,
+                    kernel_size=kernel_sizes[i],
+                    n_layers=n_layers[i] if n_layers else 4,
                     temperature=temperature,
                     random_init_alphas=random_init_alphas,
                     alpha_init_distribution=alpha_init_distribution,
@@ -343,11 +361,10 @@ class CelebAHQTaxonEncoder(nn.Module):
             else:
                 x = conv(x)
                 x = F.relu(x)
-            if self.strides[i] > 1:
-                if self.use_maxpool:
-                    x = F.max_pool2d(x, self.strides[i])
-                else:
-                    x = F.avg_pool2d(x, self.strides[i])
+            # Only apply pooling when use_maxpool=True; when False, the strided
+            # TaxonConv/Conv2d already handled downsampling in the conv itself.
+            if self.use_maxpool and self.strides[i] > 1:
+                x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
         # Return spatial features and KL divergence (if any KL layers present)
         if has_kl_layers:

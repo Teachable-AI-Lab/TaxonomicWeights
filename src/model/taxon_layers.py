@@ -92,6 +92,7 @@ class TaxonConv(nn.Module):
     """
     
     def __init__(self, in_channels=1, kernel_size=5, n_layers=3, temperature=1.0,
+                 stride=1,
                  random_init_alphas=False, alpha_init_distribution="uniform",
                  alpha_init_range=None, alpha_init_seed=None):
         super(TaxonConv, self).__init__()
@@ -99,6 +100,7 @@ class TaxonConv(nn.Module):
         self.temperature = temperature
         self.n_layers = n_layers
         self.kernel_size = kernel_size
+        self.stride = stride
 
         # Leaf-level weights: (2^n_layers, in_channels, kernel_size, kernel_size)
         self.leaves_weights = nn.Parameter(
@@ -193,9 +195,10 @@ class TaxonConv(nn.Module):
         biases = biases[::-1]
 
         # Apply convolution at each level and concatenate
+        # pad = k//2 gives same-spatial for stride=1, and half-spatial for stride=2 (odd k)
         pad = self.kernel_size // 2
         outs = [
-            F.conv2d(x, w, bias=b, stride=1, padding=pad)
+            F.conv2d(x, w, bias=b, stride=self.stride, padding=pad)
             for w, b in zip(weights, biases)
         ]
         out = torch.cat(outs, dim=1)
@@ -456,6 +459,176 @@ class TaxonDeconv(nn.Module):
     def num_output_channels(self):
         """Calculate total number of output channels."""
         return self.out_channels * sum(2**i for i in range(self.n_layers + 1))
+
+
+# ---------------------------------------------------------------------------
+# Multi-hierarchy wrappers
+# ---------------------------------------------------------------------------
+
+class MultiHierarchyTaxonConv(nn.Module):
+    """Multiple independent taxonomic Conv hierarchies concatenated in one layer.
+
+    When ``n_hierarchies > 1`` this creates *n_hierarchies* independent
+    :class:`TaxonConv` sub-hierarchies, each with its own trainable leaf
+    weights and alpha mixing parameters.  The outputs are concatenated along
+    the channel dimension, letting the layer learn *n_hierarchies* distinct
+    taxonomic feature families simultaneously.
+
+    When ``n_hierarchies == 1`` the behaviour is identical to a plain
+    :class:`TaxonConv`.
+
+    Output channels = ``n_hierarchies × sum(2^i for i in range(n_layers + 1))``
+
+    Parameters
+    ----------
+    in_channels : int
+    kernel_size : int
+    n_layers : int
+        Depth of each individual hierarchy tree.
+    temperature : float
+    n_hierarchies : int
+        Number of independent hierarchies to instantiate (default 1).
+    """
+
+    def __init__(self, in_channels=1, kernel_size=5, n_layers=3,
+                 temperature=1.0, n_hierarchies=1, stride=1,
+                 random_init_alphas=False, alpha_init_distribution="uniform",
+                 alpha_init_range=None, alpha_init_seed=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.n_hierarchies = n_hierarchies
+        self.stride = stride
+
+        self.hierarchies = nn.ModuleList()
+        for h in range(n_hierarchies):
+            seed_h = (None if alpha_init_seed is None
+                      else int(alpha_init_seed) + h * 1000)
+            self.hierarchies.append(TaxonConv(
+                in_channels=in_channels,
+                kernel_size=kernel_size,
+                n_layers=n_layers,
+                temperature=temperature,
+                stride=stride,
+                random_init_alphas=random_init_alphas,
+                alpha_init_distribution=alpha_init_distribution,
+                alpha_init_range=alpha_init_range,
+                alpha_init_seed=seed_h,
+            ))
+
+    # ── Compatibility properties for analysis / visualization scripts ────────
+
+    @property
+    def alphas(self):
+        """Expose first hierarchy's alphas for visualization compatibility."""
+        return self.hierarchies[0].alphas
+
+    @property
+    def leaves_weights(self):
+        return self.hierarchies[0].leaves_weights
+
+    # ── Core interface ───────────────────────────────────────────────────────
+
+    def forward(self, x):
+        outs = [h(x) for h in self.hierarchies]
+        return torch.cat(outs, dim=1)
+
+    def get_hierarchy_weights(self):
+        """Return the first hierarchy's weight tensors (root → leaves).
+
+        For analysis / visualization, the first hierarchy is representative.
+        Use ``layer.hierarchies[i].get_hierarchy_weights()`` to inspect other
+        hierarchies.
+        """
+        return self.hierarchies[0].get_hierarchy_weights()
+
+    def num_output_channels(self):
+        return self.n_hierarchies * sum(2 ** i for i in range(self.n_layers + 1))
+
+
+class MultiHierarchyTaxonDeconv(nn.Module):
+    """Multiple independent taxonomic Deconv hierarchies concatenated.
+
+    Identical in concept to :class:`MultiHierarchyTaxonConv` but uses
+    :class:`TaxonDeconv` sub-hierarchies for upsampling.
+
+    Output channels =
+    ``n_hierarchies × out_channels × sum(2^i for i in range(n_layers + 1))``
+
+    Parameters
+    ----------
+    in_channels : int
+    out_channels : int
+        Out-channels *per hierarchy* (usually 1).
+    kernel_size : int
+    n_layers : int
+        Depth of each individual hierarchy tree.
+    stride, padding, output_padding : int
+    temperature : float
+    n_hierarchies : int
+        Number of independent hierarchies to instantiate (default 1).
+    """
+
+    def __init__(self, in_channels, out_channels=1, kernel_size=4, n_layers=3,
+                 stride=2, padding=1, output_padding=0, temperature=1.0,
+                 n_hierarchies=1, random_init_alphas=False,
+                 alpha_init_distribution="uniform", alpha_init_range=None,
+                 alpha_init_seed=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.temperature = temperature
+        self.n_hierarchies = n_hierarchies
+
+        self.hierarchies = nn.ModuleList()
+        for h in range(n_hierarchies):
+            seed_h = (None if alpha_init_seed is None
+                      else int(alpha_init_seed) + h * 1000)
+            self.hierarchies.append(TaxonDeconv(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                n_layers=n_layers,
+                stride=stride,
+                padding=padding,
+                output_padding=output_padding,
+                temperature=temperature,
+                random_init_alphas=random_init_alphas,
+                alpha_init_distribution=alpha_init_distribution,
+                alpha_init_range=alpha_init_range,
+                alpha_init_seed=seed_h,
+            ))
+
+    # ── Compatibility properties ─────────────────────────────────────────────
+
+    @property
+    def alphas(self):
+        return self.hierarchies[0].alphas
+
+    @property
+    def leaves_weights(self):
+        return self.hierarchies[0].leaves_weights
+
+    # ── Core interface ───────────────────────────────────────────────────────
+
+    def forward(self, x):
+        outs = [h(x) for h in self.hierarchies]
+        return torch.cat(outs, dim=1)
+
+    def get_hierarchy_weights(self):
+        """Return the first hierarchy's weight tensors (root → leaves)."""
+        return self.hierarchies[0].get_hierarchy_weights()
+
+    def num_output_channels(self):
+        return (self.n_hierarchies * self.out_channels
+                * sum(2 ** i for i in range(self.n_layers + 1)))
 
 
 class TaxonConvKL(nn.Module):
