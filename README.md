@@ -4,7 +4,7 @@
 
 # Karthik Notes
 
-We first need to 
+We first need to : 
 
 ## Notes on Zekun's prior code
 
