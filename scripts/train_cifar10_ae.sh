@@ -16,7 +16,7 @@
 export PYTHONUNBUFFERED=TRUE
 source ~/.bashrc
 conda activate aryan_exp
-
+cd /nethome/aroy389/flash/aroy389/taxon/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Config file - can be overridden by command line argument
