@@ -312,6 +312,11 @@ def parse_layer_config(config):
         'decoder_output_paddings': decoder_output_paddings,
         'decoder_n_hierarchies': decoder_n_hierarchies
     }
+
+
+def main():
+    """Main entry point for training script."""
+    parser = argparse.ArgumentParser(description='Train CIFAR-10 Taxonomic Autoencoder')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to JSON config file')
     parser.add_argument('--batch-size', type=int, default=None)
@@ -360,7 +365,7 @@ def parse_layer_config(config):
         # Use experiment_name from config, or fall back to training_save_dir
         experiment_name = config.get('experiment_name', None)
         if experiment_name:
-            save_dir_prefix = f"outputs/cifar10/training/{experiment_name}"
+            save_dir_prefix = "outputs/cifar10/training/{}".format(experiment_name)
         else:
             save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/cifar10/training')
     else:
@@ -405,7 +410,7 @@ def parse_layer_config(config):
     if args.config and 'experiment_name' in config:
         save_dir = save_dir_prefix
     else:
-        save_dir = f'{save_dir_prefix}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        save_dir = '{}/{}'.format(save_dir_prefix, datetime.now().strftime("%Y%m%d_%H%M%S"))
     
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -417,27 +422,27 @@ def parse_layer_config(config):
     print("=" * 60)
     print("CIFAR-10 Taxonomic Autoencoder Training")
     print("=" * 60)
-    print(f"Batch size: {batch_size}")
-    print(f"Epochs: {epochs}")
-    print(f"Latent dim: {latent_dim}")
-    print(f"Temperature: {temperature}")
-    print(f"Learning rate: {lr}")
-    print(f"Encoder kernel sizes: {encoder_kernel_sizes}")
-    print(f"Decoder kernel sizes: {decoder_kernel_sizes if decoder_kernel_sizes else '[4, 4, 3] (default)'}")
-    print(f"Encoder strides: {encoder_strides}")
-    print(f"Decoder strides: {decoder_strides if decoder_strides else '[2, 2, 1] (default)'}")
-    print(f"Use max pooling: {use_maxpool}")
-    print(f"Random alpha init: {random_init_alphas} (dist={alpha_init_distribution}, range={alpha_init_range}, seed={alpha_init_seed})")
-    print(f"Data directory: {data_root}")
-    print(f"Save directory: {save_dir}")
+    print("Batch size: {}".format(batch_size))
+    print("Epochs: {}".format(epochs))
+    print("Latent dim: {}".format(latent_dim))
+    print("Temperature: {}".format(temperature))
+    print("Learning rate: {}".format(lr))
+    print("Encoder kernel sizes: {}".format(encoder_kernel_sizes))
+    print("Decoder kernel sizes: {}".format(decoder_kernel_sizes if decoder_kernel_sizes else '[4, 4, 3] (default)'))
+    print("Encoder strides: {}".format(encoder_strides))
+    print("Decoder strides: {}".format(decoder_strides if decoder_strides else '[2, 2, 1] (default)'))
+    print("Use max pooling: {}".format(use_maxpool))
+    print("Random alpha init: {} (dist={}, range={}, seed={})".format(random_init_alphas, alpha_init_distribution, alpha_init_range, alpha_init_seed))
+    print("Data directory: {}".format(data_root))
+    print("Save directory: {}".format(save_dir))
     print("=" * 60)
     
     # Load data
     print("\nLoading CIFAR-10 dataset...")
     loader = CIFAR10Loader(batch_size=batch_size, root=data_root)
     train_loader, test_loader = loader.get_loaders()
-    print(f"Train samples: {len(loader.trainset)}")
-    print(f"Test samples: {len(loader.testset)}")
+    print("Train samples: {}".format(len(loader.trainset)))
+    print("Test samples: {}".format(len(loader.testset)))
     
     # Create model
     print("\nCreating CIFAR10TaxonAutoencoder...")
@@ -484,9 +489,9 @@ def parse_layer_config(config):
     
     print("\n" + "=" * 60)
     print("Training complete!")
-    print(f"Final train loss: {train_losses[-1]:.6f}")
-    print(f"Final test loss: {test_losses[-1]:.6f}")
-    print(f"All outputs saved to: {save_dir}")
+    print("Final train loss: {:.6f}".format(train_losses[-1]))
+    print("Final test loss: {:.6f}".format(test_losses[-1]))
+    print("All outputs saved to: {}".format(save_dir))
     print("=" * 60)
 
 
