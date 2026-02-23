@@ -150,23 +150,22 @@ class CIFAR10TaxonAutoencoder(nn.Module):
         dict: Dictionary containing intermediate activations from each TaxonConv layer
         """
         features = {}
-        
-        # Layer 1
-        h1 = self.encoder.taxon_conv1(x)
-        features['conv1'] = h1
-        h1 = torch.relu(h1)
-        h1 = torch.nn.functional.max_pool2d(h1, 2)
-        
-        # Layer 2
-        h2 = self.encoder.taxon_conv2(h1)
-        features['conv2'] = h2
-        h2 = torch.relu(h2)
-        h2 = torch.nn.functional.max_pool2d(h2, 2)
-        
-        # Layer 3
-        h3 = self.encoder.taxon_conv3(h2)
-        features['conv3'] = h3
-        
+        h = x
+        for i, conv in enumerate(self.encoder.conv_layers):
+            result = conv(h)
+            # Handle KL layers that return (output, kl)
+            if isinstance(result, tuple):
+                h = result[0]
+            else:
+                h = result
+            features[f'conv{i+1}'] = h
+            # Apply activation and pooling for all but the last layer
+            if i < len(self.encoder.conv_layers) - 1:
+                h = F.leaky_relu(h, negative_slope=0.01)
+                if self.encoder.use_maxpool:
+                    h = F.max_pool2d(h, 2)
+                else:
+                    h = F.avg_pool2d(h, 2)
         return features
 
 

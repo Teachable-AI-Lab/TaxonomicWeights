@@ -27,7 +27,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CelebAHQTaxonAutoencoder
 from src.model.taxon_layers import (TaxonConv, TaxonDeconv,
-                                     MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv)
+                                     TaxonConvKL, TaxonDeconvKL,
+                                     MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
+                                     TaxonResnetConv, TaxonResnetDeconv,
+                                     MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -37,13 +40,24 @@ from src.utils.dataloader import CelebAHQLoader
 
 def _is_multi_hierarchy(layer):
     """Return True if layer is a multi-hierarchy wrapper."""
-    return isinstance(layer, (MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv))
+    return isinstance(layer, (MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
+                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
 
 
 def _is_any_taxon_layer(layer):
     """Return True for any taxonomic layer type (single or multi)."""
     return isinstance(layer, (TaxonConv, TaxonDeconv,
-                               MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv))
+                               TaxonConvKL, TaxonDeconvKL,
+                               MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
+                               TaxonResnetConv, TaxonResnetDeconv,
+                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
+
+
+def _is_kl_or_resnet_layer(layer):
+    """Return True for KL or Resnet taxonomic layers that skip ReLU."""
+    return isinstance(layer, (TaxonConvKL, TaxonDeconvKL,
+                               TaxonResnetConv, TaxonResnetDeconv,
+                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
 
 
 def _get_sub_layers(layer):
@@ -63,6 +77,26 @@ def _channels_per_single_hierarchy(layer):
     if _is_multi_hierarchy(layer):
         return layer.hierarchies[0].num_output_channels()
     return layer.num_output_channels()
+
+
+def _to_display(tensor, model):
+    """Convert a model tensor (1, C, H, W) to a displayable numpy image (H, W, C).
+
+    Applies the correct denormalization depending on the decoder's
+    ``output_activation``:
+    * **sigmoid** – data already in [0, 1], just clamp.
+    * **tanh** (default) – data in [-1, 1], apply ``* 0.5 + 0.5``.
+
+    The same transform is appropriate for *original* images because the
+    CelebA-HQ dataloader uses ``ToTensor()`` only (→ [0, 1]) when paired
+    with sigmoid, and ``Normalize((0.5,…),(0.5,…))`` (→ [-1, 1]) when
+    paired with tanh.
+    """
+    t = tensor.cpu()
+    act = getattr(getattr(model, 'decoder', None), 'output_activation', 'tanh')
+    if act != 'sigmoid':
+        t = t * 0.5 + 0.5
+    return t.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +438,7 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         print(f"  No alpha parameters present for {layer_name}; skipping alpha visualization.")
     
     # Get hierarchy weights (filters at each level) or use activations
-    is_deconv = isinstance(layer, TaxonDeconv)
+    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
     if activations is not None:
         # Use activations instead of filters
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
@@ -705,7 +739,7 @@ def visualize_taxonomy_subtree(layer, layer_name, save_dir, start_level, start_n
             alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
             alpha_values.append(alpha_sig)
 
-    is_deconv = isinstance(layer, TaxonDeconv)
+    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
     if activations is not None:
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
         image_type = "activations"
@@ -909,8 +943,8 @@ def visualize_all_subtree_hierarchies(layer, layer_name, base_save_dir,
     Identifies the level that is (subtree_depth - 1) levels above the leaves
     (the "4th from the bottom" when subtree_depth=4) and renders a separate
     subtree_depth-level tree for every node at that level, expanding downward
-    to the leaves.  Each sub-tree is saved in its own subdirectory under
-    ``base_save_dir/sub_hierarchies/node_L{L}N{NNNN}/``.
+    to the leaves.  All sub-tree images are saved directly under
+    ``base_save_dir/sub_hierarchies/``.
 
     For example, with n_layers=7 and subtree_depth=4 the function picks
     start_level=4 and produces 2^4=16 sub-tree visualisations covering
@@ -932,9 +966,8 @@ def visualize_all_subtree_hierarchies(layer, layer_name, base_save_dir,
           f"(root level={start_level}, n_layers={n_layers}, subtree_depth={subtree_depth})...")
 
     for node_idx in range(num_subtrees):
-        node_save_dir = os.path.join(sub_dir, f'node_L{start_level}N{node_idx:04d}')
         visualize_taxonomy_subtree(
-            layer, layer_name, node_save_dir,
+            layer, layer_name, sub_dir,
             start_level=start_level,
             start_node_idx=node_idx,
             subtree_depth=subtree_depth,
@@ -942,6 +975,542 @@ def visualize_all_subtree_hierarchies(layer, layer_name, base_save_dir,
         )
 
     print(f"  All {num_subtrees} sub-hierarchies saved under {sub_dir}")
+
+
+def analyze_partonomy_sparsity(model, data_loader, device, save_dir,
+                               num_batches=30, sparsity_threshold=0.1,
+                               ablation_images=16, n_clusters=8):
+    """Five-part partonomy sparsity analysis suite.
+
+    1. Activation overlap (Jaccard) – tests feature specialisation.
+    2. Feature selectivity & entropy – quantifies polysemanticity.
+    3. Causal unit ablations – tests additive compositionality.
+    4. Cross-layer sparsity dependency – tests hierarchical sparsity.
+    5. Dimension clustering – evaluates stable sub-structure alignment.
+    """
+    prt_dir = os.path.join(save_dir, 'partonomy_sparsity')
+    os.makedirs(prt_dir, exist_ok=True)
+
+    model.eval()
+
+    # ── Collect latents + per-layer encoder activations ──────────────────────
+    all_latents = []
+    hook_data = {}      # layer_idx -> list of (B, C, H, W) tensors
+    ablation_imgs = None
+
+    hooks = []
+    for i, layer in enumerate(model.encoder.conv_layers):
+        def _make_hook(idx):
+            def _hook(module, inp, out):
+                # KL layers return (tensor, kl_loss) tuples — unpack
+                t = out[0] if isinstance(out, tuple) else out
+                hook_data.setdefault(idx, []).append(t.detach().cpu())
+            return _hook
+        hooks.append(layer.register_forward_hook(_make_hook(i)))
+
+    print(f"Collecting activations over {num_batches} batches...")
+    with torch.no_grad():
+        for batch_idx, (images, _) in enumerate(tqdm(data_loader, desc='Partonomy data')):
+            if batch_idx >= num_batches:
+                break
+            images = images.to(device)
+            result = model.encode(images)
+            z = result[0] if isinstance(result, tuple) else result
+            z_np = z.detach().cpu().numpy()
+            if z_np.ndim > 2:
+                z_np = z_np.reshape(z_np.shape[0], -1)
+            all_latents.append(z_np)
+            if ablation_imgs is None:
+                ablation_imgs = images[:ablation_images]
+
+    for h in hooks:
+        h.remove()
+
+    all_latents = np.concatenate(all_latents, axis=0)   # (N, D)
+    N, D = all_latents.shape
+
+    # Spatially pool hook data
+    layer_acts = {}   # idx -> (N, C)
+    for idx, act_list in hook_data.items():
+        pooled = [a.mean(dim=(2, 3)).numpy() for a in act_list]   # each (B, C)
+        layer_acts[idx] = np.concatenate(pooled, axis=0)          # (N, C)
+
+    print(f"  {N} samples, latent dim={D}")
+    for idx, a in sorted(layer_acts.items()):
+        print(f"  Encoder layer {idx+1}: {a.shape[1]} channels")
+
+    binary = (np.abs(all_latents) > sparsity_threshold).astype(np.float32)   # (N, D)
+
+    # ── 1. Jaccard activation overlap ─────────────────────────────────────────
+    print("  [1/5] Jaccard activation overlap...")
+    rng = np.random.default_rng(0)
+    n_pairs = min(3000, N * (N - 1) // 2)
+    idx_a = rng.integers(0, N, n_pairs)
+    idx_b = rng.integers(0, N, n_pairs)
+    idx_b[idx_a == idx_b] = (idx_b[idx_a == idx_b] + 1) % N
+
+    inter = (binary[idx_a] * binary[idx_b]).sum(axis=1)
+    union = ((binary[idx_a] + binary[idx_b]) > 0).sum(axis=1).astype(np.float32)
+    jaccard = np.where(union > 0, inter / union, 0.0)
+
+    lifetime_sparsity = binary.mean(axis=0)   # (D,) – fraction of samples activating each dim
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].hist(jaccard, bins=50, edgecolor='black', color='steelblue')
+    axes[0].axvline(jaccard.mean(), color='red', linestyle='--', label=f'Mean={jaccard.mean():.3f}')
+    axes[0].set_xlabel('Jaccard Similarity'); axes[0].set_ylabel('Count')
+    axes[0].set_title('Pairwise Activation Overlap\n(lower = more specialisation)')
+    axes[0].legend()
+
+    axes[1].bar(range(min(D, 200)), sorted(lifetime_sparsity, reverse=True)[:200], color='darkorange')
+    axes[1].set_xlabel('Rank-ordered Feature'); axes[1].set_ylabel('Fraction Active')
+    axes[1].set_title('Lifetime Sparsity per Dim (sorted)')
+
+    dead = float((lifetime_sparsity < 0.01).mean())
+    selective = float(((lifetime_sparsity >= 0.01) & (lifetime_sparsity < 0.2)).mean())
+    dense = float((lifetime_sparsity >= 0.5).mean())
+    moderate = 1.0 - dead - selective - dense
+    axes[2].bar(['Dead\n(<1%)', 'Selective\n(1-20%)', 'Moderate\n(20-50%)', 'Dense\n(>50%)'],
+                [v * 100 for v in [dead, selective, moderate, dense]],
+                color=['#d62728', '#2ca02c', '#ff7f0e', '#1f77b4'])
+    axes[2].set_ylabel('% of Features'); axes[2].set_title('Feature Activity Categories')
+    plt.suptitle('1. Activation Overlap & Feature Specialisation', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(prt_dir, '01_jaccard_overlap.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    np.savez(os.path.join(prt_dir, '01_jaccard_stats.npz'),
+             jaccard=jaccard, lifetime_sparsity=lifetime_sparsity,
+             mean_jaccard=jaccard.mean(), median_jaccard=float(np.median(jaccard)),
+             dead_frac=dead, selective_frac=selective, dense_frac=dense)
+    print(f"    Mean Jaccard={jaccard.mean():.4f}  dead={dead*100:.1f}%  "
+          f"selective={selective*100:.1f}%  dense={dense*100:.1f}%")
+
+    # ── 2. Feature selectivity and entropy ────────────────────────────────────
+    print("  [2/5] Feature selectivity and entropy...")
+    p = lifetime_sparsity.clip(1e-6, 1 - 1e-6)
+    per_dim_entropy = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))   # bits
+
+    try:
+        from scipy.stats import kurtosis as _sp_kurt
+        per_dim_kurtosis = np.array([_sp_kurt(np.abs(all_latents[:, d]), fisher=True)
+                                      for d in range(D)])
+    except Exception:
+        per_dim_kurtosis = np.zeros(D)
+
+    per_dim_max  = np.abs(all_latents).max(axis=0)
+    per_dim_mean = np.abs(all_latents).mean(axis=0)
+    selectivity_idx = (per_dim_max - per_dim_mean) / (per_dim_max + per_dim_mean + 1e-8)
+    polysemantic_frac = float((np.abs(p - 0.5) < 0.15).mean())
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes[0, 0].hist(per_dim_entropy, bins=50, edgecolor='black', color='purple')
+    axes[0, 0].axvline(per_dim_entropy.mean(), color='red', linestyle='--',
+                       label=f'Mean={per_dim_entropy.mean():.3f} bits')
+    axes[0, 0].set_xlabel('Binary Entropy (bits)'); axes[0, 0].set_ylabel('Count')
+    axes[0, 0].set_title('Per-Dim Activation Entropy\n(0 bits = maximally selective)')
+    axes[0, 0].legend()
+
+    axes[0, 1].hist(per_dim_kurtosis.clip(-10, 50), bins=50, edgecolor='black', color='teal')
+    axes[0, 1].axvline(per_dim_kurtosis.mean(), color='red', linestyle='--',
+                       label=f'Mean={per_dim_kurtosis.mean():.2f}')
+    axes[0, 1].set_xlabel('Activation Kurtosis (Fisher)'); axes[0, 1].set_ylabel('Count')
+    axes[0, 1].set_title('Per-Dim Kurtosis\n(high = impulse-like / sparse)')
+    axes[0, 1].legend()
+
+    axes[1, 0].hist(selectivity_idx, bins=50, edgecolor='black', color='darkgreen')
+    axes[1, 0].axvline(selectivity_idx.mean(), color='red', linestyle='--',
+                       label=f'Mean={selectivity_idx.mean():.3f}')
+    axes[1, 0].set_xlabel('Selectivity Index (max-mean)/(max+mean)')
+    axes[1, 0].set_ylabel('Count')
+    axes[1, 0].set_title('Feature Selectivity\n(1.0 = fires for one sample only)')
+    axes[1, 0].legend()
+
+    axes[1, 1].scatter(lifetime_sparsity, per_dim_entropy, alpha=0.3, s=8, c='navy')
+    axes[1, 1].set_xlabel('Lifetime Sparsity (frac. active)')
+    axes[1, 1].set_ylabel('Binary Entropy (bits)')
+    axes[1, 1].set_title(f'Sparsity vs Entropy\nPolysemantic (p≈0.5): {polysemantic_frac*100:.1f}%')
+
+    plt.suptitle('2. Feature Selectivity & Entropy', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(prt_dir, '02_feature_selectivity.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    np.savez(os.path.join(prt_dir, '02_selectivity_stats.npz'),
+             per_dim_entropy=per_dim_entropy, per_dim_kurtosis=per_dim_kurtosis,
+             selectivity_idx=selectivity_idx, polysemantic_frac=polysemantic_frac,
+             mean_entropy=float(per_dim_entropy.mean()),
+             mean_kurtosis=float(per_dim_kurtosis.mean()))
+    print(f"    Mean entropy={per_dim_entropy.mean():.4f} bits  "
+          f"mean kurtosis={per_dim_kurtosis.mean():.3f}  "
+          f"polysemantic={polysemantic_frac*100:.1f}%")
+
+    # ── 3. Causal unit ablations ──────────────────────────────────────────────
+    print("  [3/5] Causal ablation analysis...")
+    ablation_imgs = ablation_imgs.to(device)
+
+    with torch.no_grad():
+        result_abl = model.encode(ablation_imgs)
+        z_orig = result_abl[0] if isinstance(result_abl, tuple) else result_abl
+        spatial = (z_orig.ndim == 4)          # True if (B, C, H, W)
+        n_units = z_orig.shape[1]             # channels to ablate
+
+        # Baseline reconstruction
+        base_recon = model(ablation_imgs)
+        if isinstance(base_recon, (tuple, list)):
+            base_recon = base_recon[0]
+        if base_recon.shape[2:] != ablation_imgs.shape[2:]:
+            base_recon = F.interpolate(base_recon, size=ablation_imgs.shape[2:],
+                                       mode='bilinear', align_corners=False)
+        base_mse = ((ablation_imgs - base_recon) ** 2).mean(dim=(1, 2, 3))
+
+        # Active units across ablation images
+        if spatial:
+            unit_active = (z_orig.abs().mean(dim=(2, 3)) > sparsity_threshold).cpu().numpy()
+        else:
+            unit_active = (z_orig.abs() > sparsity_threshold).cpu().numpy()
+        candidate_units = np.where(unit_active.any(axis=0))[0]
+
+        if len(candidate_units) > 256:
+            mean_act_per_unit = (z_orig.abs().mean(dim=(2, 3)) if spatial
+                                 else z_orig.abs()).mean(dim=0).cpu().numpy()
+            candidate_units = candidate_units[
+                np.argsort(-mean_act_per_unit[candidate_units])[:256]]
+
+        print(f"    Ablating {len(candidate_units)} active units of {n_units} total...")
+        unit_importance = np.zeros(n_units)
+
+        for d in candidate_units:
+            z_abl = z_orig.clone()
+            if spatial:
+                z_abl[:, d, :, :] = 0.0
+            else:
+                z_abl[:, d] = 0.0
+
+            if hasattr(model, 'decode'):
+                recon_abl = model.decode(z_abl)
+            else:
+                recon_abl = model.decoder(z_abl)
+            if isinstance(recon_abl, (tuple, list)):
+                recon_abl = recon_abl[0]
+            if recon_abl.shape[2:] != ablation_imgs.shape[2:]:
+                recon_abl = F.interpolate(recon_abl, size=ablation_imgs.shape[2:],
+                                          mode='bilinear', align_corners=False)
+            delta = ((ablation_imgs - recon_abl) ** 2).mean(dim=(1, 2, 3))
+            unit_importance[d] = (delta - base_mse).clamp(min=0).mean().item()
+
+    sorted_imp = np.sort(unit_importance[unit_importance > 0])[::-1]
+    total_imp = sorted_imp.sum()
+    cumulative = np.cumsum(sorted_imp) / (total_imp + 1e-12)
+    p50 = int(np.searchsorted(cumulative, 0.5)) + 1 if total_imp > 0 else 0
+    p90 = int(np.searchsorted(cumulative, 0.9)) + 1 if total_imp > 0 else 0
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    show_n = min(50, len(sorted_imp))
+    axes[0].bar(range(show_n), sorted_imp[:show_n], color='firebrick')
+    axes[0].set_xlabel('Unit (rank)'); axes[0].set_ylabel('Mean MSE Increase')
+    axes[0].set_title(f'Top-{show_n} Units by Ablation Importance')
+
+    axes[1].hist(sorted_imp, bins=40, edgecolor='black', color='salmon')
+    if len(sorted_imp):
+        axes[1].axvline(sorted_imp.mean(), color='blue', linestyle='--',
+                        label=f'Mean={sorted_imp.mean():.5f}')
+    axes[1].set_xlabel('MSE Increase when Zeroed'); axes[1].set_ylabel('Count')
+    axes[1].set_title('Ablation Importance Distribution'); axes[1].legend()
+
+    if len(sorted_imp):
+        axes[2].plot(range(1, len(sorted_imp) + 1), cumulative * 100, color='darkblue')
+        axes[2].axvline(p50, color='orange', linestyle='--', label=f'50% in top-{p50}')
+        axes[2].axvline(p90, color='red',    linestyle='--', label=f'90% in top-{p90}')
+    axes[2].set_xlabel('Number of Units'); axes[2].set_ylabel('Cumulative Importance (%)')
+    axes[2].set_title('Cumulative Ablation Importance\n(concentrated vs. distributed)')
+    axes[2].legend()
+
+    plt.suptitle('3. Causal Ablation: Unit Indispensability', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(prt_dir, '03_causal_ablations.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    np.savez(os.path.join(prt_dir, '03_ablation_importance.npz'),
+             unit_importance=unit_importance,
+             top_units=np.argsort(-unit_importance)[:50],
+             p50_units=p50, p90_units=p90)
+    print(f"    50% importance in top-{p50} units;  90% in top-{p90} units")
+
+    # ── 4. Cross-layer sparsity dependency ────────────────────────────────────
+    print("  [4/5] Cross-layer sparsity dependency...")
+    enc_indices = sorted(layer_acts.keys())
+    n_enc = len(enc_indices)
+
+    if n_enc >= 2:
+        max_ch = 64
+        layer_bin = {}
+        for idx in enc_indices:
+            a = layer_acts[idx]
+            thr = sparsity_threshold * np.abs(a).mean()
+            layer_bin[idx] = (np.abs(a) > thr).astype(np.float32)
+
+        n_pairs = n_enc - 1
+        fig, axes = plt.subplots(1, n_pairs, figsize=(8 * n_pairs, 7), squeeze=False)
+        dep_sparsities = []
+
+        for pi, (l1, l2) in enumerate(zip(enc_indices[:-1], enc_indices[1:])):
+            B1 = layer_bin[l1][:, :min(layer_bin[l1].shape[1], max_ch)]
+            B2 = layer_bin[l2][:, :min(layer_bin[l2].shape[1], max_ch)]
+            sup1 = B1.sum(axis=0) + 1e-8
+            M = (B1.T @ B2) / sup1[:, None]
+            dep_sp = float((M < 0.1).mean())
+            dep_sparsities.append(dep_sp)
+
+            ax = axes[0, pi]
+            im = ax.imshow(M, aspect='auto', cmap='hot', vmin=0, vmax=1)
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_xlabel(f'Layer {l2+1} channels')
+            ax.set_ylabel(f'Layer {l1+1} channels')
+            ax.set_title(f'Layer {l1+1}→{l2+1} Cond. Co-activation\n'
+                         f'Dep. sparsity: {dep_sp*100:.1f}% near-zero')
+
+        plt.suptitle('4. Cross-Layer Sparsity Dependency', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(prt_dir, '04_cross_layer_dependency.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        np.savez(os.path.join(prt_dir, '04_dependency_stats.npz'),
+                 dep_sparsity_per_pair=np.array(dep_sparsities),
+                 mean_dep_sparsity=float(np.mean(dep_sparsities)))
+        print(f"    Mean cross-layer dep. sparsity: {np.mean(dep_sparsities)*100:.1f}%")
+    else:
+        print("    Skipping cross-layer analysis (<2 encoder layers captured).")
+
+    # ── 5. Cluster active dimensions ──────────────────────────────────────────
+    print("  [5/5] Clustering latent dimensions...")
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+        from sklearn.decomposition import PCA as _PCA
+        _sklearn_ok = True
+    except ImportError:
+        _sklearn_ok = False
+        print("    sklearn not available; skipping clustering.")
+
+    if _sklearn_ok and N >= n_clusters * 5:
+        n_pca = min(50, D, N - 1)
+        X = all_latents
+        if D > n_pca:
+            X = _PCA(n_components=n_pca).fit_transform(X)
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+        labels = km.fit_predict(X)
+        sil = float(silhouette_score(X, labels)) if len(np.unique(labels)) > 1 else 0.0
+
+        cluster_mean = np.zeros((n_clusters, D))
+        for c in range(n_clusters):
+            m = labels == c
+            if m.sum() > 0:
+                cluster_mean[c] = np.abs(all_latents[m]).mean(axis=0)
+
+        exclusivity = cluster_mean.max(axis=0) / (cluster_mean.sum(axis=0) + 1e-8)
+        cluster_sizes = np.bincount(labels, minlength=n_clusters)
+        n_show = min(D, 64)
+        top_dims = np.argsort(-cluster_mean.mean(axis=0))[:n_show]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        axes[0].bar(range(n_clusters), cluster_sizes, color='steelblue')
+        axes[0].set_xlabel('Cluster'); axes[0].set_ylabel('Samples')
+        axes[0].set_title(f'Cluster Sizes  (Silhouette={sil:.3f})')
+
+        im = axes[1].imshow(cluster_mean[:, top_dims], aspect='auto', cmap='viridis')
+        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        axes[1].set_xlabel(f'Top-{n_show} Features'); axes[1].set_ylabel('Cluster')
+        axes[1].set_title('Cluster × Feature Activation')
+
+        axes[2].hist(exclusivity, bins=40, edgecolor='black', color='darkorange')
+        axes[2].axvline(exclusivity.mean(), color='red', linestyle='--',
+                        label=f'Mean={exclusivity.mean():.3f}')
+        axes[2].set_xlabel('Exclusivity (max_c / sum_c)'); axes[2].set_ylabel('Count')
+        axes[2].set_title('Per-Dim Cluster Exclusivity\n(1.0 = used by one cluster only)')
+        axes[2].legend()
+
+        plt.suptitle('5. Latent Dimension Clustering & Alignment', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(prt_dir, '05_dimension_clustering.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        np.savez(os.path.join(prt_dir, '05_cluster_stats.npz'),
+                 labels=labels, cluster_sizes=cluster_sizes, silhouette=sil,
+                 exclusivity=exclusivity, mean_exclusivity=float(exclusivity.mean()),
+                 cluster_mean_acts=cluster_mean)
+        print(f"    Silhouette={sil:.4f}  mean exclusivity={exclusivity.mean():.4f}")
+
+    print(f"Partonomy sparsity analysis saved to {prt_dir}")
+
+
+def analyze_weight_sparsity(model, save_dir):
+    """Analyse the sparsity and structure of learned filter weights.
+
+    Per taxonomic layer:
+      a. Leaf filter diversity  – pairwise cosine similarity between leaf filters.
+      b. Spatial concentration  – Gini coefficient of absolute weight magnitudes.
+      c. Parent-child similarity – cosine similarity between a parent and each child
+                                   filter, measures how much the tree structure
+                                   forces filters to inherit from parents.
+    """
+    wt_dir = os.path.join(save_dir, 'weight_sparsity')
+    os.makedirs(wt_dir, exist_ok=True)
+
+    all_layer_data = []
+    for i, layer in enumerate(model.encoder.conv_layers):
+        if _is_any_taxon_layer(layer):
+            all_layer_data.append((f'enc{i+1}', layer))
+    for i, layer in enumerate(model.decoder.deconv_layers):
+        if _is_any_taxon_layer(layer):
+            all_layer_data.append((f'dec{i+1}', layer))
+
+    if not all_layer_data:
+        print("No taxonomic layers found; skipping weight sparsity analysis.")
+        return
+
+    def _gini(arr):
+        arr = np.abs(arr).flatten()
+        arr = np.sort(arr)
+        n = len(arr)
+        if n == 0 or arr.sum() == 0:
+            return 0.0
+        index = np.arange(1, n + 1)
+        return (2 * (index * arr).sum() - (n + 1) * arr.sum()) / (n * arr.sum())
+
+    results = {}
+    for layer_key, layer in all_layer_data:
+        for sub_layer, h_idx in _get_sub_layers(layer):
+            key = f"{layer_key}_h{h_idx:02d}"
+            is_classic_deconv = isinstance(sub_layer, TaxonDeconv)
+            is_resnet = isinstance(sub_layer, (TaxonResnetConv, TaxonResnetDeconv))
+            is_resnet_deconv = isinstance(sub_layer, TaxonResnetDeconv)
+            weights = sub_layer.get_hierarchy_weights()   # list, root → leaves
+            n_levels = len(weights)
+
+            # ── a. Leaf filter diversity ──────────────────────────────────────
+            leaf_w = weights[-1].detach().cpu().numpy()
+            if is_resnet_deconv:
+                # Resnet deconv: weight shape (in_ch, out_ch*2^i, k, k)
+                # Transpose to (out_ch*2^i, in_ch, k, k) and treat each as a node
+                leaf_w = leaf_w.transpose(1, 0, 2, 3)
+                n_leaves = leaf_w.shape[0]
+            elif is_classic_deconv:
+                n_leaves = 2 ** sub_layer.n_layers
+                oc = sub_layer.out_channels
+                leaf_w = leaf_w.transpose(1, 0, 2, 3)
+                leaf_w = leaf_w.reshape(n_leaves, oc,
+                                        sub_layer.in_channels,
+                                        leaf_w.shape[-2], leaf_w.shape[-1])
+                leaf_w = leaf_w.mean(axis=1)
+            else:
+                n_leaves = leaf_w.shape[0]
+
+            leaf_flat = leaf_w.reshape(n_leaves, -1)
+            norms = np.linalg.norm(leaf_flat, axis=1, keepdims=True) + 1e-8
+            cos_mat = (leaf_flat / norms) @ (leaf_flat / norms).T
+            off_diag = cos_mat[np.triu_indices(n_leaves, k=1)]
+
+            # ── b. Spatial concentration (Gini) per leaf filter ───────────────
+            gini_vals = np.array([_gini(leaf_flat[i]) for i in range(n_leaves)])
+
+            # ── c. Parent-child cosine similarity ────────────────────────────
+            pc_sims = []
+            for lv in range(1, n_levels):
+                pw = weights[lv - 1].detach().cpu().numpy()
+                cw = weights[lv].detach().cpu().numpy()
+                if is_resnet_deconv:
+                    # Resnet deconv: transpose to get nodes in first dim
+                    pf = pw.transpose(1, 0, 2, 3)
+                    cf = cw.transpose(1, 0, 2, 3)
+                    n_p = pf.shape[0]
+                    n_c = cf.shape[0]
+                    pf = pf.reshape(n_p, -1)
+                    cf = cf.reshape(n_c, -1)
+                elif is_classic_deconv:
+                    n_p = 2 ** (lv - 1)
+                    n_c = 2 ** lv
+                    oc = sub_layer.out_channels
+                    ic = sub_layer.in_channels
+                    def _reshape(w, n_nodes):
+                        w = w.transpose(1, 0, 2, 3)
+                        w = w.reshape(n_nodes, oc, ic, w.shape[-2], w.shape[-1])
+                        return w.mean(axis=1).reshape(n_nodes, -1)
+                    pf = _reshape(pw, n_p)
+                    cf = _reshape(cw, n_c)
+                else:
+                    n_p = pw.shape[0]
+                    n_c = cw.shape[0]
+                    pf = pw.reshape(n_p, -1)
+                    cf = cw.reshape(n_c, -1)
+                p_norm = pf / (np.linalg.norm(pf, axis=1, keepdims=True) + 1e-8)
+                c_norm = cf / (np.linalg.norm(cf, axis=1, keepdims=True) + 1e-8)
+                for pi in range(n_p):
+                    c0, c1 = pi * 2, pi * 2 + 1
+                    if c1 < n_c:
+                        pc_sims.append(float(p_norm[pi] @ c_norm[c0]))
+                        pc_sims.append(float(p_norm[pi] @ c_norm[c1]))
+            pc_sims = np.array(pc_sims)
+
+            results[key] = dict(
+                n_leaves=n_leaves, n_levels=n_levels,
+                leaf_cosine_offdiag=off_diag, mean_leaf_cosine=float(off_diag.mean()),
+                gini_per_filter=gini_vals,   mean_gini=float(gini_vals.mean()),
+                parent_child_sims=pc_sims,
+                mean_pc_sim=float(pc_sims.mean()) if len(pc_sims) else float('nan'),
+            )
+            print(f"    {key}: n_leaves={n_leaves}  leaf_cosine={off_diag.mean():.4f}  "
+                  f"gini={gini_vals.mean():.4f}  pc_sim={results[key]['mean_pc_sim']:.4f}")
+
+    keys = list(results.keys())
+    n_k = len(keys)
+    if n_k == 0:
+        return
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    cos_means = [results[k]['mean_leaf_cosine'] for k in keys]
+    axes[0, 0].bar(range(n_k), cos_means, color='steelblue')
+    axes[0, 0].set_xticks(range(n_k)); axes[0, 0].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
+    axes[0, 0].set_ylabel('Mean Cosine'); axes[0, 0].axhline(0, color='k', lw=0.5)
+    axes[0, 0].set_title('Leaf Filter Diversity\n(lower = more independent)')
+
+    gini_means = [results[k]['mean_gini'] for k in keys]
+    axes[0, 1].bar(range(n_k), gini_means, color='darkorange')
+    axes[0, 1].set_xticks(range(n_k)); axes[0, 1].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
+    axes[0, 1].set_ylabel('Mean Gini'); axes[0, 1].set_title('Spatial Concentration\n(higher = more localised)')
+
+    pc_means = [results[k]['mean_pc_sim'] for k in keys]
+    axes[0, 2].bar(range(n_k), [v if not np.isnan(v) else 0 for v in pc_means], color='mediumpurple')
+    axes[0, 2].set_xticks(range(n_k)); axes[0, 2].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
+    axes[0, 2].set_ylabel('Mean Cosine'); axes[0, 2].set_title('Parent-Child Filter Similarity\n(lower = more differentiation)')
+
+    k0 = keys[0]
+    axes[1, 0].hist(results[k0]['leaf_cosine_offdiag'], bins=30, edgecolor='black', color='steelblue')
+    axes[1, 0].axvline(results[k0]['mean_leaf_cosine'], color='red', linestyle='--',
+                       label=f"Mean={results[k0]['mean_leaf_cosine']:.3f}")
+    axes[1, 0].set_xlabel('Cosine Similarity'); axes[1, 0].set_ylabel('Count')
+    axes[1, 0].set_title(f'Leaf Pairwise Cosine Dist. ({k0})'); axes[1, 0].legend()
+
+    axes[1, 1].hist(results[k0]['gini_per_filter'], bins=30, edgecolor='black', color='darkorange')
+    axes[1, 1].axvline(results[k0]['mean_gini'], color='red', linestyle='--',
+                       label=f"Mean={results[k0]['mean_gini']:.3f}")
+    axes[1, 1].set_xlabel('Gini Coefficient'); axes[1, 1].set_ylabel('Count')
+    axes[1, 1].set_title(f'Filter Spatial Concentration ({k0})'); axes[1, 1].legend()
+
+    pcs = results[k0]['parent_child_sims']
+    if len(pcs):
+        axes[1, 2].hist(pcs, bins=30, edgecolor='black', color='mediumpurple')
+        axes[1, 2].axvline(pcs.mean(), color='red', linestyle='--', label=f'Mean={pcs.mean():.3f}')
+        axes[1, 2].set_xlabel('Parent-Child Cosine'); axes[1, 2].set_ylabel('Count')
+        axes[1, 2].set_title(f'Parent-Child Similarity Dist. ({k0})'); axes[1, 2].legend()
+    axes[1, 2].axis('on')
+
+    plt.suptitle('Weight Sparsity & Filter Structure Analysis', fontweight='bold', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(wt_dir, 'weight_sparsity_summary.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    for k, v in results.items():
+        np.savez(os.path.join(wt_dir, f'{k}_weight_stats.npz'),
+                 **{kk: vv for kk, vv in v.items() if isinstance(vv, (np.ndarray, float, int))})
+
+    print(f"Weight sparsity analysis saved to {wt_dir}")
 
 
 def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50):
@@ -1102,8 +1671,8 @@ def visualize_multiple_reconstructions(model, data_loader, device, save_dir, num
             for i in range(num_images):
                 img = images[i:i+1]
                 
-                # Original image (unnormalize from [-1, 1] to [0, 1])
-                img_display = (img.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+                # Original image (denormalize based on output_activation)
+                img_display = _to_display(img, model)
                 axes[0, i].imshow(img_display)
                 axes[0, i].axis('off')
                 if i == 0:
@@ -1111,7 +1680,9 @@ def visualize_multiple_reconstructions(model, data_loader, device, save_dir, num
                 
                 # Generate single reconstruction
                 reconstructed = model(img)
-                recon_display = (reconstructed.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+                if isinstance(reconstructed, (tuple, list)):
+                    reconstructed = reconstructed[0]
+                recon_display = _to_display(reconstructed, model)
                 axes[1, i].imshow(recon_display)
                 axes[1, i].axis('off')
                 if i == 0:
@@ -1140,7 +1711,9 @@ def analyze_reconstruction_quality(model, data_loader, device, save_dir, num_bat
                 break
             images = images.to(device)
             reconstructed = model(images)
-            
+            if isinstance(reconstructed, (tuple, list)):
+                reconstructed = reconstructed[0]
+
             mse = ((images - reconstructed) ** 2).mean(dim=(1, 2, 3)).cpu().numpy()
             mae = torch.abs(images - reconstructed).mean(dim=(1, 2, 3)).cpu().numpy()
             
@@ -1204,7 +1777,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             os.makedirs(img_dir, exist_ok=True)
             
             # Save original image
-            img_display = (img.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+            img_display = _to_display(img, model)
             plt.figure(figsize=(4, 4))
             plt.imshow(img_display)
             plt.axis('off')
@@ -1218,6 +1791,9 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             # Process each encoder layer
             for i, conv_layer in enumerate(model.encoder.conv_layers):
                 x = conv_layer(x)
+                # KL layers return (tensor, kl_loss) tuples — unpack
+                if isinstance(x, tuple):
+                    x = x[0]
                 
                 # Check if this is any taxonomic layer (single or multi-hierarchy)
                 if _is_any_taxon_layer(conv_layer):
@@ -1245,12 +1821,14 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
                                          f'Encoder Layer {i+1}', max_maps=16)
                 
-                x = F.relu(x)
-                if i < len(model.encoder.strides) and model.encoder.strides[i] > 1:
-                    if model.encoder.use_maxpool:
-                        x = F.max_pool2d(x, model.encoder.strides[i])
-                    else:
-                        x = F.avg_pool2d(x, model.encoder.strides[i])
+                # KL/Resnet layers output log-probabilities — skip ReLU
+                if not _is_kl_or_resnet_layer(conv_layer):
+                    x = F.leaky_relu(x, negative_slope=0.01)
+                # Only pool when use_maxpool=True; strided layers handle their
+                # own downsampling when use_maxpool=False.
+                if model.encoder.use_maxpool and model.encoder.strides[i] > 1:
+                    x = F.max_pool2d(x, kernel_size=model.encoder.strides[i],
+                                     stride=model.encoder.strides[i])
             
             # Latent (may be spatial or flat, so flatten for visualization)
             result = model.encode(img)
@@ -1281,6 +1859,9 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             # Process each decoder layer
             for i, deconv_layer in enumerate(model.decoder.deconv_layers):
                 x = deconv_layer(x)
+                # KL layers return (tensor, kl_loss) tuples — unpack
+                if isinstance(x, tuple):
+                    x = x[0]
                 
                 # Check if this is any taxonomic layer (single or multi-hierarchy)
                 if _is_any_taxon_layer(deconv_layer):
@@ -1308,7 +1889,13 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
                                          f'Decoder Layer {i+1}', max_maps=16)
                 
-                x = F.relu(x)
+                # KL/Resnet layers output log-probabilities — skip ReLU
+                if not _is_kl_or_resnet_layer(deconv_layer):
+                    x = F.leaky_relu(x, negative_slope=0.01)
+            
+            # Apply batch norm before final conv if present (matches decoder forward)
+            if model.decoder.pre_final_norm is not None:
+                x = model.decoder.pre_final_norm(x)
             
             # Final Conv2D layer to RGB
             x = model.decoder.final_conv(x)
@@ -1316,7 +1903,9 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
             
             # Final reconstruction
             reconstructed = model(img)
-            recon_display = (reconstructed.cpu() * 0.5 + 0.5).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+            if isinstance(reconstructed, (tuple, list)):
+                reconstructed = reconstructed[0]
+            recon_display = _to_display(reconstructed, model)
             plt.figure(figsize=(4, 4))
             plt.imshow(recon_display)
             plt.axis('off')
@@ -1529,6 +2118,18 @@ def main():
     print("8. Visualizing Layer Activations")
     print("=" * 80)
     visualize_layer_activations(model, eval_loader, device, save_dir, num_images=num_activation_images)
+
+    # Analysis 9: Partonomy sparsity suite
+    print("\n" + "=" * 80)
+    print("9. Partonomy Sparsity Analysis")
+    print("=" * 80)
+    analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
+
+    # Analysis 10: Weight sparsity
+    print("\n" + "=" * 80)
+    print("10. Weight Sparsity Analysis")
+    print("=" * 80)
+    analyze_weight_sparsity(model, save_dir)
 
     print("\n" + "=" * 80)
     print("Analysis complete!")

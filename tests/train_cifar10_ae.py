@@ -59,6 +59,7 @@ def train_autoencoder(
         train_loss = 0.0
         train_recon_loss = 0.0
         train_kl_loss = 0.0
+        nan_count = 0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             
@@ -76,7 +77,14 @@ def train_autoencoder(
                 reconstructed = result
                 loss = criterion(reconstructed, images)
             
+            # NaN-safe: skip optimizer step if loss is NaN/Inf
+            if not torch.isfinite(loss):
+                optimizer.zero_grad()
+                nan_count += 1
+                continue
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             train_loss += loss.item()
@@ -122,6 +130,8 @@ def train_autoencoder(
                   f"Test Loss: {test_loss:.6f} (Recon: {test_recon_loss:.6f}, KL: {test_kl_loss:.6f})")
         else:
             print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
+        if nan_count > 0:
+            print(f"  WARNING: {nan_count} batches had NaN/Inf loss and were skipped")
         
         # Generate reconstructions every epoch (or every 5 epochs for faster training)
         visualize_reconstructions(model, test_loader, device, save_dir, num_images=8, epoch=epoch+1)
@@ -312,6 +322,10 @@ def parse_layer_config(config):
         'decoder_output_paddings': decoder_output_paddings,
         'decoder_n_hierarchies': decoder_n_hierarchies
     }
+
+
+def main():
+    parser = argparse.ArgumentParser(description='CIFAR-10 Taxonomic Autoencoder Training')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to JSON config file')
     parser.add_argument('--batch-size', type=int, default=None)

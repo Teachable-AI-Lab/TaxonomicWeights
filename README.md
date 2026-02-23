@@ -2,10 +2,6 @@
 
 ## Karthik Branch!!
 
-# Karthik Notes
-
-We first need to 
-
 ## Notes on Zekun's prior code
 
 *   `taxon-conv-weight.ipynb`

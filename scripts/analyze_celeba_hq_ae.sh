@@ -4,8 +4,8 @@
 #SBATCH --mem=48G
 #SBATCH --gpus-per-node=a40
 #SBATCH --exclude=spot,heistotron,clippy
-#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_celeba_hq_ae.out
-#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_celeba_hq_ae.err
+#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_celeba_hq_ae_%j.out
+#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_celeba_hq_ae_%j.err
 #SBATCH --account="overcap"
 #SBATCH --partition="overcap"
 #SBATCH --nodes=1
@@ -31,6 +31,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   exit 1
 fi
 
+echo "=== SLURM JOB ID: $SLURM_JOB_ID ==="
 echo "Starting CelebA-HQ Autoencoder analysis at $(date)"
 echo "Using config: $CONFIG_FILE"
 

@@ -1,22 +1,22 @@
 {
-  "_comment": "Multi-hierarchy CelebA-HQ Taxonomic Autoencoder: 5 independent hierarchies per layer, each with 4 hierarchy levels (n_layers=4), kernel_size=13. Each block outputs 5*(2^0+2^1+2^2+2^3+2^4)=5*31=155 channels. Same 3-encoder + 3-decoder spatial structure as celebahq_large_kernel.",
-  "description": "CelebA-HQ Taxonomic AE with n_hierarchies=5, n_layers=4 per hierarchy, kernel_size=13. 155 channels per block (5 independent taxonomic trees × 31 channels each). Spatial chain: 256->128->64->32 (encoder), 32->64->128->256 (decoder).",
+  "_comment": "Multi-hierarchy (n_hierarchies=5, n_layers=3, k=13) — bottleneck tightened to 16x16x75 (18,000 values, ~11x compression). n_layers reduced 4->3 at bottleneck so each hierarchy produces 15 channels; 5 hierarchies give 5*15=75 channels. Added 4th stride-2 layer to reach 16x16.",
+  "description": "CelebA-HQ Multi-Hierarchy AE (n_hierarchies=5, n_layers=3 bottleneck, k=13): 4 encoder layers (256x256->16x16) and 4 decoder layers. Bottleneck: 16x16x75=18,000 values (~11x compression).",
   "experiment_name": "celebahq_multi_hierarchy",
   "data": {
     "data_root": "./data/celeba_hq",
-    "batch_size": 32,
+    "batch_size": 16,
     "num_workers": 4,
     "val_split": 0.1,
     "train_subset": null,
     "val_subset": null,
-    "_comment_subset": "Set train_subset/val_subset to an integer (e.g., 5000) to train on a smaller subset for faster iteration. null = use full dataset"
+    "_comment_subset": "batch_size=16: multi-hierarchy layers are wide; reduce if OOM."
   },
   "model": {
-    "latent_dim": 155,
+    "latent_dim": 75,
     "temperature": 1.0,
     "use_maxpool": false,
     "output_activation": "sigmoid",
-    "_comment_n_hierarchies": "n_hierarchies=5 means 5 independent TaxonConv trees per layer, each with n_layers=4 levels. Outputs are concatenated: 5 * sum(2^j for j=0..4) = 5 * 31 = 155 channels per block.",
+    "_comment_n_hierarchies": "n_hierarchies=5, n_layers=4 for downsampling layers (5*31=155ch each), n_layers=3 at bottleneck (5*15=75ch). Bottleneck: 16x16x75=18,000 values (~11x compression).",
     "encoder_layers": [
       {
         "layer_type": "taxonomic_conv",
@@ -25,7 +25,7 @@
         "kernel_size": 13,
         "stride": 2,
         "padding": 6,
-        "_comment": "256x256x3 -> 128x128x155 (5 hierarchies * 31 channels each)"
+        "_comment": "256x256x3 -> stride2 -> 128x128x155 (5*31)"
       },
       {
         "layer_type": "taxonomic_conv",
@@ -34,7 +34,7 @@
         "kernel_size": 13,
         "stride": 2,
         "padding": 6,
-        "_comment": "128x128x155 -> 64x64x155"
+        "_comment": "128x128x155 -> stride2 -> 64x64x155"
       },
       {
         "layer_type": "taxonomic_conv",
@@ -43,10 +43,29 @@
         "kernel_size": 13,
         "stride": 2,
         "padding": 6,
-        "_comment": "64x64x155 -> 32x32x155 (latent space: 32x32x155)"
+        "_comment": "64x64x155 -> stride2 -> 32x32x155"
+      },
+      {
+        "layer_type": "taxonomic_conv",
+        "n_layers": 3,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "_comment": "32x32x155 -> stride2 -> 16x16x75 (BOTTLENECK: 5*15=75ch, 16x16x75=18,000 values, ~11x compression)"
       }
     ],
     "decoder_layers": [
+      {
+        "layer_type": "taxonomic_deconv",
+        "n_layers": 4,
+        "n_hierarchies": 5,
+        "kernel_size": 13,
+        "stride": 2,
+        "padding": 6,
+        "output_padding": 1,
+        "_comment": "16x16x75 -> 32x32x155"
+      },
       {
         "layer_type": "taxonomic_deconv",
         "n_layers": 4,
@@ -80,12 +99,12 @@
     ]
   },
   "training": {
-    "epochs": 20,
+    "epochs": 30,
     "learning_rate": 0.0003,
     "kl_weight": 1.0
   },
   "analysis": {
-    "checkpoint_path": "outputs/celebahq/training/celebahq_multi_hierarchy/final_model.pt",
+    "checkpoint_path": "outputs/celebahq/training/celebahq_multi_hierarchy/checkpoint_epoch_10.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,

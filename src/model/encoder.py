@@ -5,7 +5,8 @@ Encoder architectures using Taxonomic or Regular Convolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonConv, TaxonConvKL, MultiHierarchyTaxonConv
+from .taxon_layers import (TaxonConv, TaxonConvKL, MultiHierarchyTaxonConv,
+                          TaxonResnetConv, MultiHierarchyTaxonResnetConv)
 
 
 class CIFAR10TaxonEncoder(nn.Module):
@@ -147,35 +148,101 @@ class CIFAR10TaxonEncoder(nn.Module):
                         alpha_init_seed=layer_seed
                     )
                 out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
-        
+            elif layer_type == 'taxonomic_conv_kl':
+                conv = TaxonConvKL(
+                    in_channels=in_ch,
+                    kernel_size=kernel_sizes[i],
+                    n_layers=n_layers[i] if n_layers else 4,
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_resnet_conv':
+                n_hier = n_hierarchies[i] if n_hierarchies else 1
+                _n_lay = n_layers[i] if n_layers else 4
+                conv_stride = 1 if use_maxpool else layer_stride
+                if n_hier > 1:
+                    conv = MultiHierarchyTaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed,
+                    )
+                else:
+                    conv = TaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=conv_stride,
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed,
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
+            elif layer_type == 'conv':
+                out_ch = n_filters[i] if n_filters else 64
+                conv = nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=kernel_sizes[i],
+                    stride=layer_stride,
+                    padding=kernel_sizes[i] // 2,
+                    bias=True
+                )
+            else:
+                raise ValueError(f"Unknown layer_type in encoder: {layer_type}")
+
+            self.conv_layers.append(conv)
+            in_ch = out_ch
+
+        # Calculate final spatial size and channels (used by decoder init)
+        final_size = 32
+        for stride in strides[:self.num_layers]:
+            if stride > 1:
+                final_size = final_size // stride
+
+        self.final_channels = in_ch
+        self.final_size = final_size
+
     def forward(self, x):
         total_kl = 0.0
         has_kl_layers = False
         
         for i, conv in enumerate(self.conv_layers):
-            # KL layers may return either a tensor or (tensor, dkl). Accept both.
-            if isinstance(conv, TaxonConvKL):
+            # KL / resnet-KL layers return (tensor, dkl). Accept both.
+            if isinstance(conv, (TaxonConvKL, TaxonResnetConv,
+                                 MultiHierarchyTaxonResnetConv)):
                 res = conv(x)
                 if isinstance(res, tuple) and len(res) == 2:
                     x, dkl = res
                 else:
                     x = res
-                    # attempt to retrieve stored KL if available
                     dkl = getattr(conv, '_last_dkl', None)
                 
-                # Accumulate KL divergence
                 if dkl is not None:
                     total_kl = total_kl + dkl
                     has_kl_layers = True
-                # KL layers output log-probabilities (always negative); skip ReLU
+                # Log-probability outputs — skip ReLU
             else:
                 x = conv(x)
-                x = F.relu(x)
-            # Apply pooling for downsampling if use_maxpool is True
+                x = F.leaky_relu(x, negative_slope=0.01)
+            # Apply pooling when use_maxpool=True.
+            # TaxonResnetConv handles its own stride when use_maxpool=False,
+            # but when use_maxpool=True it uses stride=1 so external pool is needed.
             if self.use_maxpool and self.strides[i] > 1:
                 x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
-        # Return spatial features and KL divergence (if any KL layers present)
         if has_kl_layers:
             return x, total_kl
         else:
@@ -313,6 +380,36 @@ class CelebAHQTaxonEncoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_resnet_conv':
+                n_hier = n_hierarchies[i] if n_hierarchies else 1
+                _n_lay = n_layers[i] if n_layers else 4
+                conv_stride = 1 if use_maxpool else layer_stride
+                if n_hier > 1:
+                    conv = MultiHierarchyTaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        stride=conv_stride,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed,
+                    )
+                else:
+                    conv = TaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=conv_stride,
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed,
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
             elif layer_type == 'conv':
                 # Use regular Conv2d
                 out_ch = n_filters[i] if n_filters else 64
@@ -344,8 +441,9 @@ class CelebAHQTaxonEncoder(nn.Module):
         has_kl_layers = False
         
         for i, conv in enumerate(self.conv_layers):
-            # KL layers may return either a tensor or (tensor, dkl). Accept both.
-            if isinstance(conv, TaxonConvKL):
+            # KL / resnet-KL layers return (tensor, dkl). Accept both.
+            if isinstance(conv, (TaxonConvKL, TaxonResnetConv,
+                                 MultiHierarchyTaxonResnetConv)):
                 res = conv(x)
                 if isinstance(res, tuple) and len(res) == 2:
                     x, dkl = res
@@ -353,14 +451,13 @@ class CelebAHQTaxonEncoder(nn.Module):
                     x = res
                     dkl = getattr(conv, '_last_dkl', None)
                 
-                # Accumulate KL divergence
                 if dkl is not None:
                     total_kl = total_kl + dkl
                     has_kl_layers = True
-                # KL layers output log-probabilities (always negative); skip ReLU
+                # Log-probability outputs — skip ReLU
             else:
                 x = conv(x)
-                x = F.relu(x)
+                x = F.leaky_relu(x, negative_slope=0.01)
             # Only apply pooling when use_maxpool=True; when False, the strided
             # TaxonConv/Conv2d already handled downsampling in the conv itself.
             if self.use_maxpool and self.strides[i] > 1:

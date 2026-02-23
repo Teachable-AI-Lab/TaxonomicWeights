@@ -1,0 +1,93 @@
+{
+  "_comment": "ResNet-style taxonomic layers (k=21) — bottleneck 32x32x14 (14,336 values, ~13.7x compression). Uses ResidualConvBlock/DeconvBlock instead of plain Conv2d for richer feature extraction.",
+  "description": "ResNet Taxonomic CelebA-HQ Autoencoder (k=21): 3 encoder layers (256x256->32x32) with TaxonResnetConv and 3 decoder layers (32x32->256x256) with TaxonResnetDeconv. KL regularized.",
+  "experiment_name": "celebahq_resnet_k21",
+  "data": {
+    "data_root": "./data/celeba_hq",
+    "batch_size": 128,
+    "num_workers": 4,
+    "val_split": 0.1,
+    "train_subset": null,
+    "val_subset": null,
+    "_comment_subset": "batch_size=128; reduce if OOM with large (21x21) kernels and residual blocks."
+  },
+  "model": {
+    "latent_dim": 14,
+    "temperature": 1.0,
+    "use_maxpool": false,
+    "output_activation": "sigmoid",
+    "encoder_layers": [
+      {
+        "layer_type": "taxonomic_resnet_conv",
+        "n_layers": 5,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "_comment": "256x256x3 -> stride2 -> 128x128x62  (ResidualConvBlock per depth)"
+      },
+      {
+        "layer_type": "taxonomic_resnet_conv",
+        "n_layers": 5,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "_comment": "128x128x62 -> stride2 -> 64x64x62"
+      },
+      {
+        "layer_type": "taxonomic_resnet_conv",
+        "n_layers": 3,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "_comment": "64x64x62 -> stride2 -> 32x32x14 (BOTTLENECK: 32x32x14=14,336 values, ~13.7x compression)"
+      }
+    ],
+    "decoder_layers": [
+      {
+        "layer_type": "taxonomic_resnet_deconv",
+        "n_layers": 5,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "output_padding": 1,
+        "_comment": "32x32x14 -> 64x64x62  (ResidualDeconvBlock per depth)"
+      },
+      {
+        "layer_type": "taxonomic_resnet_deconv",
+        "n_layers": 5,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "output_padding": 1,
+        "_comment": "64x64x62 -> 128x128x62"
+      },
+      {
+        "layer_type": "taxonomic_resnet_deconv",
+        "n_layers": 5,
+        "kernel_size": 21,
+        "stride": 2,
+        "padding": 10,
+        "output_padding": 1,
+        "_comment": "128x128x62 -> 256x256x62, then final conv to 256x256x3"
+      }
+    ]
+  },
+  "training": {
+    "epochs": 30,
+    "learning_rate": 0.0003,
+    "kl_weight": 0.005,
+    "_comment": "kl_weight=0.005: moderate KL regularisation for hierarchy; matches celebahq_asymmetric_kl."
+  },
+  "analysis": {
+    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21/final_model.pt",
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3
+  },
+  "output": {
+    "training_save_dir": "outputs/celebahq/training/celebahq_resnet_k21",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_resnet_k21"
+  }
+}

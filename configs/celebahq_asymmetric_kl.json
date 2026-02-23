@@ -1,6 +1,6 @@
 {
-  "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout, using 511 filters at latent",
-  "description": "Asymmetric CelebA-HQ Taxonomic Autoencoder with KL: 5 encoder layers (256x256->16x16) and 4 decoder layers (16x16->256x256) with no linear bottleneck",
+  "_comment": "Asymmetric KL autoencoder — bottleneck tightened to 16x16x30 (7,680 values, ~26x compression of 196,608 input pixels)",
+  "description": "Asymmetric CelebA-HQ KL Taxonomic Autoencoder: 5 encoder layers (256x256->16x16) and 4 decoder layers (16x16->256x256). Bottleneck: 16x16x30=7,680 values (~26x compression).",
   "experiment_name": "celebahq_asymmetric_kl_511",
   "data": {
     "data_root": "./data/celeba_hq",
@@ -12,94 +12,94 @@
     "_comment_subset": "Set train_subset/val_subset to an integer (e.g., 5000) to train on a smaller subset for faster iteration. null = use full dataset"
   },
   "model": {
-    "latent_dim": 256,
+    "latent_dim": 30,
     "temperature": 1.0,
     "use_maxpool": true,
     "output_activation": "sigmoid",
     "encoder_layers": [
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 5,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "256x256x3 -> 128x128x(2^5-2^1) = 128x128x30"
+        "_comment": "256x256x3 -> MaxPool(2) -> 128x128x30  (KL: 2+4+8+16=30)"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 6,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "128x128x30 -> 64x64x(2^6-2^1) = 64x64x62"
+        "_comment": "128x128x30 -> MaxPool(2) -> 64x64x30"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 7,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "64x64x62 -> 32x32x(2^7-2^1) = 32x32x126"
+        "_comment": "64x64x30 -> MaxPool(2) -> 32x32x30"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 8,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "32x32x126 -> 16x16x(2^8-2^1) = 16x16x254"
+        "_comment": "32x32x30 -> MaxPool(2) -> 16x16x30"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 9,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 1,
         "padding": 1,
-        "_comment": "16x16x254 -> 16x16x(2^9-2^1) = 16x16x510 (latent space)"
+        "_comment": "16x16x30 -> 16x16x30 (BOTTLENECK: 16x16x30=7,680 values, ~26x compression)"
       }
     ],
     "decoder_layers": [
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 8,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "16x16x510 -> 32x32x(2^8-2^1) = 32x32x254"
+        "_comment": "16x16x30 -> 32x32x30"
       },
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 7,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "32x32x254 -> 64x64x(2^7-2^1) = 64x64x126"
+        "_comment": "32x32x30 -> 64x64x30"
       },
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 6,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "64x64x126 -> 128x128x(2^6-2^1) = 128x128x62"
+        "_comment": "64x64x30 -> 128x128x30"
       },
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 5,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "128x128x62 -> 256x256x(2^5-2^1) = 256x256x30, then final conv to 256x256x3"
+        "_comment": "128x128x30 -> 256x256x30, then final conv to 256x256x3"
       }
     ]
   },
   "training": {
-    "epochs": 10,
-    "learning_rate": 0.001,
+    "epochs": 50,
+    "learning_rate": 0.0005,
     "kl_weight": 0.005,
     "_comment": "kl_weight controls the weight of KL divergence in the total loss. CelebA-HQ uses smaller weight (0.01) to prevent overwhelming reconstruction loss."
   },

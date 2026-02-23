@@ -5,7 +5,10 @@ Decoder architectures using Taxonomic or Regular Deconvolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonDeconv, TaxonConv, TaxonDeconvKL, TaxonConvKL, MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv
+from .taxon_layers import (TaxonDeconv, TaxonConv, TaxonDeconvKL, TaxonConvKL,
+                          MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
+                          TaxonResnetConv, TaxonResnetDeconv,
+                          MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)
 
 
 class CIFAR10TaxonDecoder(nn.Module):
@@ -241,6 +244,68 @@ class CIFAR10TaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_resnet_deconv':
+                # TaxonResnetDeconv: residual blocks with transposed conv for upsampling
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonResnetDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonResnetDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
+            elif layer_type == 'taxonomic_resnet_conv':
+                # TaxonResnetConv in decoder (stride from config)
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
             elif layer_type == 'deconv':
                 out_ch = n_filters[i] if n_filters else 64
                 # Always use ConvTranspose2d for decoder upsampling
@@ -269,8 +334,8 @@ class CIFAR10TaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
-        # Check if any KL layers are used
-        has_kl = any('kl' in str(lt).lower() for lt in (layer_types if layer_types else []))
+        # Check if any KL/Resnet layers are used
+        has_kl = any('kl' in str(lt).lower() or 'resnet' in str(lt).lower() for lt in (layer_types if layer_types else []))
         
         # Add batch normalization before final conv if KL layers are present
         # This normalizes log-probability features to a learnable range
@@ -295,8 +360,8 @@ class CIFAR10TaxonDecoder(nn.Module):
         
         for i, deconv in enumerate(self.deconv_layers):
             
-            # KL layers may return either a tensor or (tensor, dkl). Accept both.
-            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL)):
+            # KL/Resnet layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL, TaxonResnetConv, TaxonResnetDeconv, MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)):
                 res = deconv(x)
                 if isinstance(res, tuple) and len(res) == 2:
                     x, dkl = res
@@ -311,7 +376,7 @@ class CIFAR10TaxonDecoder(nn.Module):
                 # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
-                x = F.relu(x)
+                x = F.leaky_relu(x, negative_slope=0.01)
         
         # Apply batch norm before final conv if present (for KL layers)
         if self.pre_final_norm is not None:
@@ -544,6 +609,68 @@ class CelebAHQTaxonDecoder(nn.Module):
                     alpha_init_seed=layer_seed
                 )
                 out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'taxonomic_resnet_deconv':
+                # TaxonResnetDeconv: residual blocks with transposed conv for upsampling
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonResnetDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonResnetDeconv(
+                        in_channels=in_ch,
+                        out_channels=1,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        padding=paddings[i],
+                        output_padding=output_paddings[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
+            elif layer_type == 'taxonomic_resnet_conv':
+                # TaxonResnetConv in decoder (stride from config)
+                if n_hier > 1:
+                    layer = MultiHierarchyTaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        temperature=temperature,
+                        n_hierarchies=n_hier,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                else:
+                    layer = TaxonResnetConv(
+                        in_channels=in_ch,
+                        kernel_size=kernel_sizes[i],
+                        n_layers=_n_lay,
+                        stride=strides[i],
+                        temperature=temperature,
+                        random_init_alphas=random_init_alphas,
+                        alpha_init_distribution=alpha_init_distribution,
+                        alpha_init_range=alpha_init_range,
+                        alpha_init_seed=layer_seed
+                    )
+                out_ch = n_hier * sum(2**j for j in range(1, _n_lay + 1))
             elif layer_type == 'deconv':
                 out_ch = n_filters[i] if n_filters else 64
                 # Always use ConvTranspose2d for decoder upsampling
@@ -572,8 +699,8 @@ class CelebAHQTaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
-        # Check if any KL layers are used
-        has_kl = any('kl' in str(lt).lower() for lt in (layer_types if layer_types else []))
+        # Check if any KL/Resnet layers are used
+        has_kl = any('kl' in str(lt).lower() or 'resnet' in str(lt).lower() for lt in (layer_types if layer_types else []))
         
         # Add batch normalization before final conv if KL layers are present
         # This normalizes log-probability features to a learnable range
@@ -598,8 +725,8 @@ class CelebAHQTaxonDecoder(nn.Module):
         
         for i, deconv in enumerate(self.deconv_layers):
             
-            # KL layers may return either a tensor or (tensor, dkl). Accept both.
-            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL)):
+            # KL/Resnet layers may return either a tensor or (tensor, dkl). Accept both.
+            if isinstance(deconv, (TaxonDeconvKL, TaxonConvKL, TaxonResnetConv, TaxonResnetDeconv, MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)):
                 res = deconv(x)
                 if isinstance(res, tuple) and len(res) == 2:
                     x, dkl = res
@@ -614,7 +741,7 @@ class CelebAHQTaxonDecoder(nn.Module):
                 # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
-                x = F.relu(x)
+                x = F.leaky_relu(x, negative_slope=0.01)
         
         # Apply batch norm before final conv if present (for KL layers)
         if self.pre_final_norm is not None:

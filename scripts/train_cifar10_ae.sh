@@ -4,8 +4,8 @@
 #SBATCH --mem=64G
 #SBATCH --gpus-per-node=a40
 #SBATCH --exclude=spot,heistotron,clippy
-#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/train_cifar10_ae.out
-#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/train_cifar10_ae.err
+#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/train_cifar10_ae_%j.out
+#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/train_cifar10_ae_%j.err
 #SBATCH --account="overcap"
 #SBATCH --partition="overcap"
 #SBATCH --nodes=1
@@ -22,6 +22,7 @@ export PYTHONPATH=$(pwd)
 # Config file - can be overridden by command line argument
 CONFIG_FILE=${1:-"configs/cifar10_standard.json"}
 
+echo "=== SLURM JOB ID: $SLURM_JOB_ID ==="
 echo "Starting CIFAR-10 Taxonomic Autoencoder training at $(date)"
 echo "Using config: $CONFIG_FILE"
 

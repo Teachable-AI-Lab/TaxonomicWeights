@@ -86,12 +86,6 @@ def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8
 
     images = images.cpu()
     recons = recons.cpu()
-    # Attempt to release CUDA cache after moving tensors to CPU
-    if device.type == 'cuda':
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2, 4))
     for i in range(num_images):
@@ -120,12 +114,14 @@ def train(
     lr,
     device,
     save_dir,
-    kl_weight=1.0
+    kl_weight=1.0,
+    resume_from=None
 ):
     """Train the autoencoder.
     
     Args:
         kl_weight: Weight for KL divergence loss (default 1.0). Set to 0 to ignore KL.
+        resume_from: Path to checkpoint to resume training from (optional).
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -136,15 +132,31 @@ def train(
 
     train_losses = []
     val_losses = []
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if resume_from and os.path.isfile(resume_from):
+        print(f"Resuming training from checkpoint: {resume_from}")
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        train_losses = checkpoint.get('train_losses', [])
+        val_losses = checkpoint.get('val_losses', [])
+        print(f"Resumed from epoch {start_epoch}")
+
+    # Gradient clipping max norm — prevents gradient explosion with large kernels + AMP
+    max_grad_norm = 1.0
 
     # Setup AMP scaler if CUDA is available
     use_amp = device.type == 'cuda'
     scaler = GradScaler() if use_amp else None
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         running_loss = 0.0
         running_recon_loss = 0.0
         running_kl_loss = 0.0
+        nan_count = 0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             optimizer.zero_grad()
@@ -162,7 +174,15 @@ def train(
                         recons = result
                         loss = criterion(recons, images)
                     running_recon_loss += criterion(recons, images).item() * images.size(0)
+                # NaN-safe: skip optimizer step if loss is NaN/Inf
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad()
+                    nan_count += 1
+                    continue
                 scaler.scale(loss).backward()
+                # Unscale before clipping so clip sees true gradient magnitudes
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -178,16 +198,15 @@ def train(
                     recons = result
                     loss = criterion(recons, images)
                 running_recon_loss += criterion(recons, images).item() * images.size(0)
+                # NaN-safe: skip optimizer step if loss is NaN/Inf
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad()
+                    nan_count += 1
+                    continue
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
             running_loss += loss.item() * images.size(0)
-
-            # Free CUDA cache where possible to reduce fragmentation/peak memory
-            if device.type == 'cuda':
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
         epoch_train_recon_loss = running_recon_loss / len(train_loader.dataset)
@@ -229,11 +248,6 @@ def train(
                         val_running_recon += criterion(recons, images).item() * images.size(0)
                     val_running += loss.item() * images.size(0)
 
-                    if device.type == 'cuda':
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
             epoch_val_loss = val_running / len(val_loader.dataset)
             epoch_val_recon_loss = val_running_recon / len(val_loader.dataset)
             epoch_val_kl_loss = val_running_kl / len(val_loader.dataset)
@@ -248,8 +262,10 @@ def train(
             print(f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f} (recon: {epoch_train_recon_loss:.6f}, KL: {epoch_train_kl_loss:.6f})" +
                   (f", val loss: {epoch_val_loss:.6f} (recon: {epoch_val_recon_loss:.6f}, KL: {epoch_val_kl_loss:.6f})" if epoch_val_loss is not None else ""))
         else:
-            print(f"Epoch {epoch+1}/{epochs} - train MSE: {epoch_train_loss:.6f}" +
-                  (f", val MSE: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
+            print(f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f}" +
+                  (f", val loss: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
+        if nan_count > 0:
+            print(f"  WARNING: {nan_count} batches had NaN/Inf loss and were skipped")
 
         # Save reconstructions every epoch
         visualize_reconstructions(model, val_loader or train_loader, device, save_dir, epoch=epoch+1)
@@ -280,11 +296,11 @@ def train(
 
     # Plot curves
     plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Train MSE')
+    plt.plot(train_losses, label='Train Loss')
     if any(v is not None for v in val_losses):
-        plt.plot([v for v in val_losses if v is not None], label='Val MSE')
+        plt.plot([v for v in val_losses if v is not None], label='Val Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
+    plt.ylabel('Loss')
     plt.title('Training Curves')
     plt.grid(True)
     plt.legend()
@@ -302,6 +318,8 @@ def main():
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--data-root', type=str, default=None)
     parser.add_argument('--num-workers', type=int, default=None)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
 
     args = parser.parse_args()
 
@@ -436,6 +454,21 @@ def main():
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
     print('\nStarting training...\n')
+
+    # Auto-detect resume checkpoint if --resume=auto
+    resume_from = args.resume
+    if resume_from == 'auto':
+        # Find the latest checkpoint in save_dir
+        if os.path.isdir(save_dir):
+            ckpts = sorted([f for f in os.listdir(save_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')])
+            if ckpts:
+                resume_from = os.path.join(save_dir, ckpts[-1])
+                print(f"Auto-resume: found {resume_from}")
+            else:
+                resume_from = None
+        else:
+            resume_from = None
+
     model, train_losses, val_losses = train(
         model=model,
         train_loader=train_loader,
@@ -444,14 +477,15 @@ def main():
         lr=lr,
         device=device,
         save_dir=save_dir,
-        kl_weight=kl_weight
+        kl_weight=kl_weight,
+        resume_from=resume_from
     )
 
     print('\n' + '=' * 60)
     print('Training complete!')
-    print(f'Final train MSE: {train_losses[-1]:.6f}')
+    print(f'Final train loss: {train_losses[-1]:.6f}')
     if val_losses[-1] is not None:
-        print(f'Final val MSE: {val_losses[-1]:.6f}')
+        print(f'Final val loss: {val_losses[-1]:.6f}')
     print(f'Outputs saved to: {save_dir}')
     print('=' * 60)
 

@@ -4,8 +4,8 @@
 #SBATCH --mem=24G
 #SBATCH --gpus-per-node=a40
 #SBATCH --exclude=spot,heistotron,clippy
-#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_cifar10_ae.out
-#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_cifar10_ae.err
+#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_cifar10_ae_%j.out
+#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_cifar10_ae_%j.err
 #SBATCH --account="overcap"
 #SBATCH --partition="overcap"
 #SBATCH --nodes=1
@@ -23,6 +23,7 @@ export PYTHONPATH=$(pwd)
 # If argument looks like a .json file, treat it as config, otherwise as checkpoint
 ARG=${1:-"configs/cifar10_standard.json"}
 
+echo "=== SLURM JOB ID: $SLURM_JOB_ID ==="
 echo "Starting CIFAR-10 Taxonomic Autoencoder analysis at $(date)"
 
 echo "Using config file: $ARG"

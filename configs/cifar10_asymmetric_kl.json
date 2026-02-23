@@ -1,59 +1,76 @@
 {
-  "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout",
-  "description": "Asymmetric CIFAR-10 Taxonomic Autoencoder with KL: 3 encoder layers (32x32->8x8) and 2 decoder layers (8x8->32x32) with no linear bottleneck",
+  "_comment": "KL autoencoder — strong spatial bottleneck at 4x4x30 (480 values, ~6x compression of 3072 input pixels)",
+  "description": "Asymmetric CIFAR-10 KL Taxonomic Autoencoder: 4 encoder layers (32x32->4x4) and 3 decoder layers (4x4->32x32). Bottleneck: 4x4x30=480 values (~6x compression).",
   "experiment_name": "asymmetric_kl_no_linear_ar",
   "data": {
     "batch_size": 128,
     "data_root": "./data/cifar10"
   },
   "model": {
-    "latent_dim": 256,
+    "latent_dim": 30,
     "temperature": 1.0,
     "use_maxpool": true,
     "encoder_layers": [
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 5,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "32x32x3 -> 16x16x(2^5-2^1) = 16x16x62"
+        "_comment": "32x32x3 -> MaxPool(2) -> 16x16x30  (KL: 2+4+8+16=30)"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 6,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
-        "_comment": "16x16x62 -> 8x8x(2^6-2^1) = 8x8x126"
+        "_comment": "16x16x30 -> MaxPool(2) -> 8x8x30"
       },
       {
         "layer_type": "taxonomic_conv_kl",
-        "n_layers": 7,
+        "n_layers": 4,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "_comment": "8x8x30 -> MaxPool(2) -> 4x4x30"
+      },
+      {
+        "layer_type": "taxonomic_conv_kl",
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 1,
         "padding": 1,
-        "_comment": "8x8x126 -> 8x8x(2^7-2^1) = 8x8x254 (latent space)"
+        "_comment": "4x4x30 -> 4x4x30 (BOTTLENECK: 4x4x30=480 values, ~6x compression)"
       }
     ],
     "decoder_layers": [
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 6,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "8x8x254 -> 16x16x(2^6-2^1) = 16x16x126"
+        "_comment": "4x4x30 -> 8x8x30"
       },
       {
         "layer_type": "taxonomic_deconv_kl",
-        "n_layers": 5,
+        "n_layers": 4,
         "kernel_size": 3,
         "stride": 2,
         "padding": 1,
         "output_padding": 1,
-        "_comment": "16x16x126 -> 32x32x(2^5-2^1) = 32x32x62, then final conv to 32x32x3"
+        "_comment": "8x8x30 -> 16x16x30"
+      },
+      {
+        "layer_type": "taxonomic_deconv_kl",
+        "n_layers": 4,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "output_padding": 1,
+        "_comment": "16x16x30 -> 32x32x30, then final conv to 32x32x3"
       }
     ]
   },
@@ -61,7 +78,7 @@
     "epochs": 50,
     "learning_rate": 0.001,
     "kl_weight": 0.001,
-    "_comment": "kl_weight controls the weight of KL divergence in the total loss. Lower weight (0.01) allows model to focus on reconstruction quality first."
+    "_comment": "kl_weight=0.001: light regularisation so reconstruction dominates."
   },
   "analysis": {
     "checkpoint_path": "outputs/cifar10/training/asymmetric_kl_no_linear_ar/final_model.pt",
