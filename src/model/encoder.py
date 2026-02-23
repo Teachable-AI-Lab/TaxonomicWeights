@@ -147,6 +147,44 @@ class CIFAR10TaxonEncoder(nn.Module):
                         alpha_init_seed=layer_seed
                     )
                 out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
+            elif layer_type == 'taxonomic_conv_kl':
+                # Use TaxonConvKL (returns output, dkl)
+                conv = TaxonConvKL(
+                    in_channels=in_ch,
+                    kernel_size=kernel_sizes[i],
+                    n_layers=n_layers[i] if n_layers else 4,
+                    temperature=temperature,
+                    random_init_alphas=random_init_alphas,
+                    alpha_init_distribution=alpha_init_distribution,
+                    alpha_init_range=alpha_init_range,
+                    alpha_init_seed=layer_seed
+                )
+                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
+            elif layer_type == 'conv':
+                # Use regular Conv2d
+                out_ch = n_filters[i] if n_filters else 64
+                conv = nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=kernel_sizes[i],
+                    stride=layer_stride,
+                    padding=kernel_sizes[i] // 2,
+                    bias=True
+                )
+            else:
+                raise ValueError(f"Unknown layer_type in encoder: {layer_type}")
+            
+            self.conv_layers.append(conv)
+            in_ch = out_ch
+        
+        # Calculate final spatial size and channels (keep for decoder initialization)
+        final_size = 32
+        for stride in strides[:self.num_layers]:
+            if stride > 1:
+                final_size = final_size // stride
+        
+        self.final_channels = in_ch
+        self.final_size = final_size
         
     def forward(self, x):
         total_kl = 0.0

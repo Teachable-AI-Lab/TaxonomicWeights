@@ -15,13 +15,13 @@
 
 export PYTHONUNBUFFERED=TRUE
 source ~/.bashrc
-conda activate taxon-weights
-cd ~/flash/TaxonomicWeights
+conda activate aryan_exp
+cd /nethome/aroy389/flash/aroy389/taxon/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Config file or checkpoint path - can be overridden by command line argument
 # If argument looks like a .json file, treat it as config, otherwise as checkpoint
-ARG=${1:-"configs/cifar10_standard.json"}
+ARG=${1:-"configs/cifar10_asymmetric_kl.json"}
 
 echo "Starting CIFAR-10 Taxonomic Autoencoder analysis at $(date)"
 

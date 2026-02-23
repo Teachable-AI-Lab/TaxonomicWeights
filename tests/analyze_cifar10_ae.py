@@ -1178,8 +1178,14 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
 def visualize_feature_maps(feature_tensor, save_path, title, max_maps=16, nrow=4):
     """Helper to visualize feature maps from a layer."""
     
-    # feature_tensor: (1, C, H, W)
-    maps = feature_tensor[0].detach().cpu()
+    # feature_tensor: (B, C, H, W)
+    feature_tensor = feature_tensor.detach().cpu()
+    
+    # Handle missing batch dimension
+    if feature_tensor.ndim == 3:
+        feature_tensor = feature_tensor.unsqueeze(0)
+    
+    maps = feature_tensor[0]  # (C, H, W)
     num_maps = min(maps.shape[0], max_maps)
     
     fig, axes = plt.subplots(nrow, nrow, figsize=(nrow * 2, nrow * 2))
@@ -1187,7 +1193,7 @@ def visualize_feature_maps(feature_tensor, save_path, title, max_maps=16, nrow=4
     
     for i in range(num_maps):
         ax = axes[i]
-        fmap = maps[i].numpy()
+        fmap = maps[i].numpy()  # (H, W)
         # Normalize for visualization
         fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
         ax.imshow(fmap, cmap='viridis')
