@@ -15,12 +15,12 @@
 
 export PYTHONUNBUFFERED=TRUE
 source ~/.bashrc
-conda activate taxon-weights
-cd ~/flash/TaxonomicWeights
+conda activate aryan_exp
+
 export PYTHONPATH=$(pwd)
 
 # Config file - can be overridden by command line argument
-CONFIG_FILE=${1:-"configs/cifar10_standard.json"}
+CONFIG_FILE=${1:-"configs/cifar10_asymmetric_kl.json"}
 
 echo "Starting CIFAR-10 Taxonomic Autoencoder training at $(date)"
 echo "Using config: $CONFIG_FILE"
