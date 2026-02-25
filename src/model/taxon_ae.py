@@ -24,7 +24,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
     latent_dim : int
         Dimensionality of the latent space
     temperature : float
-        Temperature for alpha sigmoid in taxonomic layers
+        Temperature for sigmoid in taxonomic layers
     encoder_kernel_sizes : list of int or int
         Kernel sizes for encoder TaxonConv layers
     decoder_kernel_sizes : list of int or int
@@ -45,10 +45,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
                  encoder_n_filters=None, decoder_n_filters=None,
                  encoder_layer_types=None, decoder_layer_types=None,
                  decoder_paddings=None, decoder_output_paddings=None,
-                 use_maxpool=True, encoder_n_hierarchies=None, decoder_n_hierarchies=None,
-                 random_init_alphas=False,
-                 alpha_init_distribution="uniform", alpha_init_range=None,
-                 alpha_init_seed=None):
+                 use_maxpool=True):
         super(CIFAR10TaxonAutoencoder, self).__init__()
         self.latent_dim = latent_dim
         
@@ -70,12 +67,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             n_layers=encoder_n_layers,
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
-            use_maxpool=use_maxpool,
-            n_hierarchies=encoder_n_hierarchies,
-            random_init_alphas=random_init_alphas,
-            alpha_init_distribution=alpha_init_distribution,
-            alpha_init_range=alpha_init_range,
-            alpha_init_seed=alpha_init_seed
+            use_maxpool=use_maxpool
         )
 
         # Get encoder's final channels for decoder input
@@ -93,12 +85,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             layer_types=decoder_layer_types,
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
-            use_maxpool=use_maxpool,
-            n_hierarchies=decoder_n_hierarchies,
-            random_init_alphas=random_init_alphas,
-            alpha_init_distribution=alpha_init_distribution,
-            alpha_init_range=alpha_init_range,
-            alpha_init_seed=alpha_init_seed
+            use_maxpool=use_maxpool
         )
         
     def encode(self, x):
@@ -186,7 +173,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
     latent_dim : int
         Dimensionality of the latent space (not used for spatial latent)
     temperature : float
-        Temperature for alpha sigmoid in taxonomic layers
+        Temperature for sigmoid in taxonomic layers
     encoder_kernel_sizes : list of int or int
         Kernel sizes for encoder layers
     decoder_kernel_sizes : list of int or int
@@ -219,10 +206,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
                  encoder_n_filters=None, decoder_n_filters=None,
                  encoder_layer_types=None, decoder_layer_types=None,
                  decoder_paddings=None, decoder_output_paddings=None,
-                 use_maxpool=True, encoder_n_hierarchies=None, decoder_n_hierarchies=None,
-                 random_init_alphas=False,
-                 alpha_init_distribution="uniform", alpha_init_range=None,
-                 alpha_init_seed=None, output_activation='sigmoid'):
+                 use_maxpool=True, output_activation='sigmoid'):
         super(CelebAHQTaxonAutoencoder, self).__init__()
         self.latent_dim = latent_dim
         
@@ -250,12 +234,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             n_layers=encoder_n_layers,
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
-            use_maxpool=use_maxpool,
-            n_hierarchies=encoder_n_hierarchies,
-            random_init_alphas=random_init_alphas,
-            alpha_init_distribution=alpha_init_distribution,
-            alpha_init_range=alpha_init_range,
-            alpha_init_seed=alpha_init_seed
+            use_maxpool=use_maxpool
         )
 
         # Get encoder's final channels for decoder input
@@ -274,11 +253,6 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
             use_maxpool=use_maxpool,
-            n_hierarchies=decoder_n_hierarchies,
-            random_init_alphas=random_init_alphas,
-            alpha_init_distribution=alpha_init_distribution,
-            alpha_init_range=alpha_init_range,
-            alpha_init_seed=alpha_init_seed,
             output_activation=output_activation
         )
         

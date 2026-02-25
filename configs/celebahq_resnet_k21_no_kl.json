@@ -1,7 +1,7 @@
 {
   "_comment": "ResNet-style taxonomic layers (k=21) — hierarchy depth increases 5->6->7 then bottleneck 16x16x30 (7,680 values, ~25.6x compression). Decoder mirrors: 7->6->5.",
   "description": "ResNet Taxonomic CelebA-HQ Autoencoder (k=21): 4 encoder layers (256->16, n_layers 5/6/7/4) with TaxonResnetConv and 4 decoder layers (16->256, n_layers 7/6/5/5) with TaxonResnetDeconv. KL regularized.",
-  "experiment_name": "celebahq_resnet_k21",
+  "experiment_name": "celebahq_resnet_k21_no_kl",
   "data": {
     "data_root": "./data/celeba_hq",
     "batch_size": 128,
@@ -92,11 +92,11 @@
   "training": {
     "epochs": 30,
     "learning_rate": 0.0003,
-    "kl_weight": 0.005,
+    "kl_weight": 0.000,
     "_comment": "kl_weight=0.005: moderate KL regularisation for hierarchy; matches celebahq_asymmetric_kl."
   },
   "analysis": {
-    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21/checkpoint_epoch_10.pt",
+    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21_no_kl/checkpoint_epoch_10.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -104,7 +104,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/celebahq/training/celebahq_resnet_k21",
-    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_resnet_k21"
+    "training_save_dir": "outputs/celebahq/training/celebahq_resnet_k21_no_kl",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_resnet_k21_no_kl"
   }
 }

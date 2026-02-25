@@ -33,7 +33,6 @@ def parse_layer_config(config_layers):
     strides_list = []
     paddings_list = []
     output_paddings_list = []
-    n_hierarchies_list = []
 
     for layer in config_layers:
         layer_type = layer.get('layer_type', 'taxonomic_conv')
@@ -53,17 +52,14 @@ def parse_layer_config(config_layers):
         strides_list.append(layer.get('stride', 1))
         paddings_list.append(layer.get('padding', None))
         output_paddings_list.append(layer.get('output_padding', 0))
-        n_hierarchies_list.append(layer.get('n_hierarchies', 1))
 
     # Clean up None lists
     n_layers_out = n_layers_list if any(x is not None for x in n_layers_list) else None
     n_filters_out = n_filters_list if any(x is not None for x in n_filters_list) else None
     paddings_out = paddings_list if any(x is not None for x in paddings_list) else None
-    n_hierarchies_out = n_hierarchies_list if any(x != 1 for x in n_hierarchies_list) else None
 
     return (n_layers_out, n_filters_out, layer_types_list,
-            kernel_sizes_list, strides_list, paddings_out, output_paddings_list,
-            n_hierarchies_out)
+            kernel_sizes_list, strides_list, paddings_out, output_paddings_list)
 
 
 def load_config(config_path):
@@ -413,18 +409,14 @@ def main():
     decoder_layers = model_config.get('decoder_layers', [])
     
     (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes,
-        enc_strides, enc_paddings, enc_output_paddings, enc_n_hierarchies) = parse_layer_config(encoder_layers)
+        enc_strides, enc_paddings, enc_output_paddings) = parse_layer_config(encoder_layers)
 
     (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes,
-        dec_strides, dec_paddings, dec_output_paddings, dec_n_hierarchies) = parse_layer_config(decoder_layers)
+        dec_strides, dec_paddings, dec_output_paddings) = parse_layer_config(decoder_layers)
     
     # Get taxonomic-specific settings
     temperature = model_config.get('temperature', 1.0)
     use_maxpool = model_config.get('use_maxpool', True)
-    random_init_alphas = model_config.get('random_init_alphas', False)
-    alpha_init_distribution = model_config.get('alpha_init_distribution', 'uniform')
-    alpha_init_range = model_config.get('alpha_init_range', None)
-    alpha_init_seed = model_config.get('alpha_init_seed', None)
     output_activation = model_config.get('output_activation', 'sigmoid')
     
     model = CelebAHQTaxonAutoencoder(
@@ -443,12 +435,6 @@ def main():
         decoder_paddings=dec_paddings,
         decoder_output_paddings=dec_output_paddings,
         use_maxpool=use_maxpool,
-        encoder_n_hierarchies=enc_n_hierarchies,
-        decoder_n_hierarchies=dec_n_hierarchies,
-        random_init_alphas=random_init_alphas,
-        alpha_init_distribution=alpha_init_distribution,
-        alpha_init_range=alpha_init_range,
-        alpha_init_seed=alpha_init_seed,
         output_activation=output_activation
     )
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")

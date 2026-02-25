@@ -2,6 +2,10 @@
 
 ## Karthik Branch!!
 
+New plan - minimize KL-divergence from uniform distribution while also minimizing KL-divergence for individual instances from the path!!
+
+We can do this by minimizing the entropy of each distribution
+
 ## Notes on Zekun's prior code
 
 *   `taxon-conv-weight.ipynb`

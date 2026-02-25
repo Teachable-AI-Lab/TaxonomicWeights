@@ -1,7 +1,7 @@
 {
-  "_comment": "ResNet-style taxonomic layers (k=21) — hierarchy depth increases 5->6->7 then bottleneck 16x16x30 (7,680 values, ~25.6x compression). Decoder mirrors: 7->6->5.",
-  "description": "ResNet Taxonomic CelebA-HQ Autoencoder (k=21): 4 encoder layers (256->16, n_layers 5/6/7/4) with TaxonResnetConv and 4 decoder layers (16->256, n_layers 7/6/5/5) with TaxonResnetDeconv. KL regularized.",
-  "experiment_name": "celebahq_resnet_k21",
+  "_comment": "ResNet-style taxonomic layers (k=3) — hierarchy depth increases 5->6->7 then bottleneck 16x16x30 (7,680 values, ~25.6x compression). Decoder mirrors: 7->6->5.",
+  "description": "ResNet Taxonomic CelebA-HQ Autoencoder (k=3): 4 encoder layers (256->16, n_layers 5/6/7/4) with TaxonConv and 4 decoder layers (16->256, n_layers 7/6/5/5) with TaxonDeconv. KL regularized.",
+  "experiment_name": "celebahq_resnet_k3_no_kl",
   "data": {
     "data_root": "./data/celeba_hq",
     "batch_size": 128,
@@ -9,7 +9,7 @@
     "val_split": 0.1,
     "train_subset": null,
     "val_subset": null,
-    "_comment_subset": "batch_size=128; reduce if OOM with large (21x21) kernels and residual blocks."
+    "_comment_subset": "batch_size=128; small (3x3) kernels with residual blocks."
   },
   "model": {
     "latent_dim": 30,
@@ -20,33 +20,33 @@
       {
         "layer_type": "taxon_conv",
         "n_layers": 5,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "_comment": "256x256x3 -> stride2 -> 128x128x62  (5 depth levels, 62ch)"
       },
       {
         "layer_type": "taxon_conv",
         "n_layers": 6,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "_comment": "128x128x62 -> stride2 -> 64x64x126  (6 depth levels, 126ch)"
       },
       {
         "layer_type": "taxon_conv",
         "n_layers": 7,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "_comment": "64x64x126 -> stride2 -> 32x32x254  (7 depth levels, 254ch)"
       },
       {
         "layer_type": "taxon_conv",
         "n_layers": 4,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "_comment": "32x32x254 -> stride2 -> 16x16x30  BOTTLENECK (4 depth, 30ch = 7,680 vals, ~25.6x compression)"
       }
     ],
@@ -54,36 +54,36 @@
       {
         "layer_type": "taxon_deconv",
         "n_layers": 7,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "output_padding": 1,
         "_comment": "16x16x30 -> 32x32x254  (7 depth levels, expand from bottleneck)"
       },
       {
         "layer_type": "taxon_deconv",
         "n_layers": 6,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "output_padding": 1,
         "_comment": "32x32x254 -> 64x64x126  (6 depth levels)"
       },
       {
         "layer_type": "taxon_deconv",
         "n_layers": 5,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "output_padding": 1,
         "_comment": "64x64x126 -> 128x128x62  (5 depth levels)"
       },
       {
         "layer_type": "taxon_deconv",
         "n_layers": 5,
-        "kernel_size": 21,
+        "kernel_size": 3,
         "stride": 2,
-        "padding": 10,
+        "padding": 1,
         "output_padding": 1,
         "_comment": "128x128x62 -> 256x256x62, then final_conv -> 256x256x3"
       }
@@ -92,11 +92,11 @@
   "training": {
     "epochs": 30,
     "learning_rate": 0.0003,
-    "kl_weight": 0.005,
-    "_comment": "kl_weight=0.005: moderate KL regularisation for hierarchy; matches celebahq_asymmetric_kl."
+    "kl_weight": 0.000,
+    "_comment": "kl_weight=0.000: no KL regularisation; pure reconstruction baseline."
   },
   "analysis": {
-    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21/checkpoint_epoch_10.pt",
+    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k3_no_kl/checkpoint_epoch_10.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -104,7 +104,7 @@
     "num_activation_images": 3
   },
   "output": {
-    "training_save_dir": "outputs/celebahq/training/celebahq_resnet_k21",
-    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_resnet_k21"
+    "training_save_dir": "outputs/celebahq/training/celebahq_resnet_k3_no_kl",
+    "analysis_save_dir": "outputs/celebahq/analysis/celebahq_resnet_k3_no_kl"
   }
 }
