@@ -9,6 +9,7 @@ multiple levels of abstraction simultaneously.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 def stable_sigmoid(x: torch.Tensor) -> torch.Tensor:
@@ -104,22 +105,74 @@ class ResidualDeconvBlock(nn.Module):
         return self.block(x) + self.skip(x)
 
 
+def _taxonomic_regularization(
+    out: torch.Tensor,
+    idx: int,
+) -> tuple:
+    """Compute the two-part taxonomic regularization for one depth level.
+
+    Parameters
+    ----------
+    out : Tensor, shape ``[B, 2^(idx+1), H, W]``
+        Joint (accumulated) log-probabilities at this depth.
+    idx : int
+        Current depth index (0-based).
+
+    Returns
+    -------
+    (entropy, batch_kl) : tuple of scalar Tensors
+        1. **Per-instance entropy** (to minimize) — encourages each sample
+           to commit to few branches (sparse routing).
+        2. **Batch-marginal KL to uniform** (to minimize) — encourages
+           all branches to be used equally across the batch.
+
+        Both are returned **unweighted**; the training loop applies the
+        ``entropy_weight`` and ``batch_kl_weight`` coefficients from config.
+    """
+    n_branches = out.shape[1]  # 2^(idx+1)
+
+    # Convert joint log-probs to a proper per-instance distribution over
+    # branches at this depth via softmax across the channel dimension.
+    instance_probs = torch.softmax(out, dim=1)  # [B, n_branches, H, W]
+
+    # ---- Term 1: per-instance entropy (minimize → sparse per sample) ----
+    instance_entropy = -(instance_probs * instance_probs.clamp(min=1e-8).log()).sum(dim=1)
+    entropy = instance_entropy.mean()
+
+    # ---- Term 2: batch-marginal KL to uniform (minimize → diverse) ------
+    batch_marginal = instance_probs.mean(dim=(0, 2, 3))  # [n_branches]
+    batch_marginal = batch_marginal / batch_marginal.sum()  # re-normalise
+    uniform = torch.full_like(batch_marginal, 1.0 / n_branches)
+    # KL(batch_marginal || uniform)
+    batch_kl = F.kl_div(
+        input=uniform.log(),
+        target=batch_marginal,
+        reduction='sum',
+        log_target=False,
+    )
+
+    return entropy, batch_kl
+
+
 class TaxonConv(nn.Module):
-    """Taxonomic Convolutional Layer with Residual Blocks and KL Divergence.
+    """Taxonomic Convolutional Layer with Residual Blocks.
 
     Based on the design in ``taxon-conv-zekun.ipynb``.  Each depth of the
     probabilistic hierarchy uses a :class:`ResidualConvBlock` (BN-Conv-ReLU-
     BN-Conv + skip) instead of a plain ``nn.Conv2d``.  Every residual block
     takes the **original input** ``x`` and produces conditional Bernoulli
     probabilities via sigmoid.  Parent log-probabilities are accumulated
-    down the binary tree, and KL divergence against a uniform distribution
-    is computed as regularisation.
+    down the binary tree.
 
-    Output channels = ``2 + 4 + … + 2^n_layers``
-        (same channel layout as :class:`TaxonConv`).
+    Regularisation (returned as second element of the forward tuple):
+        * **Per-instance entropy minimization** — each sample should commit
+          to a sparse subset of branches (decisive routing).
+        * **Batch-marginal KL to uniform** — across the batch, all branches
+          should be used equally (no branch collapse).
 
-    Returns ``(output_tensor, dkl)`` — treat identically to
-    :class:`TaxonConv` in training loops and analysis scripts.
+    Output channels = ``2 + 4 + … + 2^n_layers``.
+
+    Returns ``(output_tensor, entropy_reg, batch_kl_reg)``.
 
     Parameters
     ----------
@@ -156,7 +209,8 @@ class TaxonConv(nn.Module):
     def forward(self, x):
         outputs = []
         prev = None
-        dkl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_entropy = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_batch_kl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         for idx, conv in enumerate(self.convs):
             # Residual block → sigmoid → probabilities
@@ -177,18 +231,19 @@ class TaxonConv(nn.Module):
             else:
                 out = logp + prev.repeat_interleave(2, dim=1)
 
-            # KL against uniform at this depth
-            out_expected = torch.full_like(out, 0.5 / (2 ** idx))
-            dkl_raw = F.kl_div(
-                input=out, target=out_expected,
-                reduction='none', log_target=False,
+            # Taxonomic regularization: sparse per-instance + uniform per-batch
+            # Gradient checkpointing frees large softmax/entropy intermediates
+            # during forward; they are recomputed on-the-fly during backward.
+            ent, bkl = grad_checkpoint(
+                _taxonomic_regularization, out, idx, use_reentrant=False
             )
-            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            total_entropy = total_entropy + ent
+            total_batch_kl = total_batch_kl + bkl
 
             outputs.append(out)
             prev = out
 
-        return torch.cat(outputs, dim=1), dkl
+        return torch.cat(outputs, dim=1), total_entropy, total_batch_kl
 
     def num_output_channels(self):
         """Total output channels: 2 + 4 + … + 2^n_layers."""
@@ -206,13 +261,23 @@ class TaxonConv(nn.Module):
 
 
 class TaxonDeconv(nn.Module):
-    """Taxonomic Deconvolutional Layer with Residual Blocks and KL Divergence.
+    """Taxonomic Deconvolutional Layer with Residual Blocks.
 
     Transposed-convolution analogue of :class:`TaxonConv`.  Uses
     :class:`ResidualDeconvBlock` at each depth for upsampling.  Returns
-    ``(output_tensor, dkl)`` — treat identically to :class:`TaxonDeconv`.
+    ``(output_tensor, entropy_reg, batch_kl_reg)``.
+
+    Regularisation (returned as second element of the forward tuple):
+        * **Per-instance entropy minimization** — each sample should commit
+          to a sparse subset of branches (decisive routing).
+        * **Batch-marginal KL to uniform** — across the batch, all branches
+          should be used equally (no branch collapse).
 
     Output channels = ``out_channels × (2 + 4 + … + 2^n_layers)``.
+
+    Parameters
+    ----------
+    (see :class:`TaxonConv` for shared parameters)
     """
 
     def __init__(self, in_channels, out_channels=1, kernel_size=3, n_layers=3,
@@ -243,7 +308,8 @@ class TaxonDeconv(nn.Module):
     def forward(self, x):
         outputs = []
         prev = None
-        dkl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_entropy = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_batch_kl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         for idx, deconv in enumerate(self.deconvs):
             ll = deconv(x) / self.temperature
@@ -264,18 +330,19 @@ class TaxonDeconv(nn.Module):
                 prev_upsampled = F.interpolate(prev, size=logp.shape[2:], mode='nearest')
                 out = logp + prev_upsampled.repeat_interleave(2, dim=1)
 
-            # KL against uniform
-            out_expected = torch.full_like(out, 0.5 / (2 ** idx))
-            dkl_raw = F.kl_div(
-                input=out, target=out_expected,
-                reduction='none', log_target=False,
+            # Taxonomic regularization: sparse per-instance + uniform per-batch
+            # Gradient checkpointing frees large softmax/entropy intermediates
+            # during forward; they are recomputed on-the-fly during backward.
+            ent, bkl = grad_checkpoint(
+                _taxonomic_regularization, out, idx, use_reentrant=False
             )
-            dkl = dkl + dkl_raw.sum(dim=1).mean()
+            total_entropy = total_entropy + ent
+            total_batch_kl = total_batch_kl + bkl
 
             outputs.append(out)
             prev = out
 
-        return torch.cat(outputs, dim=1), dkl
+        return torch.cat(outputs, dim=1), total_entropy, total_batch_kl
 
     def num_output_channels(self):
         return self.out_channels * sum(2 ** i for i in range(1, self.n_layers + 1))

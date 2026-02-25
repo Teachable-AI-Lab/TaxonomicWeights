@@ -92,8 +92,9 @@
   "training": {
     "epochs": 30,
     "learning_rate": 0.0003,
-    "kl_weight": 0.000,
-    "_comment": "kl_weight=0.000: no KL regularisation; pure reconstruction baseline."
+    "entropy_weight": 0.0,
+    "batch_kl_weight": 0.0,
+    "_comment": "entropy_weight=0, batch_kl_weight=0: no regularisation; pure reconstruction baseline."
   },
   "analysis": {
     "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k3_no_kl/checkpoint_epoch_10.pt",

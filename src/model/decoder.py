@@ -187,7 +187,7 @@ class CIFAR10TaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
-        # TaxonConv / TaxonDeconv always produce dkl output
+        # TaxonConv / TaxonDeconv always produce regularization output
         has_kl = any(lt in ('taxon_conv', 'taxon_deconv') for lt in (layer_types if layer_types else []))
         
         # Add batch normalization before final conv if KL layers are present
@@ -208,23 +208,17 @@ class CIFAR10TaxonDecoder(nn.Module):
     def forward(self, z):
         # z is spatial input from encoder (B, C, H, W)
         x = z
-        total_kl = 0.0
+        total_entropy = 0.0
+        total_batch_kl = 0.0
         has_kl_layers = False
         
         for i, deconv in enumerate(self.deconv_layers):
             
             if isinstance(deconv, (TaxonConv, TaxonDeconv)):
-                res = deconv(x)
-                if isinstance(res, tuple) and len(res) == 2:
-                    x, dkl = res
-                else:
-                    x = res
-                    dkl = getattr(deconv, '_last_dkl', None)
-                
-                # Accumulate KL divergence
-                if dkl is not None:
-                    total_kl = total_kl + dkl
-                    has_kl_layers = True
+                x, ent, bkl = deconv(x)
+                total_entropy = total_entropy + ent
+                total_batch_kl = total_batch_kl + bkl
+                has_kl_layers = True
                 # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
@@ -235,15 +229,13 @@ class CIFAR10TaxonDecoder(nn.Module):
             x = self.pre_final_norm(x)
         
         # Final conv to RGB (outputs exactly 3 channels)
-        # For KL layers: log-probs are treated as features, final conv learns RGB mapping
         x = self.final_conv(x)
         
         # Apply tanh activation for output in [-1, 1] range
         x = torch.tanh(x)
         
-        # Return reconstruction and KL divergence (if any KL layers present)
         if has_kl_layers:
-            return x, total_kl
+            return x, total_entropy, total_batch_kl
         else:
             return x
 
@@ -408,7 +400,7 @@ class CelebAHQTaxonDecoder(nn.Module):
             self.deconv_layers.append(layer)
             in_ch = out_ch
         
-        # TaxonConv / TaxonDeconv always produce dkl output
+        # TaxonConv / TaxonDeconv always produce regularization output
         has_kl = any(lt in ('taxon_conv', 'taxon_deconv') for lt in (layer_types if layer_types else []))
         
         # Add batch normalization before final conv if KL layers are present
@@ -429,23 +421,17 @@ class CelebAHQTaxonDecoder(nn.Module):
     def forward(self, z):
         # z is spatial input from encoder (B, C, H, W)
         x = z
-        total_kl = 0.0
+        total_entropy = 0.0
+        total_batch_kl = 0.0
         has_kl_layers = False
         
         for i, deconv in enumerate(self.deconv_layers):
             
             if isinstance(deconv, (TaxonConv, TaxonDeconv)):
-                res = deconv(x)
-                if isinstance(res, tuple) and len(res) == 2:
-                    x, dkl = res
-                else:
-                    x = res
-                    dkl = getattr(deconv, '_last_dkl', None)
-                
-                # Accumulate KL divergence
-                if dkl is not None:
-                    total_kl = total_kl + dkl
-                    has_kl_layers = True
+                x, ent, bkl = deconv(x)
+                total_entropy = total_entropy + ent
+                total_batch_kl = total_batch_kl + bkl
+                has_kl_layers = True
                 # KL layers output log-probabilities as learned features; skip ReLU
             else:
                 x = deconv(x)
@@ -456,7 +442,6 @@ class CelebAHQTaxonDecoder(nn.Module):
             x = self.pre_final_norm(x)
         
         # Final conv to RGB (outputs exactly 3 channels)
-        # For KL layers: log-probs are treated as features, final conv learns RGB mapping
         x = self.final_conv(x)
         
         # Apply activation based on config
@@ -465,8 +450,7 @@ class CelebAHQTaxonDecoder(nn.Module):
         elif self.output_activation == 'tanh':
             x = torch.tanh(x)
         
-        # Return reconstruction and KL divergence (if any KL layers present)
         if has_kl_layers:
-            return x, total_kl
+            return x, total_entropy, total_batch_kl
         else:
             return x

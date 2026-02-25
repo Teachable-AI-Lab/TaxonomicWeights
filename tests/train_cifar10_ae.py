@@ -32,12 +32,14 @@ def train_autoencoder(
     lr=0.001,
     device='cuda',
     save_dir='outputs/cifar10/training',
-    kl_weight=1.0
+    entropy_weight=0.0,
+    batch_kl_weight=0.0
 ):
     """Train the autoencoder and save checkpoints.
     
     Args:
-        kl_weight: Weight for KL divergence loss (default 1.0). Set to 0 to ignore KL.
+        entropy_weight: Weight for per-instance entropy term.
+        batch_kl_weight: Weight for batch-marginal KL-to-uniform term.
     """
     
     os.makedirs(save_dir, exist_ok=True)
@@ -58,24 +60,25 @@ def train_autoencoder(
         model.train()
         train_loss = 0.0
         train_recon_loss = 0.0
-        train_kl_loss = 0.0
+        train_entropy_loss = 0.0
+        train_batch_kl_loss = 0.0
         nan_count = 0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
             
             optimizer.zero_grad()
             
-            # Handle both (reconstruction, kl) and just reconstruction returns
             result = model(images)
-            if isinstance(result, tuple):
-                reconstructed, kl = result
+            if isinstance(result, tuple) and len(result) == 3:
+                reconstructed, entropy_reg, batch_kl_reg = result
                 recon_loss = criterion(reconstructed, images)
-                kl_loss = kl if kl_weight > 0 else 0.0
-                loss = recon_loss + kl_weight * kl_loss
-                train_kl_loss += (kl.item() if hasattr(kl, 'item') else kl)
+                loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                train_entropy_loss += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg)
+                train_batch_kl_loss += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg)
             else:
-                reconstructed = result
-                loss = criterion(reconstructed, images)
+                reconstructed = result if not isinstance(result, tuple) else result[0]
+                recon_loss = criterion(reconstructed, images)
+                loss = recon_loss
             
             # NaN-safe: skip optimizer step if loss is NaN/Inf
             if not torch.isfinite(loss):
@@ -88,48 +91,49 @@ def train_autoencoder(
             optimizer.step()
             
             train_loss += loss.item()
-            train_recon_loss += criterion(reconstructed, images).item()
+            train_recon_loss += recon_loss.item()
         
         train_loss /= len(train_loader)
         train_recon_loss /= len(train_loader)
-        train_kl_loss /= len(train_loader)
+        train_entropy_loss /= len(train_loader)
+        train_batch_kl_loss /= len(train_loader)
         train_losses.append(train_loss)
         
         # Testing
         model.eval()
         test_loss = 0.0
         test_recon_loss = 0.0
-        test_kl_loss = 0.0
+        test_entropy_loss = 0.0
+        test_batch_kl_loss = 0.0
         with torch.no_grad():
             for images, _ in test_loader:
                 images = images.to(device)
                 
-                # Handle both (reconstruction, kl) and just reconstruction returns
                 result = model(images)
-                if isinstance(result, tuple):
-                    reconstructed, kl = result
+                if isinstance(result, tuple) and len(result) == 3:
+                    reconstructed, entropy_reg, batch_kl_reg = result
                     recon_loss = criterion(reconstructed, images)
-                    kl_loss = kl if kl_weight > 0 else 0.0
-                    loss = recon_loss + kl_weight * kl_loss
-                    test_kl_loss += (kl.item() if hasattr(kl, 'item') else kl)
+                    loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                    test_entropy_loss += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg)
+                    test_batch_kl_loss += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg)
                 else:
-                    reconstructed = result
-                    loss = criterion(reconstructed, images)
+                    reconstructed = result if not isinstance(result, tuple) else result[0]
+                    recon_loss = criterion(reconstructed, images)
+                    loss = recon_loss
                 
                 test_loss += loss.item()
-                test_recon_loss += criterion(reconstructed, images).item()
+                test_recon_loss += recon_loss.item()
         
         test_loss /= len(test_loader)
         test_recon_loss /= len(test_loader)
-        test_kl_loss /= len(test_loader)
+        test_entropy_loss /= len(test_loader)
+        test_batch_kl_loss /= len(test_loader)
         test_losses.append(test_loss)
         
-        # Print losses with KL if present
-        if train_kl_loss > 0 or test_kl_loss > 0:
-            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f} (Recon: {train_recon_loss:.6f}, KL: {train_kl_loss:.6f}), "
-                  f"Test Loss: {test_loss:.6f} (Recon: {test_recon_loss:.6f}, KL: {test_kl_loss:.6f})")
-        else:
-            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
+        # Print all three loss terms
+        print(f"Epoch {epoch+1}/{epochs} - "
+              f"Train Loss: {train_loss:.6f} (recon: {train_recon_loss:.6f}, entropy: {train_entropy_loss:.6f}, batch_kl: {train_batch_kl_loss:.6f}), "
+              f"Test Loss: {test_loss:.6f} (recon: {test_recon_loss:.6f}, entropy: {test_entropy_loss:.6f}, batch_kl: {test_batch_kl_loss:.6f})")
         if nan_count > 0:
             print(f"  WARNING: {nan_count} batches had NaN/Inf loss and were skipped")
         
@@ -344,10 +348,6 @@ def main():
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
         use_maxpool = config['model']['use_maxpool']
-        random_init_alphas = config['model'].get('random_init_alphas', False)
-        alpha_init_distribution = config['model'].get('alpha_init_distribution', 'uniform')
-        alpha_init_range = config['model'].get('alpha_init_range', None)
-        alpha_init_seed = config['model'].get('alpha_init_seed', None)
         
         # Parse layer configurations (supports both formats)
         layer_params = parse_layer_config(config)
@@ -363,13 +363,12 @@ def main():
         decoder_layer_types = layer_params['decoder_layer_types']
         decoder_paddings = layer_params['decoder_paddings']
         decoder_output_paddings = layer_params['decoder_output_paddings']
-        encoder_n_hierarchies = layer_params.get('encoder_n_hierarchies', None)
-        decoder_n_hierarchies = layer_params.get('decoder_n_hierarchies', None)
         
         # Training-specific parameters (optional)
         epochs = config.get('training', {}).get('epochs', 20)
         lr = config.get('training', {}).get('learning_rate', 0.001)
-        kl_weight = config.get('training', {}).get('kl_weight', 1.0)
+        entropy_weight = config.get('training', {}).get('entropy_weight', 0.0)
+        batch_kl_weight = config.get('training', {}).get('batch_kl_weight', 0.0)
         
         # Use experiment_name from config, or fall back to training_save_dir
         experiment_name = config.get('experiment_name', None)
@@ -382,7 +381,8 @@ def main():
         batch_size = 128
         epochs = 20
         lr = 0.001
-        kl_weight = 1.0
+        entropy_weight = 0.0
+        batch_kl_weight = 0.0
         data_root = './data/cifar10'
         latent_dim = 256
         temperature = 1.0
@@ -392,15 +392,13 @@ def main():
         decoder_strides = [2, 2, 1]
         encoder_n_layers = None
         decoder_n_layers = None
+        encoder_n_filters = None
+        decoder_n_filters = None
+        encoder_layer_types = None
+        decoder_layer_types = None
         decoder_paddings = None
         decoder_output_paddings = None
-        encoder_n_hierarchies = None
-        decoder_n_hierarchies = None
         use_maxpool = True
-        random_init_alphas = False
-        alpha_init_distribution = 'uniform'
-        alpha_init_range = None
-        alpha_init_seed = None
         save_dir_prefix = 'outputs/cifar10/training'
     
     # Command line args override config
@@ -441,7 +439,8 @@ def main():
     print(f"Encoder strides: {encoder_strides}")
     print(f"Decoder strides: {decoder_strides if decoder_strides else '[2, 2, 1] (default)'}")
     print(f"Use max pooling: {use_maxpool}")
-    print(f"Random alpha init: {random_init_alphas} (dist={alpha_init_distribution}, range={alpha_init_range}, seed={alpha_init_seed})")
+    print(f"Entropy weight: {entropy_weight}")
+    print(f"Batch KL weight: {batch_kl_weight}")
     print(f"Data directory: {data_root}")
     print(f"Save directory: {save_dir}")
     print("=" * 60)
@@ -471,12 +470,6 @@ def main():
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool,
-        encoder_n_hierarchies=encoder_n_hierarchies,
-        decoder_n_hierarchies=decoder_n_hierarchies,
-        random_init_alphas=random_init_alphas,
-        alpha_init_distribution=alpha_init_distribution,
-        alpha_init_range=alpha_init_range,
-        alpha_init_seed=alpha_init_seed
     )
     
     # Train
@@ -489,7 +482,8 @@ def main():
         lr=lr,
         device=device,
         save_dir=save_dir,
-        kl_weight=kl_weight
+        entropy_weight=entropy_weight,
+        batch_kl_weight=batch_kl_weight
     )
     
     # Visualize reconstructions

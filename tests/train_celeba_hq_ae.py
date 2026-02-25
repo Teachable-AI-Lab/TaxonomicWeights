@@ -110,13 +110,15 @@ def train(
     lr,
     device,
     save_dir,
-    kl_weight=1.0,
+    entropy_weight=0.0,
+    batch_kl_weight=0.0,
     resume_from=None
 ):
     """Train the autoencoder.
     
     Args:
-        kl_weight: Weight for KL divergence loss (default 1.0). Set to 0 to ignore KL.
+        entropy_weight: Weight for per-instance entropy term.
+        batch_kl_weight: Weight for batch-marginal KL-to-uniform term.
         resume_from: Path to checkpoint to resume training from (optional).
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -151,7 +153,8 @@ def train(
         model.train()
         running_loss = 0.0
         running_recon_loss = 0.0
-        running_kl_loss = 0.0
+        running_entropy_loss = 0.0
+        running_batch_kl_loss = 0.0
         nan_count = 0
         for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             images = images.to(device)
@@ -159,42 +162,39 @@ def train(
             if scaler is not None:
                 with autocast():
                     result = model(images)
-                    # Handle both (reconstruction, kl) and just reconstruction returns
-                    if isinstance(result, tuple):
-                        recons, kl = result
+                    if isinstance(result, tuple) and len(result) == 3:
+                        recons, entropy_reg, batch_kl_reg = result
                         recon_loss = criterion(recons, images)
-                        kl_loss = kl if kl_weight > 0 else 0.0
-                        loss = recon_loss + kl_weight * kl_loss
-                        running_kl_loss += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                        loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                        running_entropy_loss += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
+                        running_batch_kl_loss += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
                     else:
-                        recons = result
-                        loss = criterion(recons, images)
-                    running_recon_loss += criterion(recons, images).item() * images.size(0)
-                # NaN-safe: skip optimizer step if loss is NaN/Inf
+                        recons = result if not isinstance(result, tuple) else result[0]
+                        recon_loss = criterion(recons, images)
+                        loss = recon_loss
+                    running_recon_loss += recon_loss.item() * images.size(0)
                 if not torch.isfinite(loss):
                     optimizer.zero_grad()
                     nan_count += 1
                     continue
                 scaler.scale(loss).backward()
-                # Unscale before clipping so clip sees true gradient magnitudes
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 result = model(images)
-                # Handle both (reconstruction, kl) and just reconstruction returns
-                if isinstance(result, tuple):
-                    recons, kl = result
+                if isinstance(result, tuple) and len(result) == 3:
+                    recons, entropy_reg, batch_kl_reg = result
                     recon_loss = criterion(recons, images)
-                    kl_loss = kl if kl_weight > 0 else 0.0
-                    loss = recon_loss + kl_weight * kl_loss
-                    running_kl_loss += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                    loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                    running_entropy_loss += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
+                    running_batch_kl_loss += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
                 else:
-                    recons = result
-                    loss = criterion(recons, images)
-                running_recon_loss += criterion(recons, images).item() * images.size(0)
-                # NaN-safe: skip optimizer step if loss is NaN/Inf
+                    recons = result if not isinstance(result, tuple) else result[0]
+                    recon_loss = criterion(recons, images)
+                    loss = recon_loss
+                running_recon_loss += recon_loss.item() * images.size(0)
                 if not torch.isfinite(loss):
                     optimizer.zero_grad()
                     nan_count += 1
@@ -205,61 +205,67 @@ def train(
             running_loss += loss.item() * images.size(0)
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
-        epoch_train_recon_loss = running_recon_loss / len(train_loader.dataset)
-        epoch_train_kl_loss = running_kl_loss / len(train_loader.dataset)
+        epoch_train_recon = running_recon_loss / len(train_loader.dataset)
+        epoch_train_entropy = running_entropy_loss / len(train_loader.dataset)
+        epoch_train_bkl = running_batch_kl_loss / len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
 
         if val_loader is not None:
             model.eval()
             val_running = 0.0
             val_running_recon = 0.0
-            val_running_kl = 0.0
+            val_running_entropy = 0.0
+            val_running_bkl = 0.0
             with torch.no_grad():
                 for images, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                     images = images.to(device)
                     if scaler is not None:
                         with autocast():
                             result = model(images)
-                            if isinstance(result, tuple):
-                                recons, kl = result
+                            if isinstance(result, tuple) and len(result) == 3:
+                                recons, entropy_reg, batch_kl_reg = result
                                 recon_loss = criterion(recons, images)
-                                kl_loss = kl if kl_weight > 0 else 0.0
-                                loss = recon_loss + kl_weight * kl_loss
-                                val_running_kl += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                                loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                                val_running_entropy += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
+                                val_running_bkl += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
                             else:
-                                recons = result
+                                recons = result if not isinstance(result, tuple) else result[0]
                                 loss = criterion(recons, images)
                             val_running_recon += criterion(recons, images).item() * images.size(0)
                     else:
                         result = model(images)
-                        if isinstance(result, tuple):
-                            recons, kl = result
+                        if isinstance(result, tuple) and len(result) == 3:
+                            recons, entropy_reg, batch_kl_reg = result
                             recon_loss = criterion(recons, images)
-                            kl_loss = kl if kl_weight > 0 else 0.0
-                            loss = recon_loss + kl_weight * kl_loss
-                            val_running_kl += (kl.item() if hasattr(kl, 'item') else kl) * images.size(0)
+                            loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
+                            val_running_entropy += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
+                            val_running_bkl += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
                         else:
-                            recons = result
+                            recons = result if not isinstance(result, tuple) else result[0]
                             loss = criterion(recons, images)
                         val_running_recon += criterion(recons, images).item() * images.size(0)
                     val_running += loss.item() * images.size(0)
 
             epoch_val_loss = val_running / len(val_loader.dataset)
-            epoch_val_recon_loss = val_running_recon / len(val_loader.dataset)
-            epoch_val_kl_loss = val_running_kl / len(val_loader.dataset)
+            epoch_val_recon = val_running_recon / len(val_loader.dataset)
+            epoch_val_entropy = val_running_entropy / len(val_loader.dataset)
+            epoch_val_bkl = val_running_bkl / len(val_loader.dataset)
         else:
             epoch_val_loss = None
-            epoch_val_recon_loss = None
-            epoch_val_kl_loss = None
+            epoch_val_recon = None
+            epoch_val_entropy = None
+            epoch_val_bkl = None
         val_losses.append(epoch_val_loss)
 
-        # Print losses with KL if present
-        if epoch_train_kl_loss > 0 or (epoch_val_kl_loss and epoch_val_kl_loss > 0):
-            print(f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f} (recon: {epoch_train_recon_loss:.6f}, KL: {epoch_train_kl_loss:.6f})" +
-                  (f", val loss: {epoch_val_loss:.6f} (recon: {epoch_val_recon_loss:.6f}, KL: {epoch_val_kl_loss:.6f})" if epoch_val_loss is not None else ""))
-        else:
-            print(f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f}" +
-                  (f", val loss: {epoch_val_loss:.6f}" if epoch_val_loss is not None else ""))
+        # Print all three loss terms
+        train_str = (f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f} "
+                     f"(recon: {epoch_train_recon:.6f}, entropy: {epoch_train_entropy:.6f}, "
+                     f"batch_kl: {epoch_train_bkl:.6f})")
+        if epoch_val_loss is not None:
+            train_str += (f", val loss: {epoch_val_loss:.6f} "
+                          f"(recon: {epoch_val_recon:.6f}, entropy: {epoch_val_entropy:.6f}, "
+                          f"batch_kl: {epoch_val_bkl:.6f})")
+        print(train_str)
         if nan_count > 0:
             print(f"  WARNING: {nan_count} batches had NaN/Inf loss and were skipped")
 
@@ -330,7 +336,8 @@ def main():
         val_subset = config['data'].get('val_subset', None)
         epochs = config['training'].get('epochs', 20)
         lr = config['training'].get('learning_rate', 1e-4)
-        kl_weight = config['training'].get('kl_weight', 1.0)
+        entropy_weight = config['training'].get('entropy_weight', 0.0)
+        batch_kl_weight = config['training'].get('batch_kl_weight', 0.0)
         experiment_name = config.get('experiment_name', None)
         save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/celebahq/training')
         
@@ -347,7 +354,8 @@ def main():
         val_subset = None
         epochs = 20
         lr = 1e-4
-        kl_weight = 1.0
+        entropy_weight = 0.0
+        batch_kl_weight = 0.0
         experiment_name = None
         save_dir_prefix = 'outputs/celebahq/training'
         use_taxonomic = False
@@ -435,7 +443,7 @@ def main():
         decoder_paddings=dec_paddings,
         decoder_output_paddings=dec_output_paddings,
         use_maxpool=use_maxpool,
-        output_activation=output_activation
+        output_activation=output_activation,
     )
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
 
@@ -463,7 +471,8 @@ def main():
         lr=lr,
         device=device,
         save_dir=save_dir,
-        kl_weight=kl_weight,
+        entropy_weight=entropy_weight,
+        batch_kl_weight=batch_kl_weight,
         resume_from=resume_from
     )
 

@@ -140,34 +140,26 @@ class CIFAR10TaxonEncoder(nn.Module):
         self.final_size = final_size
 
     def forward(self, x):
-        total_kl = 0.0
+        total_entropy = 0.0
+        total_batch_kl = 0.0
         has_kl_layers = False
         
         for i, conv in enumerate(self.conv_layers):
-            # KL / resnet-KL layers return (tensor, dkl). Accept both.
             if isinstance(conv, TaxonConv):
-                res = conv(x)
-                if isinstance(res, tuple) and len(res) == 2:
-                    x, dkl = res
-                else:
-                    x = res
-                    dkl = getattr(conv, '_last_dkl', None)
-                
-                if dkl is not None:
-                    total_kl = total_kl + dkl
-                    has_kl_layers = True
+                x, ent, bkl = conv(x)
+                total_entropy = total_entropy + ent
+                total_batch_kl = total_batch_kl + bkl
+                has_kl_layers = True
                 # Log-probability outputs — skip ReLU
             else:
                 x = conv(x)
                 x = F.leaky_relu(x, negative_slope=0.01)
             # Apply pooling when use_maxpool=True.
-            # TaxonConv handles its own stride when use_maxpool=False,
-            # but when use_maxpool=True it uses stride=1 so external pool is needed.
             if self.use_maxpool and self.strides[i] > 1:
                 x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
         if has_kl_layers:
-            return x, total_kl
+            return x, total_entropy, total_batch_kl
         else:
             return x
 
@@ -284,33 +276,25 @@ class CelebAHQTaxonEncoder(nn.Module):
         self.final_size = final_size
         
     def forward(self, x):
-        total_kl = 0.0
+        total_entropy = 0.0
+        total_batch_kl = 0.0
         has_kl_layers = False
         
         for i, conv in enumerate(self.conv_layers):
-            # KL / resnet-KL layers return (tensor, dkl). Accept both.
             if isinstance(conv, TaxonConv):
-                res = conv(x)
-                if isinstance(res, tuple) and len(res) == 2:
-                    x, dkl = res
-                else:
-                    x = res
-                    dkl = getattr(conv, '_last_dkl', None)
-                
-                if dkl is not None:
-                    total_kl = total_kl + dkl
-                    has_kl_layers = True
+                x, ent, bkl = conv(x)
+                total_entropy = total_entropy + ent
+                total_batch_kl = total_batch_kl + bkl
+                has_kl_layers = True
                 # Log-probability outputs — skip ReLU
             else:
                 x = conv(x)
                 x = F.leaky_relu(x, negative_slope=0.01)
-            # Only apply pooling when use_maxpool=True; when False, the strided
-            # TaxonConv/Conv2d already handled downsampling in the conv itself.
+            # Only apply pooling when use_maxpool=True.
             if self.use_maxpool and self.strides[i] > 1:
                 x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
         
-        # Return spatial features and KL divergence (if any KL layers present)
         if has_kl_layers:
-            return x, total_kl
+            return x, total_entropy, total_batch_kl
         else:
             return x

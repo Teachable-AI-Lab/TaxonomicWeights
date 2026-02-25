@@ -67,7 +67,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             n_layers=encoder_n_layers,
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
-            use_maxpool=use_maxpool
+            use_maxpool=use_maxpool,
         )
 
         # Get encoder's final channels for decoder input
@@ -85,48 +85,46 @@ class CIFAR10TaxonAutoencoder(nn.Module):
             layer_types=decoder_layer_types,
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
-            use_maxpool=use_maxpool
+            use_maxpool=use_maxpool,
         )
         
     def encode(self, x):
         result = self.encoder(x)
-        # Handle both (features, kl) and just features returns
         if isinstance(result, tuple):
-            return result  # (features, kl)
+            return result  # (features, entropy, batch_kl)
         else:
             return result  # just features
     
     def decode(self, z):
         result = self.decoder(z)
-        # Handle both (reconstruction, kl) and just reconstruction returns
         if isinstance(result, tuple):
-            return result  # (reconstruction, kl)
+            return result  # (reconstruction, entropy, batch_kl)
         else:
             return result  # just reconstruction
     
     def forward(self, x):
         # Encode
         enc_result = self.encode(x)
-        if isinstance(enc_result, tuple):
-            z, enc_kl = enc_result
+        if isinstance(enc_result, tuple) and len(enc_result) == 3:
+            z, enc_ent, enc_bkl = enc_result
         else:
             z = enc_result
-            enc_kl = 0.0
+            enc_ent, enc_bkl = 0.0, 0.0
         
         # Decode
         dec_result = self.decode(z)
-        if isinstance(dec_result, tuple):
-            x_recon, dec_kl = dec_result
+        if isinstance(dec_result, tuple) and len(dec_result) == 3:
+            x_recon, dec_ent, dec_bkl = dec_result
         else:
             x_recon = dec_result
-            dec_kl = 0.0
+            dec_ent, dec_bkl = 0.0, 0.0
         
-        # Return reconstruction and total KL (if any)
-        total_kl = enc_kl + dec_kl
-        if isinstance(total_kl, float) and total_kl == 0.0:
+        total_entropy = enc_ent + dec_ent
+        total_batch_kl = enc_bkl + dec_bkl
+        if isinstance(total_entropy, float) and total_entropy == 0.0:
             return x_recon
         else:
-            return x_recon, total_kl
+            return x_recon, total_entropy, total_batch_kl
     
     def get_hierarchical_features(self, x):
         """
@@ -140,7 +138,7 @@ class CIFAR10TaxonAutoencoder(nn.Module):
         h = x
         for i, conv in enumerate(self.encoder.conv_layers):
             result = conv(h)
-            # Handle KL layers that return (output, kl)
+            # Handle taxonomic layers that return (output, entropy, batch_kl)
             if isinstance(result, tuple):
                 h = result[0]
             else:
@@ -234,7 +232,7 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             n_layers=encoder_n_layers,
             n_filters=encoder_n_filters,
             layer_types=encoder_layer_types,
-            use_maxpool=use_maxpool
+            use_maxpool=use_maxpool,
         )
 
         # Get encoder's final channels for decoder input
@@ -253,46 +251,44 @@ class CelebAHQTaxonAutoencoder(nn.Module):
             initial_spatial_size=initial_size,
             encoder_final_channels=encoder_final_channels,
             use_maxpool=use_maxpool,
-            output_activation=output_activation
+            output_activation=output_activation,
         )
         
     def encode(self, x):
         result = self.encoder(x)
-        # Handle both (features, kl) and just features returns
         if isinstance(result, tuple):
-            return result  # (features, kl)
+            return result  # (features, entropy, batch_kl)
         else:
             return result  # just features
     
     def decode(self, z):
         result = self.decoder(z)
-        # Handle both (reconstruction, kl) and just reconstruction returns
         if isinstance(result, tuple):
-            return result  # (reconstruction, kl)
+            return result  # (reconstruction, entropy, batch_kl)
         else:
             return result  # just reconstruction
     
     def forward(self, x):
         # Encode
         enc_result = self.encode(x)
-        if isinstance(enc_result, tuple):
-            z, enc_kl = enc_result
+        if isinstance(enc_result, tuple) and len(enc_result) == 3:
+            z, enc_ent, enc_bkl = enc_result
         else:
             z = enc_result
-            enc_kl = 0.0
+            enc_ent, enc_bkl = 0.0, 0.0
         
         # Decode
         dec_result = self.decode(z)
-        if isinstance(dec_result, tuple):
-            x_recon, dec_kl = dec_result
+        if isinstance(dec_result, tuple) and len(dec_result) == 3:
+            x_recon, dec_ent, dec_bkl = dec_result
         else:
             x_recon = dec_result
-            dec_kl = 0.0
+            dec_ent, dec_bkl = 0.0, 0.0
         
-        # Return reconstruction and total KL (if any)
-        total_kl = enc_kl + dec_kl
-        if isinstance(total_kl, float) and total_kl == 0.0:
+        total_entropy = enc_ent + dec_ent
+        total_batch_kl = enc_bkl + dec_bkl
+        if isinstance(total_entropy, float) and total_entropy == 0.0:
             return x_recon
         else:
-            return x_recon, total_kl
+            return x_recon, total_entropy, total_batch_kl
 

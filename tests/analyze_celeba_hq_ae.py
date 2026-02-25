@@ -26,11 +26,7 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CelebAHQTaxonAutoencoder
-from src.model.taxon_layers import (TaxonConv, TaxonDeconv,
-                                     TaxonConvKL, TaxonDeconvKL,
-                                     MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                                     TaxonResnetConv, TaxonResnetDeconv,
-                                     MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)
+from src.model.taxon_layers import TaxonConv, TaxonDeconv
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -38,44 +34,30 @@ from src.utils.dataloader import CelebAHQLoader
 # Multi-hierarchy utilities
 # ---------------------------------------------------------------------------
 
-def _is_multi_hierarchy(layer):
-    """Return True if layer is a multi-hierarchy wrapper."""
-    return isinstance(layer, (MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
-
-
 def _is_any_taxon_layer(layer):
-    """Return True for any taxonomic layer type (single or multi)."""
-    return isinstance(layer, (TaxonConv, TaxonDeconv,
-                               TaxonConvKL, TaxonDeconvKL,
-                               MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                               TaxonResnetConv, TaxonResnetDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
+    """Return True for any taxonomic layer type."""
+    return isinstance(layer, (TaxonConv, TaxonDeconv))
 
 
-def _is_kl_or_resnet_layer(layer):
-    """Return True for KL or Resnet taxonomic layers that skip ReLU."""
-    return isinstance(layer, (TaxonConvKL, TaxonDeconvKL,
-                               TaxonResnetConv, TaxonResnetDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
+def _is_resnet_layer(layer):
+    """Return True for ResNet-style taxonomic layers that skip ReLU.
+
+    Current TaxonConv/TaxonDeconv are all ResNet-style, so this always
+    returns True for taxonomic layers.
+    """
+    return isinstance(layer, (TaxonConv, TaxonDeconv))
 
 
 def _get_sub_layers(layer):
     """Return list of (sub_layer, hierarchy_index) pairs.
 
-    For single-hierarchy layers returns ``[(layer, 0)]``.
-    For multi-hierarchy wrappers returns
-    ``[(layer.hierarchies[h], h) for h in range(n_hierarchies)]``.
+    Always returns ``[(layer, 0)]`` (single hierarchy).
     """
-    if _is_multi_hierarchy(layer):
-        return [(sub, h) for h, sub in enumerate(layer.hierarchies)]
     return [(layer, 0)]
 
 
 def _channels_per_single_hierarchy(layer):
     """Return the number of output channels produced by one hierarchy tree."""
-    if _is_multi_hierarchy(layer):
-        return layer.hierarchies[0].num_output_channels()
     return layer.num_output_channels()
 
 
@@ -114,7 +96,7 @@ def parse_layer_config(config_layers):
     strides_list = []
     paddings_list = []
     output_paddings_list = []
-    n_hierarchies_list = []
+
 
     for layer in config_layers:
         layer_type = layer.get('layer_type', 'taxonomic_conv')
@@ -134,17 +116,14 @@ def parse_layer_config(config_layers):
         strides_list.append(layer.get('stride', 1))
         paddings_list.append(layer.get('padding', None))
         output_paddings_list.append(layer.get('output_padding', 0))
-        n_hierarchies_list.append(layer.get('n_hierarchies', 1))
 
     # Clean up None lists
     n_layers_out = n_layers_list if any(x is not None for x in n_layers_list) else None
     n_filters_out = n_filters_list if any(x is not None for x in n_filters_list) else None
     paddings_out = paddings_list if any(x is not None for x in paddings_list) else None
-    n_hierarchies_out = n_hierarchies_list if any(x != 1 for x in n_hierarchies_list) else None
 
     return (n_layers_out, n_filters_out, layer_types_list,
-            kernel_sizes_list, strides_list, paddings_out, output_paddings_list,
-            n_hierarchies_out)
+            kernel_sizes_list, strides_list, paddings_out, output_paddings_list)
 
 
 def load_config(config_path):
@@ -199,18 +178,14 @@ def load_model(checkpoint_path, device, config=None):
     decoder_layers = model_config.get('decoder_layers', [])
     
     (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes,
-        enc_strides, enc_paddings, enc_output_paddings, enc_n_hierarchies) = parse_layer_config(encoder_layers)
+        enc_strides, enc_paddings, enc_output_paddings) = parse_layer_config(encoder_layers)
 
     (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes,
-        dec_strides, dec_paddings, dec_output_paddings, dec_n_hierarchies) = parse_layer_config(decoder_layers)
+        dec_strides, dec_paddings, dec_output_paddings) = parse_layer_config(decoder_layers)
     
     # Get taxonomic-specific settings
     temperature = model_config.get('temperature', 1.0)
     use_maxpool = model_config.get('use_maxpool', True)
-    random_init_alphas = model_config.get('random_init_alphas', False)
-    alpha_init_distribution = model_config.get('alpha_init_distribution', 'uniform')
-    alpha_init_range = model_config.get('alpha_init_range', None)
-    alpha_init_seed = model_config.get('alpha_init_seed', None)
     output_activation = model_config.get('output_activation', 'sigmoid')
     
     model = CelebAHQTaxonAutoencoder(
@@ -229,12 +204,6 @@ def load_model(checkpoint_path, device, config=None):
         decoder_paddings=dec_paddings,
         decoder_output_paddings=dec_output_paddings,
         use_maxpool=use_maxpool,
-        encoder_n_hierarchies=enc_n_hierarchies,
-        decoder_n_hierarchies=dec_n_hierarchies,
-        random_init_alphas=random_init_alphas,
-        alpha_init_distribution=alpha_init_distribution,
-        alpha_init_range=alpha_init_range,
-        alpha_init_seed=alpha_init_seed,
         output_activation=output_activation
     )
     
@@ -251,7 +220,7 @@ def load_model(checkpoint_path, device, config=None):
 def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonConv layer, covering all hierarchies."""
 
-    # Get the layer (may be TaxonConv or MultiHierarchyTaxonConv)
+    # Get the layer (TaxonConv)
     if layer_name.startswith('encoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
         layer = model.encoder.conv_layers[layer_idx]
@@ -334,7 +303,7 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n
 def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonDeconv layer, covering all hierarchies."""
 
-    # Get the layer (may be TaxonDeconv or MultiHierarchyTaxonDeconv)
+    # Get the layer (TaxonDeconv)
     if layer_name.startswith('decoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
         layer = model.decoder.deconv_layers[layer_idx]
@@ -438,7 +407,7 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         print(f"  No alpha parameters present for {layer_name}; skipping alpha visualization.")
     
     # Get hierarchy weights (filters at each level) or use activations
-    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
+    is_deconv = isinstance(layer, TaxonDeconv)
     if activations is not None:
         # Use activations instead of filters
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
@@ -739,7 +708,7 @@ def visualize_taxonomy_subtree(layer, layer_name, save_dir, start_level, start_n
             alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
             alpha_values.append(alpha_sig)
 
-    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
+    is_deconv = isinstance(layer, TaxonDeconv)
     if activations is not None:
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
         image_type = "activations"
@@ -1378,8 +1347,8 @@ def analyze_weight_sparsity(model, save_dir):
         for sub_layer, h_idx in _get_sub_layers(layer):
             key = f"{layer_key}_h{h_idx:02d}"
             is_classic_deconv = isinstance(sub_layer, TaxonDeconv)
-            is_resnet = isinstance(sub_layer, (TaxonResnetConv, TaxonResnetDeconv))
-            is_resnet_deconv = isinstance(sub_layer, TaxonResnetDeconv)
+            is_resnet = isinstance(sub_layer, (TaxonConv, TaxonDeconv))
+            is_resnet_deconv = isinstance(sub_layer, TaxonDeconv)
             weights = sub_layer.get_hierarchy_weights()   # list, root → leaves
             n_levels = len(weights)
 
@@ -1822,7 +1791,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                                          f'Encoder Layer {i+1}', max_maps=16)
                 
                 # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_kl_or_resnet_layer(conv_layer):
+                if not _is_resnet_layer(conv_layer):
                     x = F.leaky_relu(x, negative_slope=0.01)
                 # Only pool when use_maxpool=True; strided layers handle their
                 # own downsampling when use_maxpool=False.
@@ -1890,7 +1859,7 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                                          f'Decoder Layer {i+1}', max_maps=16)
                 
                 # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_kl_or_resnet_layer(deconv_layer):
+                if not _is_resnet_layer(deconv_layer):
                     x = F.leaky_relu(x, negative_slope=0.01)
             
             # Apply batch norm before final conv if present (matches decoder forward)

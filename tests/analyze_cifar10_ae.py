@@ -25,11 +25,7 @@ import networkx as nx
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CIFAR10TaxonAutoencoder
-from src.model.taxon_layers import (TaxonConv, TaxonDeconv,
-                                     TaxonConvKL, TaxonDeconvKL,
-                                     MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                                     TaxonResnetConv, TaxonResnetDeconv,
-                                     MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv)
+from src.model.taxon_layers import TaxonConv, TaxonDeconv
 from src.utils.dataloader import CIFAR10Loader
 
 
@@ -37,44 +33,30 @@ from src.utils.dataloader import CIFAR10Loader
 # Multi-hierarchy utilities
 # ---------------------------------------------------------------------------
 
-def _is_multi_hierarchy(layer):
-    """Return True if layer is a multi-hierarchy wrapper."""
-    return isinstance(layer, (MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
-
-
 def _is_any_taxon_layer(layer):
-    """Return True for any taxonomic layer type (single or multi)."""
-    return isinstance(layer, (TaxonConv, TaxonDeconv,
-                               TaxonConvKL, TaxonDeconvKL,
-                               MultiHierarchyTaxonConv, MultiHierarchyTaxonDeconv,
-                               TaxonResnetConv, TaxonResnetDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
+    """Return True for any taxonomic layer type."""
+    return isinstance(layer, (TaxonConv, TaxonDeconv))
 
 
-def _is_kl_or_resnet_layer(layer):
-    """Return True for KL or Resnet taxonomic layers that skip ReLU."""
-    return isinstance(layer, (TaxonConvKL, TaxonDeconvKL,
-                               TaxonResnetConv, TaxonResnetDeconv,
-                               MultiHierarchyTaxonResnetConv, MultiHierarchyTaxonResnetDeconv))
+def _is_resnet_layer(layer):
+    """Return True for ResNet-style taxonomic layers that skip ReLU.
+
+    Current TaxonConv/TaxonDeconv are all ResNet-style, so this always
+    returns True for taxonomic layers.
+    """
+    return isinstance(layer, (TaxonConv, TaxonDeconv))
 
 
 def _get_sub_layers(layer):
     """Return list of (sub_layer, hierarchy_index) pairs.
 
-    For single-hierarchy layers returns ``[(layer, 0)]``.
-    For multi-hierarchy wrappers returns
-    ``[(layer.hierarchies[h], h) for h in range(n_hierarchies)]``.
+    Always returns ``[(layer, 0)]`` (single hierarchy).
     """
-    if _is_multi_hierarchy(layer):
-        return [(sub, h) for h, sub in enumerate(layer.hierarchies)]
     return [(layer, 0)]
 
 
 def _channels_per_single_hierarchy(layer):
     """Return the number of output channels produced by one hierarchy tree."""
-    if _is_multi_hierarchy(layer):
-        return layer.hierarchies[0].num_output_channels()
     return layer.num_output_channels()
 
 
@@ -88,10 +70,7 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
                encoder_n_filters=None, decoder_n_filters=None,
                encoder_layer_types=None, decoder_layer_types=None,
                decoder_paddings=None, decoder_output_paddings=None,
-               use_maxpool=True, encoder_n_hierarchies=None, decoder_n_hierarchies=None,
-               random_init_alphas=False,
-               alpha_init_distribution="uniform", alpha_init_range=None,
-               alpha_init_seed=None):
+               use_maxpool=True):
     """Load trained model from checkpoint."""
     model = CIFAR10TaxonAutoencoder(
         latent_dim=latent_dim,
@@ -109,12 +88,6 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool,
-        encoder_n_hierarchies=encoder_n_hierarchies,
-        decoder_n_hierarchies=decoder_n_hierarchies,
-        random_init_alphas=random_init_alphas,
-        alpha_init_distribution=alpha_init_distribution,
-        alpha_init_range=alpha_init_range,
-        alpha_init_seed=alpha_init_seed
     )
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -129,7 +102,7 @@ def load_model(checkpoint_path, latent_dim=256, temperature=1.0, device='cuda',
 def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonConv layer, covering all hierarchies."""
 
-    # Get the layer (may be TaxonConv or MultiHierarchyTaxonConv)
+    # Get the layer (TaxonConv)
     if layer_name.startswith('encoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
         layer = model.encoder.conv_layers[layer_idx]
@@ -212,7 +185,7 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n
 def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonDeconv layer, covering all hierarchies."""
 
-    # Get the layer (may be TaxonDeconv or MultiHierarchyTaxonDeconv)
+    # Get the layer (TaxonDeconv)
     if layer_name.startswith('decoder_layer_'):
         layer_idx = int(layer_name.split('_')[-1]) - 1
         layer = model.decoder.deconv_layers[layer_idx]
@@ -316,7 +289,7 @@ def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activation
         print(f"  No alpha parameters present for {layer_name}; skipping alpha visualization.")
     
     # Get hierarchy weights (filters at each level) or use activations
-    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
+    is_deconv = isinstance(layer, TaxonDeconv)
     if activations is not None:
         # Use activations instead of filters
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
@@ -617,7 +590,7 @@ def visualize_taxonomy_subtree(layer, layer_name, save_dir, start_level, start_n
             alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
             alpha_values.append(alpha_sig)
 
-    is_deconv = isinstance(layer, (TaxonDeconv, TaxonResnetDeconv))
+    is_deconv = isinstance(layer, TaxonDeconv)
     if activations is not None:
         acts = activations[0].detach().cpu().numpy()  # (C, H, W)
         image_type = "activations"
@@ -1260,8 +1233,8 @@ def analyze_weight_sparsity(model, save_dir):
         for sub_layer, h_idx in _get_sub_layers(layer):
             key = f"{layer_key}_h{h_idx:02d}"
             is_classic_deconv = isinstance(sub_layer, TaxonDeconv)
-            is_resnet = isinstance(sub_layer, (TaxonResnetConv, TaxonResnetDeconv))
-            is_resnet_deconv = isinstance(sub_layer, TaxonResnetDeconv)
+            is_resnet = isinstance(sub_layer, (TaxonConv, TaxonDeconv))
+            is_resnet_deconv = isinstance(sub_layer, TaxonDeconv)
             weights = sub_layer.get_hierarchy_weights()   # list, root → leaves
             n_levels = len(weights)
 
@@ -1655,8 +1628,8 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
                                          f'Encoder Layer {i+1}', max_maps=16)
                 
-                # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_kl_or_resnet_layer(conv_layer):
+                # Resnet layers output log-probabilities — skip ReLU
+                if not _is_resnet_layer(conv_layer):
                     x = F.leaky_relu(x, negative_slope=0.01)
                 # Only pool when use_maxpool=True; strided layers handle their
                 # own downsampling when use_maxpool=False.
@@ -1723,8 +1696,8 @@ def visualize_layer_activations(model, data_loader, device, save_dir, num_images
                     visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
                                          f'Decoder Layer {i+1}', max_maps=16)
                 
-                # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_kl_or_resnet_layer(deconv_layer):
+                # Resnet layers output log-probabilities — skip ReLU
+                if not _is_resnet_layer(deconv_layer):
                     x = F.leaky_relu(x, negative_slope=0.01)
             
             # Apply batch norm before final conv if present (matches decoder forward)
@@ -1896,11 +1869,6 @@ def parse_layer_config(config):
         decoder_n_layers = [layer.get('n_layers') for layer in decoder_layers] if 'n_layers' in decoder_layers[0] else None
         decoder_n_filters = [layer.get('n_filters') for layer in decoder_layers] if 'n_filters' in decoder_layers[0] else None
         decoder_layer_types = [layer.get('layer_type', 'taxonomic') for layer in decoder_layers]
-        
-        encoder_n_hierarchies = [layer.get('n_hierarchies', 1) for layer in encoder_layers]
-        encoder_n_hierarchies = encoder_n_hierarchies if any(x != 1 for x in encoder_n_hierarchies) else None
-        decoder_n_hierarchies = [layer.get('n_hierarchies', 1) for layer in decoder_layers]
-        decoder_n_hierarchies = decoder_n_hierarchies if any(x != 1 for x in decoder_n_hierarchies) else None
 
         # Auto-infer decoder paddings if not specified
         decoder_paddings = []
@@ -1927,7 +1895,6 @@ def parse_layer_config(config):
         encoder_n_layers = model_config.get('encoder_n_layers', None)
         encoder_n_filters = model_config.get('encoder_n_filters', None)
         encoder_layer_types = model_config.get('encoder_layer_types', None)
-        encoder_n_hierarchies = None
 
         decoder_kernel_sizes = model_config.get('decoder_kernel_sizes')
         decoder_strides = model_config.get('decoder_strides')
@@ -1936,7 +1903,6 @@ def parse_layer_config(config):
         decoder_layer_types = model_config.get('decoder_layer_types', None)
         decoder_paddings = model_config.get('decoder_paddings', None)
         decoder_output_paddings = model_config.get('decoder_output_paddings', None)
-        decoder_n_hierarchies = None
 
     return {
         'encoder_kernel_sizes': encoder_kernel_sizes,
@@ -1944,7 +1910,6 @@ def parse_layer_config(config):
         'encoder_n_layers': encoder_n_layers,
         'encoder_n_filters': encoder_n_filters,
         'encoder_layer_types': encoder_layer_types,
-        'encoder_n_hierarchies': encoder_n_hierarchies,
         'decoder_kernel_sizes': decoder_kernel_sizes,
         'decoder_strides': decoder_strides,
         'decoder_n_layers': decoder_n_layers,
@@ -1952,7 +1917,6 @@ def parse_layer_config(config):
         'decoder_layer_types': decoder_layer_types,
         'decoder_paddings': decoder_paddings,
         'decoder_output_paddings': decoder_output_paddings,
-        'decoder_n_hierarchies': decoder_n_hierarchies
     }
 
 
@@ -1995,10 +1959,6 @@ def main():
         latent_dim = config['model']['latent_dim']
         temperature = config['model']['temperature']
         use_maxpool = config['model']['use_maxpool']
-        random_init_alphas = config['model'].get('random_init_alphas', False)
-        alpha_init_distribution = config['model'].get('alpha_init_distribution', 'uniform')
-        alpha_init_range = config['model'].get('alpha_init_range', None)
-        alpha_init_seed = config['model'].get('alpha_init_seed', None)
         
         # Parse layer configurations (supports both formats)
         layer_params = parse_layer_config(config)
@@ -2014,8 +1974,6 @@ def main():
         decoder_layer_types = layer_params['decoder_layer_types']
         decoder_paddings = layer_params['decoder_paddings']
         decoder_output_paddings = layer_params['decoder_output_paddings']
-        encoder_n_hierarchies = layer_params.get('encoder_n_hierarchies', None)
-        decoder_n_hierarchies = layer_params.get('decoder_n_hierarchies', None)
         
         # Analysis-specific parameters (optional)
         checkpoint_path = config.get('analysis', {}).get('checkpoint_path', None)
@@ -2051,12 +2009,6 @@ def main():
         decoder_paddings = None
         decoder_output_paddings = None
         use_maxpool = True
-        encoder_n_hierarchies = None
-        decoder_n_hierarchies = None
-        random_init_alphas = False
-        alpha_init_distribution = 'uniform'
-        alpha_init_range = None
-        alpha_init_seed = None
         num_latent_batches = 50
         num_reconstruction_batches = 20
         num_multiple_recon_images = 8
@@ -2115,7 +2067,6 @@ def main():
     print(f"Encoder strides: {encoder_strides}")
     print(f"Decoder strides: {decoder_strides}")
     print(f"Use max pooling: {use_maxpool}")
-    print(f"Random alpha init: {random_init_alphas} (dist={alpha_init_distribution}, range={alpha_init_range}, seed={alpha_init_seed})")
     print("=" * 60)
     
     # Load model
@@ -2138,12 +2089,6 @@ def main():
         decoder_paddings=decoder_paddings,
         decoder_output_paddings=decoder_output_paddings,
         use_maxpool=use_maxpool,
-        encoder_n_hierarchies=encoder_n_hierarchies,
-        decoder_n_hierarchies=decoder_n_hierarchies,
-        random_init_alphas=random_init_alphas,
-        alpha_init_distribution=alpha_init_distribution,
-        alpha_init_range=alpha_init_range,
-        alpha_init_seed=alpha_init_seed
     )
     
     # Load data

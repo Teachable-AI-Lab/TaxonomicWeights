@@ -92,8 +92,9 @@
   "training": {
     "epochs": 30,
     "learning_rate": 0.0003,
-    "kl_weight": 0.005,
-    "_comment": "kl_weight=0.005: moderate KL regularisation for hierarchy; matches celebahq_asymmetric_kl."
+    "entropy_weight": 0,
+    "batch_kl_weight": 0.005,
+    "_comment": "entropy_weight/batch_kl_weight: separate coefficients for per-instance entropy and batch-marginal KL-to-uniform."
   },
   "analysis": {
     "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21/checkpoint_epoch_10.pt",
