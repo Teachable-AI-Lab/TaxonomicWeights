@@ -64,12 +64,13 @@ class ResidualConvBlock(nn.Module):
 
 
 class ResidualDeconvBlock(nn.Module):
-    """Pre-activated residual block with transposed convolution for upsampling.
+    """Pre-activated residual block with resize-convolution upsampling.
 
-    Mirrors :class:`ResidualConvBlock` exactly, but uses ``ConvTranspose2d``
-    for spatial upsampling instead of strided ``Conv2d`` for downsampling.
+    Mirrors :class:`ResidualConvBlock`, but replaces transposed convolution
+    with explicit nearest-neighbor upsampling followed by ``Conv2d`` to avoid
+    checkerboard artifacts from uneven overlap.
 
-    Architecture: BN -> ConvTranspose2d(stride) -> ReLU -> BN -> Conv2d(1) + skip.
+    Architecture: BN -> Upsample(stride) -> Conv2d -> ReLU -> BN -> Conv2d + skip.
 
     Parameters
     ----------
@@ -77,29 +78,39 @@ class ResidualDeconvBlock(nn.Module):
     out_channels : int
     kernel_size : int
     stride : int
-        Stride for the transposed convolution.
+        Spatial upsampling factor.
     padding : int
+        Kept for API compatibility. Main branch uses ``kernel_size // 2``.
     output_padding : int
+        Kept for API compatibility; unused in resize-convolution mode.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=2,
                  padding=1, output_padding=0):
         super().__init__()
+        del padding, output_padding
+        self.upsample = (
+            nn.Upsample(scale_factor=stride, mode='nearest')
+            if stride != 1 else nn.Identity()
+        )
         self.block = nn.Sequential(
             nn.BatchNorm2d(in_channels),
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride,
-                               padding, output_padding, bias=False),
+            self.upsample,
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=1,
+                      padding=kernel_size // 2, bias=False),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(out_channels),
             nn.Conv2d(out_channels, out_channels, kernel_size, stride=1,
                       padding=kernel_size // 2, bias=False),
         )
-        self.skip = (
-            nn.ConvTranspose2d(in_channels, out_channels, 1, stride,
-                               padding=0, output_padding=output_padding, bias=False)
-            if (in_channels != out_channels) or (stride != 1)
-            else nn.Identity()
-        )
+        if (in_channels != out_channels) or (stride != 1):
+            self.skip = nn.Sequential(
+                nn.Upsample(scale_factor=stride, mode='nearest')
+                if stride != 1 else nn.Identity(),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            )
+        else:
+            self.skip = nn.Identity()
 
     def forward(self, x):
         return self.block(x) + self.skip(x)
@@ -263,8 +274,8 @@ class TaxonConv(nn.Module):
 class TaxonDeconv(nn.Module):
     """Taxonomic Deconvolutional Layer with Residual Blocks.
 
-    Transposed-convolution analogue of :class:`TaxonConv`.  Uses
-    :class:`ResidualDeconvBlock` at each depth for upsampling.  Returns
+    Upsampling analogue of :class:`TaxonConv`. Uses
+    :class:`ResidualDeconvBlock` at each depth. Returns
     ``(output_tensor, entropy_reg, batch_kl_reg)``.
 
     Regularisation (returned as second element of the forward tuple):
@@ -348,14 +359,12 @@ class TaxonDeconv(nn.Module):
         return self.out_channels * sum(2 ** i for i in range(1, self.n_layers + 1))
 
     def get_hierarchy_weights(self):
-        """Return the first ConvTranspose2d weight tensor from each depth."""
+        """Return the first Conv2d weight tensor from each depth."""
         weights = []
         for deconv_block in self.deconvs:
             for m in deconv_block.block:
-                if isinstance(m, nn.ConvTranspose2d):
+                if isinstance(m, nn.Conv2d):
                     weights.append(m.weight.detach())
                     break
         return weights
-
-
 
