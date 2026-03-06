@@ -5,7 +5,7 @@ Decoder architectures using Taxonomic or Regular Deconvolutional Layers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .taxon_layers import TaxonConv, TaxonDeconv
+from .taxon_layers import TaxonConv, TaxonDeconv, UpsampleConv
 
 
 class CIFAR10TaxonDecoder(nn.Module):
@@ -161,14 +161,13 @@ class CIFAR10TaxonDecoder(nn.Module):
                 out_ch = sum(2**j for j in range(1, _n_lay + 1))
             elif layer_type == 'deconv':
                 out_ch = n_filters[i] if n_filters else 64
-                # Always use ConvTranspose2d for decoder upsampling
-                layer = nn.ConvTranspose2d(
+                # Resize-convolution (upsample + Conv2d) — avoids checkerboard
+                # artifacts that ConvTranspose2d produces via uneven overlap.
+                layer = UpsampleConv(
                     in_channels=in_ch,
                     out_channels=out_ch,
                     kernel_size=kernel_sizes[i],
                     stride=strides[i],
-                    padding=paddings[i],
-                    output_padding=output_paddings[i],
                     bias=True
                 )
             elif layer_type == 'conv':
@@ -374,14 +373,13 @@ class CelebAHQTaxonDecoder(nn.Module):
                 out_ch = sum(2**j for j in range(1, _n_lay + 1))
             elif layer_type == 'deconv':
                 out_ch = n_filters[i] if n_filters else 64
-                # Always use ConvTranspose2d for decoder upsampling
-                layer = nn.ConvTranspose2d(
+                # Resize-convolution (upsample + Conv2d) — avoids checkerboard
+                # artifacts that ConvTranspose2d produces via uneven overlap.
+                layer = UpsampleConv(
                     in_channels=in_ch,
                     out_channels=out_ch,
                     kernel_size=kernel_sizes[i],
                     stride=strides[i],
-                    padding=paddings[i],
-                    output_padding=output_paddings[i],
                     bias=True
                 )
             elif layer_type == 'conv':

@@ -26,7 +26,7 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.model.taxon_ae import CelebAHQTaxonAutoencoder
-from src.model.taxon_layers import TaxonConv, TaxonDeconv
+from src.model.taxon_layers import TaxonConv, TaxonDeconv, UpsampleConv
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -231,6 +231,12 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
 
+    # Fall back to regular filter grid for non-taxon layers
+    if not _is_any_taxon_layer(layer):
+        print(f"  {layer_name} is a regular layer — visualizing filters as grid")
+        visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=n_cols)
+        return
+
     # Base directory for this layer's filter visualizations
     base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
 
@@ -300,6 +306,58 @@ def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n
         print(f"Conv filter visualizations saved to {layer_dir}")
 
 
+def visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=8):
+    """Visualize filters from a regular Conv2d, ConvTranspose2d, or UpsampleConv as a single grid."""
+    layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
+    os.makedirs(layer_dir, exist_ok=True)
+
+    # Resolve the actual conv weight tensor regardless of wrapper type
+    if isinstance(layer, UpsampleConv):
+        conv_layer = layer.conv
+    elif isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+        conv_layer = layer
+    else:
+        # Generic fallback: find first Conv2d child
+        conv_layer = next((m for m in layer.modules() if isinstance(m, nn.Conv2d)), None)
+        if conv_layer is None:
+            print(f"  Skipping {layer_name} — no Conv2d weight found")
+            return
+
+    w = conv_layer.weight.detach().cpu().numpy()
+    # Conv2d:          (out_ch, in_ch, kH, kW)
+    # ConvTranspose2d: (in_ch, out_ch, kH, kW) → transpose to (out_ch, in_ch, kH, kW)
+    if isinstance(conv_layer, nn.ConvTranspose2d):
+        w = w.transpose(1, 0, 2, 3)
+    out_ch, in_ch, kH, kW = w.shape
+
+    # Average across in_ch for a single-channel display per filter
+    w_display = w.mean(axis=1)           # (out_ch, kH, kW)
+    mins = w_display.min(axis=(1, 2), keepdims=True)
+    maxs = w_display.max(axis=(1, 2), keepdims=True)
+    w_norm = (w_display - mins) / (maxs - mins + 1e-5)
+
+    max_filters = min(out_ch, n_cols * 8)
+    n_rows = int(np.ceil(max_filters / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    axes = axes.flatten()
+
+    for i in range(max_filters):
+        axes[i].imshow(w_norm[i], cmap='viridis')
+        axes[i].axis('off')
+        axes[i].set_title(f'F{i}', fontsize=8)
+    for ax in axes[max_filters:]:
+        ax.axis('off')
+
+    type_str = type(layer).__name__
+    plt.suptitle(f'{layer_name} [{type_str}] — {out_ch} filters (avg of {in_ch} in_ch, {kH}×{kW})')
+    plt.tight_layout()
+    plt.savefig(os.path.join(layer_dir, 'filters.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved {layer_name} regular {type_str} filters ({max_filters}/{out_ch} shown)")
+
+
 def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
     """Visualize hierarchical filters from a TaxonDeconv layer, covering all hierarchies."""
 
@@ -309,6 +367,12 @@ def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1',
         layer = model.decoder.deconv_layers[layer_idx]
     else:
         raise ValueError(f"Unknown layer: {layer_name}")
+
+    # Fall back to regular filter grid for non-taxon layers
+    if not _is_any_taxon_layer(layer):
+        print(f"  {layer_name} is a regular layer — visualizing filters as grid")
+        visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=n_cols)
+        return
 
     # Base directory for this layer's filter visualizations
     base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
@@ -1409,6 +1473,9 @@ def analyze_weight_sparsity(model, save_dir):
                     cf = cw.reshape(n_c, -1)
                 p_norm = pf / (np.linalg.norm(pf, axis=1, keepdims=True) + 1e-8)
                 c_norm = cf / (np.linalg.norm(cf, axis=1, keepdims=True) + 1e-8)
+                if p_norm.shape[1] != c_norm.shape[1]:
+                    # Flattened feature dims differ between levels; skip this pair
+                    continue
                 for pi in range(n_p):
                     c0, c1 = pi * 2, pi * 2 + 1
                     if c1 < n_c:
@@ -2007,6 +2074,9 @@ def main():
     
     for layer, layer_name in encoder_layers:
         print(f"\nProcessing {layer_name}...")
+        if not _is_any_taxon_layer(layer):
+            print(f"  Skipping {layer_name} — not a taxonomic layer, no hierarchy tree to visualize")
+            continue
         layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
         sub_layers = _get_sub_layers(layer)
         multi = len(sub_layers) > 1
@@ -2042,6 +2112,9 @@ def main():
     
     for layer, layer_name in decoder_layers:
         print(f"\nProcessing {layer_name}...")
+        if not _is_any_taxon_layer(layer):
+            print(f"  Skipping {layer_name} — not a taxonomic layer, no hierarchy tree to visualize")
+            continue
         layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
         sub_layers = _get_sub_layers(layer)
         multi = len(sub_layers) > 1

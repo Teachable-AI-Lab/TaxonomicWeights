@@ -4,6 +4,7 @@
   "experiment_name": "celebahq_resnet_k21_no_kl",
   "data": {
     "data_root": "./data/celeba_hq",
+    "image_size": 128,
     "batch_size": 128,
     "num_workers": 4,
     "val_split": 0.1,
@@ -97,7 +98,7 @@
     "_comment": "entropy_weight=0, batch_kl_weight=0: no regularisation; pure reconstruction baseline."
   },
   "analysis": {
-    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21_no_kl/checkpoint_epoch_10.pt",
+    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21_no_kl/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,

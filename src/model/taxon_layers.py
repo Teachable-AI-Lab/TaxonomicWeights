@@ -116,6 +116,49 @@ class ResidualDeconvBlock(nn.Module):
         return self.block(x) + self.skip(x)
 
 
+class UpsampleConv(nn.Module):
+    """Checkerboard-free upsampling block: nearest-neighbor upsample + Conv2d.
+
+    Mirrors the resize-convolution design used inside
+    :class:`ResidualDeconvBlock` to keep all regular `deconv` decoder layers
+    consistent and free of the checkerboard artifacts inherent to
+    ``ConvTranspose2d``.
+
+    Parameters
+    ----------
+    in_channels : int
+    out_channels : int
+    kernel_size : int
+    stride : int
+        Spatial upsampling factor.
+    padding : int
+        Kept for API compatibility; the internal Conv2d always uses
+        ``kernel_size // 2`` for same-spatial output.
+    output_padding : int
+        Kept for API compatibility; unused in resize-convolution mode.
+    bias : bool
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=2,
+                 padding=1, output_padding=0, bias=True):
+        super().__init__()
+        del padding, output_padding          # not needed for resize-conv
+        self.upsample = (
+            nn.Upsample(scale_factor=stride, mode='nearest')
+            if stride != 1 else nn.Identity()
+        )
+        self.conv = nn.Conv2d(
+            in_channels, out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=bias,
+        )
+
+    def forward(self, x):
+        return self.conv(self.upsample(x))
+
+
 def _taxonomic_regularization(
     out: torch.Tensor,
     idx: int,

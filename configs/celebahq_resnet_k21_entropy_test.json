@@ -4,6 +4,7 @@
   "experiment_name": "celebahq_resnet_k21_entropy_test",
   "data": {
     "data_root": "./data/celeba_hq",
+    "image_size": 128,
     "batch_size": 128,
     "num_workers": 4,
     "val_split": 0.1,
@@ -97,7 +98,7 @@
     "_comment": "Both regularizers active: entropy for sparse per-instance routing, batch_kl for branch diversity."
   },
   "analysis": {
-    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21_entropy_test/checkpoint_epoch_10.pt",
+    "checkpoint_path": "outputs/celebahq/training/celebahq_resnet_k21_entropy_test/final_model.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
