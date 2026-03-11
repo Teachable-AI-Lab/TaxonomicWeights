@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from .decoder import TaxonResNetDecoder
-from .encoder import TaxonResNetEncoder
+from .encoder import TaxonResNetEncoder, TaxonResNetEncoderWithAttention
 
 
 class TaxonAutoencoder(nn.Module):
