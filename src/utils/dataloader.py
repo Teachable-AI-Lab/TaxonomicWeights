@@ -231,6 +231,7 @@ class CelebAHQLoader:
         pin_memory: bool = True,
         train_subset: int = None,
         val_subset: int = None,
+        transform=None,
     ):
         self.data_root = Path(data_root)
         self.batch_size = batch_size
@@ -239,10 +240,14 @@ class CelebAHQLoader:
         self.train_subset = train_subset
         self.val_subset = val_subset
 
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),  # Scales to [0, 1]
-        ])
+        # Use caller-supplied transform if given, otherwise sensible default.
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),  # Scales to [0, 1]
+            ])
 
         train_dir = self.data_root / "train"
         val_dir = self.data_root / "val"

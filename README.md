@@ -1,10 +1,10 @@
 # Taxonomic Weights
 
+## Karthik Branch!!
 
+New plan - minimize KL-divergence from uniform distribution while also minimizing KL-divergence for individual instances from the path!!
 
-# Karthik Notes
-
-We first need to : 
+We can do this by minimizing the entropy of each distribution
 
 ## Notes on Zekun's prior code
 

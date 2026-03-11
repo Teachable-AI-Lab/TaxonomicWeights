@@ -4,3 +4,4 @@ intuitions.pdf
 __pycache__
 slurm
 *.npz
+outputs
