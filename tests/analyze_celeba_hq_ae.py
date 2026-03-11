@@ -1,1055 +1,689 @@
-"""
-Analysis script for CelebA-HQ Autoencoder.
-Computes reconstruction metrics and saves sample reconstructions.
-Performs comprehensive analysis including:
-- Filter visualization at each hierarchy level (encoder Conv & decoder Deconv)
-- Latent space sparsity analysis
-- Reconstruction quality metrics
-- Feature activation patterns
+"""Analysis script for the ResNet-based Taxon Autoencoder.
+
+Runs the following analyses and saves results to ``output.analysis_save_dir``:
+
+1.  Encoder stage filter visualization (residual block weights per stage).
+2.  Taxonomy probability distributions per encoder stage.
+3.  Latent space sparsity & norm statistics.
+4.  Reconstruction quality metrics (MSE / MAE).
+5.  Multiple reconstruction comparisons.
+6.  Partonomy sparsity suite (Jaccard, selectivity, ablation, cross-stage,
+    clustering).
+7.  Encoder stage activation maps.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import sys
-import json
-import argparse
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
 from tqdm import tqdm
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# ── path setup ──────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.model.taxon_ae import CelebAHQTaxonAutoencoder
-from src.model.taxon_layers import TaxonConv, TaxonDeconv, UpsampleConv
+from src.model.taxon_ae import TaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
+from torchvision import transforms
 
 
-# ---------------------------------------------------------------------------
-# Multi-hierarchy utilities
-# ---------------------------------------------------------------------------
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-def _is_any_taxon_layer(layer):
-    """Return True for any taxonomic layer type."""
-    return isinstance(layer, (TaxonConv, TaxonDeconv))
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
 
 
-def _is_resnet_layer(layer):
-    """Return True for ResNet-style taxonomic layers that skip ReLU.
+def _to_display(tensor: torch.Tensor, normalized: bool = True) -> np.ndarray:
+    """Convert a model tensor (1, C, H, W) to a displayable (H, W, C) image.
 
-    Current TaxonConv/TaxonDeconv are all ResNet-style, so this always
-    returns True for taxonomic layers.
+    If ``normalized`` is True the tensor is assumed to be in [-1, 1]
+    (trained with Normalize mean=0.5 std=0.5) and is mapped back to [0, 1].
+    Otherwise it is assumed to already be in [0, 1].
     """
-    return isinstance(layer, (TaxonConv, TaxonDeconv))
-
-
-def _get_sub_layers(layer):
-    """Return list of (sub_layer, hierarchy_index) pairs.
-
-    Always returns ``[(layer, 0)]`` (single hierarchy).
-    """
-    return [(layer, 0)]
-
-
-def _channels_per_single_hierarchy(layer):
-    """Return the number of output channels produced by one hierarchy tree."""
-    return layer.num_output_channels()
-
-
-def _to_display(tensor, model):
-    """Convert a model tensor (1, C, H, W) to a displayable numpy image (H, W, C).
-
-    Applies the correct denormalization depending on the decoder's
-    ``output_activation``:
-    * **sigmoid** – data already in [0, 1], just clamp.
-    * **tanh** (default) – data in [-1, 1], apply ``* 0.5 + 0.5``.
-
-    The same transform is appropriate for *original* images because the
-    CelebA-HQ dataloader uses ``ToTensor()`` only (→ [0, 1]) when paired
-    with sigmoid, and ``Normalize((0.5,…),(0.5,…))`` (→ [-1, 1]) when
-    paired with tanh.
-    """
-    t = tensor.cpu()
-    act = getattr(getattr(model, 'decoder', None), 'output_activation', 'tanh')
-    if act != 'sigmoid':
+    t = tensor.detach().cpu()
+    if normalized:
         t = t * 0.5 + 0.5
     return t.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
 
 
-# ---------------------------------------------------------------------------
-
-
-def parse_layer_config(config_layers):
-    """Parse layer configuration from JSON into model parameters."""
-    if not config_layers:
-        return None, None, None, None, None, None, None, None
-
-    n_layers_list = []
-    n_filters_list = []
-    layer_types_list = []
-    kernel_sizes_list = []
-    strides_list = []
-    paddings_list = []
-    output_paddings_list = []
-
-
-    for layer in config_layers:
-        layer_type = layer.get('layer_type', 'taxonomic_conv')
-        layer_types_list.append(layer_type)
-
-        if 'n_layers' in layer:
-            n_layers_list.append(layer['n_layers'])
-        else:
-            n_layers_list.append(None)
-
-        if 'n_filters' in layer:
-            n_filters_list.append(layer['n_filters'])
-        else:
-            n_filters_list.append(None)
-
-        kernel_sizes_list.append(layer.get('kernel_size', 3))
-        strides_list.append(layer.get('stride', 1))
-        paddings_list.append(layer.get('padding', None))
-        output_paddings_list.append(layer.get('output_padding', 0))
-
-    # Clean up None lists
-    n_layers_out = n_layers_list if any(x is not None for x in n_layers_list) else None
-    n_filters_out = n_filters_list if any(x is not None for x in n_filters_list) else None
-    paddings_out = paddings_list if any(x is not None for x in paddings_list) else None
-
-    return (n_layers_out, n_filters_out, layer_types_list,
-            kernel_sizes_list, strides_list, paddings_out, output_paddings_list)
-
-
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return json.load(f)
-
-
-def load_model(checkpoint_path, device, config=None):
-    """Load model from checkpoint. Uses config to determine if taxonomic or baseline."""
-    import os
-    
-    # Verify checkpoint file exists and is readable
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    config: dict,
+) -> Tuple[TaxonAutoencoder, dict]:
+    """Instantiate TaxonAutoencoder from config and load checkpoint weights."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
-    # Check if file is actually a JSON config instead of a checkpoint
-    if checkpoint_path.endswith('.json'):
-        raise ValueError(f"Provided path appears to be a JSON config file, not a checkpoint: {checkpoint_path}\n"
-                        f"Please provide a .pt checkpoint file (e.g., final_model.pt or checkpoint_epoch_X.pt)")
-    
-    # Check file content to detect JSON vs PyTorch checkpoint
-    with open(checkpoint_path, 'rb') as f:
-        first_bytes = f.read(10)
-        if first_bytes.startswith(b'{') or first_bytes.startswith(b'{\n'):
-            raise ValueError(f"File appears to be JSON format, not a PyTorch checkpoint: {checkpoint_path}\n"
-                           f"First bytes: {first_bytes}\n"
-                           f"Expected a .pt checkpoint file saved with torch.save()")
-    
-    file_size = os.path.getsize(checkpoint_path)
-    print(f"Loading checkpoint: {checkpoint_path} ({file_size / 1024 / 1024:.1f} MB)")
-    
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        print(f"Checkpoint path: {os.path.abspath(checkpoint_path)}")
-        print(f"\nMake sure you're pointing to a .pt checkpoint file, not a .json config file.")
-        print(f"Valid checkpoint files are saved by the training script with names like:")
-        print(f"  - final_model.pt")
-        print(f"  - checkpoint_epoch_X.pt")
-        raise
-    
-    # Determine model type from config
-    use_taxonomic = False
-    if config:
-        model_config = config.get('model', {})
-        use_taxonomic = 'encoder_layers' in model_config or 'decoder_layers' in model_config
-    
-    # Parse layer configs
-    model_config = config.get('model', {})
-    encoder_layers = model_config.get('encoder_layers', [])
-    decoder_layers = model_config.get('decoder_layers', [])
-    
-    (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes,
-        enc_strides, enc_paddings, enc_output_paddings) = parse_layer_config(encoder_layers)
 
-    (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes,
-        dec_strides, dec_paddings, dec_output_paddings) = parse_layer_config(decoder_layers)
-    
-    # Get taxonomic-specific settings
-    temperature = model_config.get('temperature', 1.0)
-    use_maxpool = model_config.get('use_maxpool', True)
-    output_activation = model_config.get('output_activation', 'sigmoid')
-    
-    model = CelebAHQTaxonAutoencoder(
-        latent_dim=model_config.get('latent_dim', 256),
-        temperature=temperature,
-        encoder_kernel_sizes=enc_kernel_sizes,
-        decoder_kernel_sizes=dec_kernel_sizes,
-        encoder_strides=enc_strides,
-        decoder_strides=dec_strides,
-        encoder_n_layers=enc_n_layers,
-        decoder_n_layers=dec_n_layers,
-        encoder_n_filters=enc_n_filters,
-        decoder_n_filters=dec_n_filters,
-        encoder_layer_types=enc_layer_types,
-        decoder_layer_types=dec_layer_types,
-        decoder_paddings=dec_paddings,
-        decoder_output_paddings=dec_output_paddings,
-        use_maxpool=use_maxpool,
-        output_activation=output_activation
+    print(f"Loading checkpoint: {checkpoint_path} ({os.path.getsize(checkpoint_path)/1e6:.1f} MB)")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    mc = config.get("model", {})
+    model = TaxonAutoencoder(
+        in_channels=mc.get("in_channels", 3),
+        resnet_variant=mc.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(mc.get("stage_taxonomy_layers", [5, 6, 7, 8])),
+        stage_strides=tuple(mc.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=mc.get("stage_blocks", None),
+        temperature=mc.get("temperature", 1.0),
+        hard=mc.get("hard", False),
+        kernel_size=mc.get("kernel_size", 3),
+        use_stem=mc.get("use_stem", True),
+        stem_channels=mc.get("stem_channels", 64),
+        stem_stride=mc.get("stem_stride", 2),
+        use_stem_maxpool=mc.get("use_stem_maxpool", True),
+        output_activation=mc.get("output_activation", "none"),
+        depth_decay=mc.get("depth_decay", 0.5),
     )
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    state = checkpoint.get("model_state", checkpoint)
+    model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
-    print(f"Loaded model from epoch {checkpoint['epoch']}")
-    print(f"Train loss: {checkpoint['train_loss']:.6f}")
-    if 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
-        print(f"Val loss: {checkpoint['val_loss']:.6f}")
+
+    print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
+    if "train_stats" in checkpoint:
+        print(f"  train_loss={checkpoint['train_stats'].get('loss', '?'):.6f}")
+    if "val_stats" in checkpoint:
+        print(f"  val_loss={checkpoint['val_stats'].get('loss', '?'):.6f}")
     return model, checkpoint
 
 
-def visualize_taxonconv_filters(model, save_dir, layer_name='encoder_layer_1', n_cols=8):
-    """Visualize hierarchical filters from a TaxonConv layer, covering all hierarchies."""
-
-    # Get the layer (TaxonConv)
-    if layer_name.startswith('encoder_layer_'):
-        layer_idx = int(layer_name.split('_')[-1]) - 1
-        layer = model.encoder.conv_layers[layer_idx]
-    elif layer_name == 'final_conv':
-        # final_conv is now a regular Conv2D, skip visualization
-        print(f"  Skipping {layer_name} - it's a regular Conv2D, not a TaxonConv")
-        return
-    else:
-        raise ValueError(f"Unknown layer: {layer_name}")
-
-    # Fall back to regular filter grid for non-taxon layers
-    if not _is_any_taxon_layer(layer):
-        print(f"  {layer_name} is a regular layer — visualizing filters as grid")
-        visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=n_cols)
-        return
-
-    # Base directory for this layer's filter visualizations
-    base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
-
-    sub_layers = _get_sub_layers(layer)
-    multi = len(sub_layers) > 1
-    if multi:
-        print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
-
-    for sub_layer, h_idx in sub_layers:
-        # Per-hierarchy subdirectory for multi-hierarchy; flat dir for single
-        if multi:
-            layer_dir = os.path.join(base_layer_dir, f'hierarchy_{h_idx:02d}')
-            h_label = f" (hierarchy {h_idx})"
-        else:
-            layer_dir = base_layer_dir
-            h_label = ""
-        os.makedirs(layer_dir, exist_ok=True)
-
-        # Get hierarchy weights from this individual sub-layer
-        weights = sub_layer.get_hierarchy_weights()
-
-        # Visualize each level
-        for level_idx, w_tensor in enumerate(weights):
-            w_np = w_tensor.detach().cpu().numpy()
-            n_filters, in_ch, k, _ = w_np.shape
-
-            # Normalize per filter
-            mins = w_np.min(axis=(1, 2, 3), keepdims=True)
-            maxs = w_np.max(axis=(1, 2, 3), keepdims=True)
-            w_norm = (w_np - mins) / (maxs - mins + 1e-5)
-
-            # Grid setup
-            n_rows = int(np.ceil(n_filters / n_cols))
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
-            if n_rows == 1:
-                axes = axes.reshape(1, -1)
-            axes = axes.flatten()
-
-            for i in range(n_filters):
-                filt = w_norm[i]
-
-                if in_ch == 1:
-                    filt = filt.squeeze()
-                    cmap = 'gray'
-                elif in_ch == 3:
-                    filt = np.transpose(filt, (1, 2, 0))
-                    cmap = None
-                else:
-                    # Too many channels - average across all input channels
-                    filt = filt.mean(axis=0)
-                    cmap = 'viridis'
-
-                axes[i].imshow(filt, cmap=cmap)
-                axes[i].axis('off')
-
-            # Turn off extra axes
-            for ax in axes[n_filters:]:
-                ax.axis('off')
-
-            plt.suptitle(f'{layer_name}{h_label} Level {level_idx} ({n_filters} filters, {in_ch}ch, {k}×{k})')
-            plt.tight_layout()
-            plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-
-            print(f"  Saved {layer_name}{h_label} level {level_idx} ({n_filters} filters)")
-
-        print(f"Conv filter visualizations saved to {layer_dir}")
-
-
-def visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=8):
-    """Visualize filters from a regular Conv2d, ConvTranspose2d, or UpsampleConv as a single grid."""
-    layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
-    os.makedirs(layer_dir, exist_ok=True)
-
-    # Resolve the actual conv weight tensor regardless of wrapper type
-    if isinstance(layer, UpsampleConv):
-        conv_layer = layer.conv
-    elif isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
-        conv_layer = layer
-    else:
-        # Generic fallback: find first Conv2d child
-        conv_layer = next((m for m in layer.modules() if isinstance(m, nn.Conv2d)), None)
-        if conv_layer is None:
-            print(f"  Skipping {layer_name} — no Conv2d weight found")
-            return
-
-    w = conv_layer.weight.detach().cpu().numpy()
-    # Conv2d:          (out_ch, in_ch, kH, kW)
-    # ConvTranspose2d: (in_ch, out_ch, kH, kW) → transpose to (out_ch, in_ch, kH, kW)
-    if isinstance(conv_layer, nn.ConvTranspose2d):
-        w = w.transpose(1, 0, 2, 3)
-    out_ch, in_ch, kH, kW = w.shape
-
-    # Average across in_ch for a single-channel display per filter
-    w_display = w.mean(axis=1)           # (out_ch, kH, kW)
-    mins = w_display.min(axis=(1, 2), keepdims=True)
-    maxs = w_display.max(axis=(1, 2), keepdims=True)
-    w_norm = (w_display - mins) / (maxs - mins + 1e-5)
-
-    max_filters = min(out_ch, n_cols * 8)
-    n_rows = int(np.ceil(max_filters / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
-    axes = axes.flatten()
-
-    for i in range(max_filters):
-        axes[i].imshow(w_norm[i], cmap='viridis')
-        axes[i].axis('off')
-        axes[i].set_title(f'F{i}', fontsize=8)
-    for ax in axes[max_filters:]:
-        ax.axis('off')
-
-    type_str = type(layer).__name__
-    plt.suptitle(f'{layer_name} [{type_str}] — {out_ch} filters (avg of {in_ch} in_ch, {kH}×{kW})')
-    plt.tight_layout()
-    plt.savefig(os.path.join(layer_dir, 'filters.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved {layer_name} regular {type_str} filters ({max_filters}/{out_ch} shown)")
-
-
-def visualize_taxondeconv_filters(model, save_dir, layer_name='decoder_layer_1', n_cols=8):
-    """Visualize hierarchical filters from a TaxonDeconv layer, covering all hierarchies."""
-
-    # Get the layer (TaxonDeconv)
-    if layer_name.startswith('decoder_layer_'):
-        layer_idx = int(layer_name.split('_')[-1]) - 1
-        layer = model.decoder.deconv_layers[layer_idx]
-    else:
-        raise ValueError(f"Unknown layer: {layer_name}")
-
-    # Fall back to regular filter grid for non-taxon layers
-    if not _is_any_taxon_layer(layer):
-        print(f"  {layer_name} is a regular layer — visualizing filters as grid")
-        visualize_regular_layer_filters(layer, layer_name, save_dir, n_cols=n_cols)
-        return
-
-    # Base directory for this layer's filter visualizations
-    base_layer_dir = os.path.join(save_dir, f'{layer_name}_filters')
-
-    sub_layers = _get_sub_layers(layer)
-    multi = len(sub_layers) > 1
-    if multi:
-        print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
-
-    for sub_layer, h_idx in sub_layers:
-        # Per-hierarchy subdirectory for multi-hierarchy; flat dir for single
-        if multi:
-            layer_dir = os.path.join(base_layer_dir, f'hierarchy_{h_idx:02d}')
-            h_label = f" (hierarchy {h_idx})"
-        else:
-            layer_dir = base_layer_dir
-            h_label = ""
-        os.makedirs(layer_dir, exist_ok=True)
-
-        # Get hierarchy weights from this individual sub-layer
-        weights = sub_layer.get_hierarchy_weights()
-
-        # Visualize each level with cumulative filter indices (reset per hierarchy)
-        cumulative_filter_count = 0
-        for level_idx, w_tensor in enumerate(weights):
-            w_np = w_tensor.detach().cpu().numpy()
-            in_ch, out_ch, k, _ = w_np.shape
-
-            # For deconv, visualize a subset of output filters
-            max_filters = min(out_ch, n_cols * 8)
-            w_subset = w_np[:, :max_filters, :, :]
-
-            # Average across input channels for visualization
-            w_display = w_subset.mean(axis=0)
-
-            # Normalize
-            mins = w_display.min(axis=(1, 2), keepdims=True)
-            maxs = w_display.max(axis=(1, 2), keepdims=True)
-            w_norm = (w_display - mins) / (maxs - mins + 1e-5)
-
-            # Grid setup
-            n_rows = int(np.ceil(max_filters / n_cols))
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
-            if n_rows == 1:
-                axes = axes.reshape(1, -1)
-            axes = axes.flatten()
-
-            for i in range(max_filters):
-                axes[i].imshow(w_norm[i], cmap='viridis')
-                axes[i].axis('off')
-                axes[i].set_title(f'F{cumulative_filter_count + i}', fontsize=8)
-
-            # Update cumulative count
-            cumulative_filter_count += out_ch
-
-            # Turn off extra axes
-            for ax in axes[max_filters:]:
-                ax.axis('off')
-
-            plt.suptitle(f'{layer_name}{h_label} Level {level_idx} ({out_ch} filters, avg of {in_ch} in_ch, {k}×{k})')
-            plt.tight_layout()
-            plt.savefig(os.path.join(layer_dir, f'level_{level_idx}.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-
-            print(f"  Saved {layer_name}{h_label} level {level_idx} (showing {max_filters}/{out_ch} filters)")
-
-        print(f"Deconv filter visualizations saved to {layer_dir}")
-
-
-def visualize_taxonomy_tree(layer, layer_name, save_dir, max_depth=4, activations=None):
-    """Visualize the taxonomic hierarchy as a tree with alpha parameters and filter/activation images.
-    
-    Args:
-        layer: TaxonConv or TaxonDeconv layer
-        layer_name: Name for the layer (e.g., 'taxon_conv1')
-        save_dir: Directory to save visualization
-        max_depth: Maximum depth to visualize (including root)
-        activations: Optional activation tensor (1, C, H, W) to visualize activations instead of filters
-    """
-    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-    
-    # Get alpha parameters and apply sigmoid (alphas is a ParameterList)
-    # Each element in alphas has shape (2^i, 1) where i is the level
-    # Determine whether this layer exposes alpha parameters. KL variants provide
-    # an empty `alphas` list for compatibility; when absent we skip alpha visuals.
-    has_alphas = (hasattr(layer, 'alphas') and len(layer.alphas) > 0)
-    alpha_values = []
-    if has_alphas:
-        for i, alpha in enumerate(layer.alphas):
-            # Apply sigmoid to get mixing coefficients in [0, 1]
-            alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
-            alpha_values.append(alpha_sig)
-            print(f"  Alpha level {i}: shape {alpha_sig.shape}, mean={alpha_sig.mean():.4f}, "
-                  f"min={alpha_sig.min():.4f}, max={alpha_sig.max():.4f}")
-    else:
-        print(f"  No alpha parameters present for {layer_name}; skipping alpha visualization.")
-    
-    # Get hierarchy weights (filters at each level) or use activations
-    is_deconv = isinstance(layer, TaxonDeconv)
-    if activations is not None:
-        # Use activations instead of filters
-        acts = activations[0].detach().cpu().numpy()  # (C, H, W)
-        image_type = "activations"
-    else:
-        hierarchy_weights = layer.get_hierarchy_weights()
-        image_type = "filters"
-    
-    # Determine actual depth (including root = depth 0)
-    n_layers = layer.n_layers
-    actual_depth = min(n_layers + 1, max_depth, 4)  # Cap at 4 layers
-    
-    # Create figure with larger size to accommodate high-resolution images
-    max_nodes = 2 ** (actual_depth - 1)
-    # Scale up for high-resolution images
-    fig_width = max(60, max_nodes * 6.0)  # Horizontal space unchanged
-    fig_height = 30  # Condensed height to ~1/3 of previous
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=100)
-    ax.axis('off')
-    
-    # Track node positions and connections
-    positions = {}
-    node_labels = {}
-    node_image_indices = {}  # Will store either (level, filter_idx) or (start_ch, end_ch)
-    edges = []
-    edge_labels = {}
-    
-    # Level 0: Root
-    positions[0] = (0.5, 0.88)  # Moved down from 0.95 to leave space for title
-    node_labels[0] = "Root"
-
-    # Channel accounting per node
-    per_node_channels = 1 if not is_deconv else layer.out_channels
-    if image_type == "activations":
-        node_image_indices[0] = (0, per_node_channels)
-    else:
-        node_image_indices[0] = (0, 0)  # (level, filter_idx)
-
-    node_counter = 1
-    cumulative_start = per_node_channels  # next available channel start
-    vertical_spacing = 0.55 / actual_depth  # Condensed vertical spacing
-    
-    # Process each level
-    for level in range(1, actual_depth):
-        if level > n_layers:
-            break
-            
-        num_nodes = 2 ** level
-        y_pos = 0.88 - level * vertical_spacing  # Adjusted to match new root position
-        
-        # Horizontal spacing: spread nodes evenly across width
-        # Add padding on the sides
-        padding = 0.10  # Increased padding for better horizontal spacing
-        available_width = 1.0 - 2 * padding
-        
-        for node_idx in range(num_nodes):
-            node_id = node_counter + node_idx
-            
-            # Evenly space nodes horizontally
-            if num_nodes == 1:
-                x_pos = 0.5
-            else:
-                x_pos = padding + available_width * node_idx / (num_nodes - 1)
-            
-            positions[node_id] = (x_pos, y_pos)
-            node_labels[node_id] = f"L{level}N{node_idx}"
-
-            # Store image index differently based on type
-            if image_type == "activations":
-                start_ch = cumulative_start + node_idx * per_node_channels
-                end_ch = start_ch + per_node_channels
-                node_image_indices[node_id] = (start_ch, end_ch)
-            else:
-                # For filters: use node_idx for both conv and deconv (indexed per level)
-                node_image_indices[node_id] = (level, node_idx)
-            
-            # Find parent - FIXED CALCULATION
-            parent_idx = node_idx // 2
-            # Parent is at level-1, and its node_id is the sum of all previous levels + parent_idx
-            parent_id = sum(2**i for i in range(level - 1)) + parent_idx if level > 0 else None
-            
-            if parent_id is not None:
-                # Determine which child this is (0 or 1)
-                child_position = node_idx % 2
-                
-                # Get alpha value for this edge
-                alpha_idx = n_layers - level
-                if 0 <= alpha_idx < len(alpha_values):
-                    alpha_tensor = alpha_values[alpha_idx]
-                    
-                    if parent_idx < alpha_tensor.shape[0]:
-                        alpha_val = alpha_tensor[parent_idx, 0]
-                        if child_position == 1:
-                            alpha_val = 1.0 - alpha_val
-                        
-                        edges.append((parent_id, node_id))
-                        edge_labels[(parent_id, node_id)] = f"α={alpha_val:.3f}"
-                    else:
-                        edges.append((parent_id, node_id))
-                        edge_labels[(parent_id, node_id)] = ""
-                else:
-                    edges.append((parent_id, node_id))
-                    edge_labels[(parent_id, node_id)] = ""
-        
-        if image_type == "activations":
-            cumulative_start += per_node_channels * num_nodes
-        
-        node_counter += num_nodes
-    
-    # Pre-render all image thumbnails to avoid expensive inline rendering
-    image_thumbnails = {}
-    image_sizes = {}
-    print(f"  Pre-rendering {len(positions)} {image_type} thumbnails...")
-    for node_id, (x, y) in positions.items():
-        img_idx = node_image_indices[node_id]
-        
-        if image_type == "activations":
-            # img_idx is a channel slice (start, end)
-            start_ch, end_ch = img_idx
-            if end_ch <= acts.shape[0]:
-                # Aggregate across the slice (mean over channels within the node)
-                img_data = acts[start_ch:end_ch, :, :].mean(axis=0)
-                
-                # Store original size
-                image_sizes[node_id] = img_data.shape
-                
-                # Normalize to [0, 1] - NO RESIZING, keep original resolution
-                img_min, img_max = img_data.min(), img_data.max()
-                if img_max > img_min:
-                    img_norm = (img_data - img_min) / (img_max - img_min)
-                else:
-                    img_norm = np.zeros_like(img_data)
-                
-                image_thumbnails[node_id] = img_norm
-        else:
-            # img_idx is (level, filter_idx) for filters
-            level_idx, filter_idx = img_idx
-            
-            if level_idx < len(hierarchy_weights):
-                w_np = hierarchy_weights[level_idx].detach().cpu().numpy()
-                
-                # Handle Conv vs Deconv shapes
-                if len(w_np.shape) == 4 and w_np.shape[0] == layer.in_channels:
-                    # Deconv: (in_ch, out_ch * nodes, k, k)
-                    nodes = 2 ** level_idx
-                    out_ch = layer.out_channels
-                    w_np = w_np.transpose(1, 0, 2, 3)  # (out_ch*nodes, in_ch, k, k)
-                    w_np = w_np.reshape(nodes, out_ch, layer.in_channels, w_np.shape[2], w_np.shape[3])
-                    if filter_idx >= nodes:
-                        filter_idx = 0
-                    img_data = w_np[filter_idx].mean(axis=0).mean(axis=0)
-                elif len(w_np.shape) == 4:
-                    # Conv: (num_filters, in_ch, k, k)
-                    if filter_idx >= w_np.shape[0]:
-                        filter_idx = 0
-                    img_data = w_np[filter_idx, :, :, :]
-                    img_data = img_data.mean(axis=0)
-                else:
-                    img_data = w_np[0] if len(w_np.shape) > 0 else w_np
-                
-                # Store original size
-                image_sizes[node_id] = img_data.shape
-                
-                # Normalize to [0, 1]
-                img_min, img_max = img_data.min(), img_data.max()
-                if img_max > img_min:
-                    img_norm = (img_data - img_min) / (img_max - img_min)
-                else:
-                    img_norm = np.zeros_like(img_data)
-                
-                image_thumbnails[node_id] = img_norm
-    
-    # Determine zoom based on image size to maintain consistent visual size
-    # Target visual size in inches (adjust as needed)
-    if image_type == "activations":
-        target_size_inches = 2.5  # Larger activations
-    else:
-        target_size_inches = 2.5  # Larger filters
-    
-    # Get a representative image size
-    if image_sizes:
-        sample_size = list(image_sizes.values())[0]
-        sample_pixels = max(sample_size)
-        # Calculate zoom to achieve target size
-        # zoom * pixels / dpi = inches, so zoom = inches * dpi / pixels
-        # Assume 100 dpi for OffsetImage
-        base_zoom = (target_size_inches * 100) / sample_pixels
-    else:
-        base_zoom = 35.0
-    
-    # Draw edges first (so they appear behind nodes)
-    print(f"  Drawing {len(edges)} edges...")
-    for (parent_id, child_id) in edges:
-        px, py = positions[parent_id]
-        cx, cy = positions[child_id]
-        
-        # Draw line with minimal thickness
-        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)
-        
-        # Add alpha label at midpoint
-        mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
-        label = edge_labels[(parent_id, child_id)]
-        
-        if label:  # Only draw label if it exists
-                bbox_props = dict(boxstyle='round,pad=0.7', facecolor='lightyellow', 
-                         edgecolor='gray', alpha=0.9, linewidth=1.3)
-                ax.text(mid_x, mid_y, label, ha='center', va='center', 
-                    fontsize=16, fontweight='bold', bbox=bbox_props, zorder=2)
-    
-    # Draw nodes with image visualizations using OffsetImage for better control
-    print(f"  Drawing {len(positions)} nodes with {image_type}...")
-    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-    
-    for node_id, (x, y) in positions.items():
-        if node_id in image_thumbnails:
-            # Use nearest-neighbor interpolation to preserve pixel boundaries
-            imagebox = OffsetImage(image_thumbnails[node_id], cmap='viridis', 
-                                 zoom=base_zoom, interpolation='nearest')
-            imagebox.image.axes = ax
-            
-            # Create AnnotationBbox to place the image
-            ab = AnnotationBbox(imagebox, (x, y),
-                               frameon=True,
-                               pad=0.0,
-                               bboxprops=dict(edgecolor='black', linewidth=1.5, facecolor='none'))
-            ax.add_artist(ab)
-            
-            # Add label below
-            label_offset = 0.08  # Reduced to bring labels closer to images
-            ax.text(x, y - label_offset, node_labels[node_id], 
-                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)
-        else:
-            # Fallback: draw circle
-            circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black', linewidth=2, zorder=3)
-            ax.add_patch(circle)
-            ax.text(x, y - 0.03, node_labels[node_id], 
-                    ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
-    
-    # Add title with layer info and extra padding
-    print(f"  Adding title and saving...")
-    title_text = f"{layer_name} Taxonomy Tree\n"
-    if actual_depth < n_layers + 1:
-        title_text += f"(Showing first {actual_depth} levels, truncated from {n_layers + 1})"
-    else:
-        title_text += f"(Full hierarchy: {actual_depth} levels)"
-    
-    # Use text instead of set_title for better control of positioning
-    ax.text(0.5, 0.98, title_text, ha='center', va='top', 
-            transform=ax.transAxes, fontsize=18, fontweight='bold')
-    
-    # Add legend
-    # Legend: omit alpha explanation when this is a KL-layer without alphas
-    legend_lines = [f"Total layers: {n_layers}", f"Nodes at each level: 1, 2, 4, 8, ..."]
-    if has_alphas:
-        legend_lines.append("α = Sigmoid weight for child selection")
-    legend_lines.append('Brighter = Higher activation' if image_type == 'activations' else 'Filter weights shown')
-    legend_text = "\n".join(legend_lines)
-    ax.text(0.02, 0.98, legend_text, transform=ax.transAxes,
-            fontsize=11, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    # Save with higher DPI to preserve detail
-    os.makedirs(save_dir, exist_ok=True)
-    safe_name = layer_name.lower().replace(' ', '_')
-    save_path = os.path.join(save_dir, f'{safe_name}_tree.png')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    
-    print(f"  Saved taxonomy tree to {save_path} (full resolution preserved)")
-
-
-def visualize_taxonomy_subtree(layer, layer_name, save_dir, start_level, start_node_idx,
-                                subtree_depth=4, activations=None):
-    """Visualize a sub-hierarchy of the taxonomy tree rooted at a specific node.
-
-    Renders a tree of ``subtree_depth`` levels starting from the node at global
-    position ``(start_level, start_node_idx)`` and expanding downward toward the
-    leaves.  All filter images and alpha weights are looked up using the correct
-    *global* level and node index so the displayed content is exactly the portion
-    of the full hierarchy associated with that sub-tree.
-
-    Args:
-        layer: TaxonConv or TaxonDeconv layer
-        layer_name: Human-readable layer name
-        save_dir: Directory in which to save this sub-tree image
-        start_level: Global hierarchy level of the sub-tree root (0 = true root)
-        start_node_idx: Index of the root node within start_level
-        subtree_depth: Number of levels to render, including the root
-        activations: Optional activation tensor (1, C, H, W)
-    """
-    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-
-    has_alphas = (hasattr(layer, 'alphas') and len(layer.alphas) > 0)
-    alpha_values = []
-    if has_alphas:
-        for i, alpha in enumerate(layer.alphas):
-            alpha_sig = torch.sigmoid(alpha / layer.temperature).detach().cpu().numpy()
-            alpha_values.append(alpha_sig)
-
-    is_deconv = isinstance(layer, TaxonDeconv)
-    if activations is not None:
-        acts = activations[0].detach().cpu().numpy()  # (C, H, W)
-        image_type = "activations"
-    else:
-        hierarchy_weights = layer.get_hierarchy_weights()
-        image_type = "filters"
-
-    n_layers = layer.n_layers
-    # Cap depth so we never descend past the actual leaves
-    actual_depth = min(subtree_depth, n_layers - start_level + 1)
-
-    max_nodes = 2 ** (actual_depth - 1)
-    fig_width = max(30, max_nodes * 6.0)
-    fig_height = 30
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=100)
-    ax.axis('off')
-
-    positions = {}
-    node_labels = {}
-    node_image_indices = {}
-    edges = []
-    edge_labels = {}
-
-    # Channels per output node (Conv = 1, Deconv = out_channels)
-    per_node_channels = 1 if not is_deconv else layer.out_channels
-
-    # ---- Sub-tree root (sub-level 0) ----
-    positions[0] = (0.5, 0.88)
-    node_labels[0] = f"L{start_level}N{start_node_idx}"
-    if image_type == "activations":
-        # BFS channel offset: (2^GL - 1 + GN) * per_node_channels
-        root_ch = ((2 ** start_level - 1) + start_node_idx) * per_node_channels
-        node_image_indices[0] = (root_ch, root_ch + per_node_channels)
-    else:
-        node_image_indices[0] = (start_level, start_node_idx)
-
-    node_counter = 1
-    vertical_spacing = 0.55 / actual_depth
-
-    for sub_level in range(1, actual_depth):
-        global_level = start_level + sub_level
-        if global_level > n_layers:
-            break
-
-        num_nodes = 2 ** sub_level
-        y_pos = 0.88 - sub_level * vertical_spacing
-        padding = 0.10
-        available_width = 1.0 - 2 * padding
-
-        for sub_node_idx in range(num_nodes):
-            node_id = node_counter + sub_node_idx
-            x_pos = (0.5 if num_nodes == 1
-                     else padding + available_width * sub_node_idx / (num_nodes - 1))
-            positions[node_id] = (x_pos, y_pos)
-
-            # Global node index within global_level
-            global_node_idx = start_node_idx * (2 ** sub_level) + sub_node_idx
-            node_labels[node_id] = f"L{global_level}N{global_node_idx}"
-
-            if image_type == "activations":
-                chan_start = ((2 ** global_level - 1) + global_node_idx) * per_node_channels
-                node_image_indices[node_id] = (chan_start, chan_start + per_node_channels)
-            else:
-                node_image_indices[node_id] = (global_level, global_node_idx)
-
-            # Parent in sub-tree coordinate space
-            sub_parent_idx = sub_node_idx // 2
-            parent_id = sum(2 ** i for i in range(sub_level - 1)) + sub_parent_idx
-
-            child_position = sub_node_idx % 2
-            # Alpha lookup: same formula as the full-tree renderer, using global level
-            alpha_idx = n_layers - global_level
-            global_parent_node_idx = start_node_idx * (2 ** (sub_level - 1)) + sub_parent_idx
-
-            if has_alphas and 0 <= alpha_idx < len(alpha_values):
-                alpha_tensor = alpha_values[alpha_idx]
-                if global_parent_node_idx < alpha_tensor.shape[0]:
-                    alpha_val = float(alpha_tensor[global_parent_node_idx, 0])
-                    if child_position == 1:
-                        alpha_val = 1.0 - alpha_val
-                    edges.append((parent_id, node_id))
-                    edge_labels[(parent_id, node_id)] = f"α={alpha_val:.3f}"
-                else:
-                    edges.append((parent_id, node_id))
-                    edge_labels[(parent_id, node_id)] = ""
-            else:
-                edges.append((parent_id, node_id))
-                edge_labels[(parent_id, node_id)] = ""
-
-        node_counter += num_nodes
-
-    # ---- Pre-render thumbnails ----
-    image_thumbnails = {}
-    image_sizes = {}
-    for node_id in positions:
-        img_idx = node_image_indices[node_id]
-        if image_type == "activations":
-            start_ch, end_ch = img_idx
-            if end_ch <= acts.shape[0]:
-                img_data = acts[start_ch:end_ch].mean(axis=0)
-                image_sizes[node_id] = img_data.shape
-                img_min, img_max = img_data.min(), img_data.max()
-                img_norm = ((img_data - img_min) / (img_max - img_min + 1e-8)
-                            if img_max > img_min else np.zeros_like(img_data))
-                image_thumbnails[node_id] = img_norm
-        else:
-            global_level_idx, global_filter_idx = img_idx
-            if global_level_idx < len(hierarchy_weights):
-                w_np = hierarchy_weights[global_level_idx].detach().cpu().numpy()
-                if len(w_np.shape) == 4 and w_np.shape[0] == layer.in_channels:
-                    # Deconv: (in_ch, out_ch * nodes_at_level, k, k)
-                    nodes_at_level = 2 ** global_level_idx
-                    out_ch = layer.out_channels
-                    w_t = w_np.transpose(1, 0, 2, 3)
-                    w_t = w_t.reshape(nodes_at_level, out_ch, layer.in_channels,
-                                      w_t.shape[2], w_t.shape[3])
-                    fi = global_filter_idx if global_filter_idx < nodes_at_level else 0
-                    img_data = w_t[fi].mean(axis=0).mean(axis=0)
-                elif len(w_np.shape) == 4:
-                    # Conv: (num_filters_at_level, in_ch, k, k)
-                    fi = global_filter_idx if global_filter_idx < w_np.shape[0] else 0
-                    img_data = w_np[fi].mean(axis=0)
-                else:
-                    img_data = w_np[0] if w_np.ndim > 0 else w_np
-                image_sizes[node_id] = img_data.shape
-                img_min, img_max = img_data.min(), img_data.max()
-                img_norm = ((img_data - img_min) / (img_max - img_min + 1e-8)
-                            if img_max > img_min else np.zeros_like(img_data))
-                image_thumbnails[node_id] = img_norm
-
-    target_size_inches = 2.5
-    if image_sizes:
-        sample_pixels = max(list(image_sizes.values())[0])
-        base_zoom = (target_size_inches * 100) / sample_pixels
-    else:
-        base_zoom = 35.0
-
-    # ---- Draw edges ----
-    for (parent_id, child_id) in edges:
-        px, py = positions[parent_id]
-        cx, cy = positions[child_id]
-        ax.plot([px, cx], [py, cy], 'k-', linewidth=0.5, zorder=1, alpha=0.3)
-        mid_x, mid_y = (px + cx) / 2, (py + cy) / 2
-        label = edge_labels[(parent_id, child_id)]
-        if label:
-            bbox_props = dict(boxstyle='round,pad=0.7', facecolor='lightyellow',
-                              edgecolor='gray', alpha=0.9, linewidth=1.3)
-            ax.text(mid_x, mid_y, label, ha='center', va='center',
-                    fontsize=16, fontweight='bold', bbox=bbox_props, zorder=2)
-
-    # ---- Draw nodes ----
-    for node_id, (x, y) in positions.items():
-        if node_id in image_thumbnails:
-            imagebox = OffsetImage(image_thumbnails[node_id], cmap='viridis',
-                                   zoom=base_zoom, interpolation='nearest')
-            imagebox.image.axes = ax
-            ab = AnnotationBbox(imagebox, (x, y), frameon=True, pad=0.0,
-                                bboxprops=dict(edgecolor='black', linewidth=1.5,
-                                               facecolor='none'))
-            ax.add_artist(ab)
-            ax.text(x, y - 0.08, node_labels[node_id],
-                    ha='center', va='top', fontsize=11, fontweight='bold', zorder=5)
-        else:
-            circle = plt.Circle((x, y), 0.015, color='lightgray', ec='black',
-                                 linewidth=2, zorder=3)
-            ax.add_patch(circle)
-            ax.text(x, y - 0.03, node_labels[node_id],
-                    ha='center', va='top', fontsize=10, fontweight='bold', zorder=5)
-
-    title_text = (f"{layer_name} Sub-Hierarchy: Root at L{start_level}N{start_node_idx}\n"
-                  f"Global levels {start_level}–{min(start_level + actual_depth - 1, n_layers)} "
-                  f"of {n_layers}")
-    ax.text(0.5, 0.98, title_text, ha='center', va='top',
-            transform=ax.transAxes, fontsize=18, fontweight='bold')
-
-    legend_lines = [
-        f"Sub-tree root: L{start_level}N{start_node_idx}",
-        f"Showing {actual_depth} levels ({image_type})",
-        f"Total layers in model: {n_layers}",
-    ]
-    if has_alphas:
-        legend_lines.append("α = Sigmoid weight for child selection")
-    legend_lines.append('Brighter = Higher activation'
-                        if image_type == 'activations' else 'Filter weights shown')
-    ax.text(0.02, 0.98, "\n".join(legend_lines), transform=ax.transAxes,
-            fontsize=11, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'subtree_L{start_level}N{start_node_idx:04d}_tree.png')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f"    Saved sub-tree L{start_level}N{start_node_idx} → {save_path}")
-
-
-def visualize_all_subtree_hierarchies(layer, layer_name, base_save_dir,
-                                       subtree_depth=4, activations=None):
-    """Visualize all bottom-up sub-hierarchies for a taxonomic layer.
-
-    Identifies the level that is (subtree_depth - 1) levels above the leaves
-    (the "4th from the bottom" when subtree_depth=4) and renders a separate
-    subtree_depth-level tree for every node at that level, expanding downward
-    to the leaves.  All sub-tree images are saved directly under
-    ``base_save_dir/sub_hierarchies/``.
-
-    For example, with n_layers=7 and subtree_depth=4 the function picks
-    start_level=4 and produces 2^4=16 sub-tree visualisations covering
-    global levels 4–7.
-    """
-    n_layers = layer.n_layers
-    start_level = max(0, n_layers - (subtree_depth - 1))
-
-    if start_level == 0:
-        print(f"  {layer_name}: hierarchy has only {n_layers} levels; bottom-up "
-              f"sub-hierarchies (subtree_depth={subtree_depth}) would cover the "
-              f"entire tree — skipping to avoid duplication.")
-        return
-
-    num_subtrees = 2 ** start_level
-    sub_dir = os.path.join(base_save_dir, 'sub_hierarchies')
-    os.makedirs(sub_dir, exist_ok=True)
-    print(f"  Generating {num_subtrees} bottom-up sub-hierarchies for {layer_name} "
-          f"(root level={start_level}, n_layers={n_layers}, subtree_depth={subtree_depth})...")
-
-    for node_idx in range(num_subtrees):
-        visualize_taxonomy_subtree(
-            layer, layer_name, sub_dir,
-            start_level=start_level,
-            start_node_idx=node_idx,
-            subtree_depth=subtree_depth,
-            activations=activations,
+# ── 1. Stage filter visualization ────────────────────────────────────────────
+
+def visualize_stage_filters(model: TaxonAutoencoder, save_dir: str, n_cols: int = 8) -> None:
+    """Save filter grids for the first residual block in each encoder stage."""
+    stage_dir = os.path.join(save_dir, "stage_filters")
+    os.makedirs(stage_dir, exist_ok=True)
+
+    for s_idx, stage in enumerate(model.encoder.taxon_stages, start=1):
+        first_block = stage.blocks[0]
+        conv = next((m for m in first_block.main.modules() if isinstance(m, nn.Conv2d)), None)
+        if conv is None:
+            print(f"  Stage {s_idx}: no Conv2d found, skipping.")
+            continue
+
+        w = conv.weight.detach().cpu().numpy()          # (out, in, k, k)
+        out_ch, in_ch, k, _ = w.shape
+        w_disp = w.mean(axis=1)                         # avg input channels
+        w_min = w_disp.min(axis=(1, 2), keepdims=True)
+        w_max = w_disp.max(axis=(1, 2), keepdims=True)
+        w_norm = (w_disp - w_min) / (w_max - w_min + 1e-8)
+
+        n_show = min(out_ch, n_cols * 8)
+        n_rows = max(1, (n_show + n_cols - 1) // n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2, n_rows * 2))
+        axes = np.array(axes).flatten()
+
+        for i in range(n_show):
+            axes[i].imshow(w_norm[i], cmap="viridis")
+            axes[i].axis("off")
+        for ax in axes[n_show:]:
+            ax.axis("off")
+
+        plt.suptitle(
+            f"Stage {s_idx} first-block conv1 filters "
+            f"({n_show}/{out_ch} shown, avg of {in_ch} in-ch, {k}x{k})",
+            fontsize=10,
         )
+        plt.tight_layout()
+        out_path = os.path.join(stage_dir, f"stage{s_idx}_filters.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  Stage {s_idx}: {n_show}/{out_ch} filters -> {out_path}")
 
-    print(f"  All {num_subtrees} sub-hierarchies saved under {sub_dir}")
+
+# ── 2. Taxonomy probability distributions ────────────────────────────────────
+
+def visualize_taxonomy_distributions(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_batches: int = 10,
+) -> None:
+    """Plot per-stage mean entropy & DKL over several batches."""
+    dist_dir = os.path.join(save_dir, "taxonomy_distributions")
+    os.makedirs(dist_dir, exist_ok=True)
+
+    n_stages = len(model.encoder.taxon_stages)
+    entropy_per_stage: List[List[float]] = [[] for _ in range(n_stages)]
+    dkl_per_stage: List[List[float]] = [[] for _ in range(n_stages)]
+
+    model.eval()
+    with torch.no_grad():
+        for b_idx, (images, _) in enumerate(tqdm(data_loader, desc="Taxonomy stats")):
+            if b_idx >= num_batches:
+                break
+            images = images.to(device)
+            _, details = model.encode(images, return_details=True)
+            for s_idx, stage_info in enumerate(details["stages"]):
+                entropy_per_stage[s_idx].append(float(stage_info["entropy"].cpu()))
+                dkl_per_stage[s_idx].append(float(stage_info["dkl"].cpu()))
+
+    fig, axes = plt.subplots(2, n_stages, figsize=(4 * n_stages, 6))
+    if n_stages == 1:
+        axes = axes.reshape(2, 1)
+
+    for s_idx in range(n_stages):
+        stage = model.encoder.taxon_stages[s_idx]
+        axes[0, s_idx].plot(entropy_per_stage[s_idx], marker="o", ms=3)
+        axes[0, s_idx].set_title(f"Stage {s_idx+1} entropy\n(depth={stage.n_taxonomy_layers})")
+        axes[0, s_idx].set_xlabel("batch")
+        axes[1, s_idx].plot(dkl_per_stage[s_idx], marker="o", ms=3, color="tab:orange")
+        axes[1, s_idx].set_title(f"Stage {s_idx+1} DKL\n(depth={stage.n_taxonomy_layers})")
+        axes[1, s_idx].set_xlabel("batch")
+
+    plt.suptitle("Per-stage Taxonomy Regularization Over Batches", fontweight="bold")
+    plt.tight_layout()
+    out_path = os.path.join(dist_dir, "taxonomy_regularization.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    np.savez(
+        os.path.join(dist_dir, "taxonomy_stats.npz"),
+        **{f"stage{i+1}_entropy": np.array(entropy_per_stage[i]) for i in range(n_stages)},
+        **{f"stage{i+1}_dkl":    np.array(dkl_per_stage[i])    for i in range(n_stages)},
+    )
+    print(f"Taxonomy distributions saved to {dist_dir}")
 
 
-def analyze_partonomy_sparsity(model, data_loader, device, save_dir,
-                               num_batches=30, sparsity_threshold=0.1,
-                               ablation_images=16, n_clusters=8):
-    """Five-part partonomy sparsity analysis suite.
+# ── 2b. Path probability plots per stage ─────────────────────────────────────
 
-    1. Activation overlap (Jaccard) – tests feature specialisation.
-    2. Feature selectivity & entropy – quantifies polysemanticity.
-    3. Causal unit ablations – tests additive compositionality.
-    4. Cross-layer sparsity dependency – tests hierarchical sparsity.
-    5. Dimension clustering – evaluates stable sub-structure alignment.
+def _get_encoder_details(model: TaxonAutoencoder, images: torch.Tensor) -> List[dict]:
+    """Run encoder with return_details=True and return the stages list."""
+    with torch.no_grad():
+        _, enc_details = model.encoder(images, return_details=True)
+    return enc_details["stages"]
+
+
+def visualize_taxonomy_path_probs(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_patches: int = 20,
+    sample_index: int = 0,
+    alpha: float = 0.6,
+) -> None:
+    """For each encoder stage, plot path probability distributions over patches.
+
+    A separate plot per stage mirrors the notebook's ``plot_patch_path_probabilities``
+    but saves to disk.  The left panel shows each patch's probability curve across
+    all flattened tree channels (depth-separated by dashed boundaries).  The right
+    panel shows the per-depth path-sum heat-map (should be ~1 everywhere).
     """
-    prt_dir = os.path.join(save_dir, 'partonomy_sparsity')
+    prob_dir = os.path.join(save_dir, "path_probability_plots")
+    os.makedirs(prob_dir, exist_ok=True)
+
+    model.eval()
+    images, _ = next(iter(data_loader))
+    images = images.to(device)
+
+    stages = _get_encoder_details(model, images)
+
+    for stage_info in stages:
+        name = stage_info["name"]
+        logp_all = stage_info["logp"]          # (B, total_C, H, W)
+        layer_channels = stage_info["layer_channels"]
+
+        # Take one sample, convert to prob, split by depth
+        logp_s = logp_all[sample_index:sample_index + 1]   # (1, total_C, H, W)
+        prob_splits = [torch.exp(t) for t in torch.split(logp_s, layer_channels, dim=1)]
+
+        # Flatten into (n_patches, total_C) and layer sum (n_patches, n_depths)
+        flattened = torch.cat(prob_splits, dim=1)           # (1, total_C, H, W)
+        layer_sums = torch.stack(
+            [p.sum(dim=1) for p in prob_splits], dim=1
+        )                                                    # (1, n_depths, H, W)
+
+        patch_probs = flattened[0].permute(1, 2, 0).reshape(-1, flattened.shape[1])   # (n_patches, C)
+        depth_sums  = layer_sums[0].permute(1, 2, 0).reshape(-1, len(layer_channels)) # (n_patches, L)
+
+        n_show = min(num_patches, patch_probs.shape[0])
+        patch_probs = patch_probs[:n_show].detach().cpu().numpy()
+        depth_sums  = depth_sums[:n_show].detach().cpu().numpy()
+
+        total_C = patch_probs.shape[1]
+        x_full = np.arange(total_C)
+        boundaries = (np.cumsum(layer_channels)[:-1] - 0.5).tolist()
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5),
+                                 gridspec_kw={"width_ratios": [2.4, 1.2]})
+
+        ax = axes[0]
+        start = 0
+        layer_slices = []
+        for width in layer_channels:
+            end = start + width
+            layer_slices.append((x_full[start:end], start, end))
+            start = end
+
+        for i in range(n_show):
+            for x_seg, s, e in layer_slices:
+                ax.plot(x_seg, patch_probs[i, s:e], alpha=alpha, linewidth=0.8)
+        for b in boundaries:
+            ax.axvline(b, color="gray", linestyle="--", linewidth=0.8)
+
+        ax.set_xlabel("Flattened tree channel index")
+        ax.set_ylabel("Path probability")
+        ax.set_title(f"{name} path distributions (first {n_show} patches)")
+
+        ax2 = axes[1]
+        im = ax2.imshow(depth_sums.T, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+        ax2.set_xlabel("Patch index")
+        ax2.set_ylabel("Layer (depth)")
+        ax2.set_yticks(np.arange(len(layer_channels)))
+        ax2.set_yticklabels([f"L{i+1}" for i in range(len(layer_channels))])
+        ax2.set_title("Per-layer path sum (should be 1)")
+        plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+
+        err = np.abs(depth_sums - 1.0).max()
+        ax2.set_xlabel(f"Patch index  [max|sum-1|={err:.2e}]")
+
+        plt.tight_layout()
+        out_path = os.path.join(prob_dir, f"{name}_path_probs.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  {name}: path prob plot -> {out_path}  (max depth-sum err={err:.2e})")
+
+    print(f"Path probability plots saved to {prob_dir}")
+
+
+# ── 2c. Hierarchical tree activation visualization ────────────────────────────
+
+def visualize_taxonomy_tree(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 2,
+    max_tree_depths: int = 3,
+) -> None:
+    """Draw the binary-tree activation structure for each encoder stage.
+
+    For each (image, stage) pair, a matplotlib figure is produced showing the
+    binary tree of taxonomy nodes up to ``max_tree_depths`` (default 3 → 14
+    nodes: 2 + 4 + 8).  Each node shows:
+    - Background colour: mean activation magnitude of that depth/channel at the
+      selected spatial patch (centre of the feature map).
+    - Text: the node's channel index within its depth and its mean |activation|.
+
+    Edges are drawn from parent to its two children; edge width is proportional
+    to the conditional routing probability of selecting that child (computed from
+    the joint log-probs: P(child | parent) ≈ joint_prob[child] / joint_prob[parent]).
+    """
+    tree_dir = os.path.join(save_dir, "taxonomy_tree_activations")
+    os.makedirs(tree_dir, exist_ok=True)
+
+    model.eval()
+    images, _ = next(iter(data_loader))
+    images = images[:num_images].to(device)
+
+    stages = _get_encoder_details(model, images)
+
+    for img_idx in range(num_images):
+        for stage_info in stages:
+            name = stage_info["name"]
+            output_all = stage_info["output"]        # (B, total_C, H, W)
+            logp_all   = stage_info["logp"]          # (B, total_C, H, W)
+            layer_channels: List[int] = stage_info["layer_channels"]
+
+            n_depths_show = min(max_tree_depths, len(layer_channels))
+            shown_channels = layer_channels[:n_depths_show]
+
+            # Pick centre spatial location
+            H, W = output_all.shape[2], output_all.shape[3]
+            cy, cx = H // 2, W // 2
+
+            # Split output and logp by depth, then select centre patch
+            out_splits  = list(torch.split(output_all[img_idx], layer_channels, dim=0))  # per depth: (C_d, H, W)
+            logp_splits = list(torch.split(logp_all[img_idx],   layer_channels, dim=0))
+
+            # Centre-patch activation and prob per depth
+            acts  = [out_splits[d][:, cy, cx].detach().cpu().numpy()  for d in range(n_depths_show)]
+            probs = [logp_splits[d][:, cy, cx].exp().detach().cpu().numpy() for d in range(n_depths_show)]
+
+            # Compute max act for colour normalisation
+            all_acts = np.concatenate(acts)
+            vmax = max(np.abs(all_acts).max(), 1e-8)
+
+            # Tree layout: node i at depth d → x in (0,1], y = -d
+            def node_pos(depth: int, idx: int) -> Tuple[float, float]:
+                n = layer_channels[depth]
+                return (idx + 0.5) / n, -depth
+
+            fig, ax = plt.subplots(1, 1, figsize=(max(8, 2 * shown_channels[-1]), (n_depths_show + 1) * 2.5 + 1))
+            ax.set_xlim(0, 1)
+            ax.set_ylim(-n_depths_show, 1.5)
+            ax.set_aspect("auto")
+            ax.axis("off")
+            ax.set_title(
+                f"{name}  —  image {img_idx+1}  —  centre patch ({cy},{cx})\n"
+                f"Node colour = activation magnitude, edge width ∝ conditional prob",
+                fontsize=9,
+            )
+
+            cmap = plt.cm.RdYlGn
+            node_radius = 0.012
+
+            # Virtual root node sits above depth 0 (depth-0 has 2 channels; we
+            # add an implicit root so the diagram reads as one connected tree).
+            vroot_x, vroot_y = 0.5, 1.0
+            ax.add_patch(plt.Circle((vroot_x, vroot_y), node_radius * 1.8,
+                                    color="lightgray", zorder=2,
+                                    linewidth=0.5, edgecolor="black"))
+            ax.text(vroot_x, vroot_y - node_radius * 2.8, "root",
+                    ha="center", va="top", fontsize=5.5, zorder=3, color="dimgray")
+
+            # Edges from virtual root to each depth-0 node
+            for i in range(layer_channels[0]):
+                x_c, y_c = node_pos(0, i)
+                ax.plot([vroot_x, x_c], [vroot_y, y_c],
+                        color="steelblue", linewidth=1.0, alpha=0.5, zorder=1)
+
+            # Draw remaining edges (depth ≥ 1 → parent at previous depth)
+            for d in range(1, n_depths_show):
+                n_nodes = layer_channels[d]
+                for i in range(n_nodes):
+                    parent_i = i // 2
+                    x_c, y_c = node_pos(d, i)
+                    x_p, y_p = node_pos(d - 1, parent_i)
+
+                    # Conditional prob = joint_prob[child] / joint_prob[parent]
+                    joint_child  = float(probs[d][i])
+                    joint_parent = float(probs[d - 1][parent_i])
+                    cond_prob = joint_child / max(joint_parent, 1e-8)
+                    cond_prob = min(cond_prob, 1.0)
+
+                    ax.plot(
+                        [x_p, x_c], [y_p, y_c],
+                        color="steelblue",
+                        linewidth=0.5 + 3.5 * cond_prob,
+                        alpha=0.4 + 0.5 * cond_prob,
+                        zorder=1,
+                    )
+
+            # Draw nodes
+            for d in range(n_depths_show):
+                n_nodes = layer_channels[d]
+                for i in range(n_nodes):
+                    x_n, y_n = node_pos(d, i)
+                    act_val = float(acts[d][i])
+                    norm_val = (act_val + vmax) / (2 * vmax)    # [-vmax, vmax] → [0,1]
+                    node_col = cmap(norm_val)
+
+                    circle = plt.Circle(
+                        (x_n, y_n), node_radius * (1.8 if n_nodes <= 4 else 1.0),
+                        color=node_col, zorder=2, linewidth=0.5,
+                        edgecolor="black",
+                    )
+                    ax.add_patch(circle)
+
+                    prob_val = float(probs[d][i])
+                    ax.text(
+                        x_n, y_n - node_radius * 2.8,
+                        f"c{i}\n{act_val:.2f}\np={prob_val:.2f}",
+                        ha="center", va="top", fontsize=5.5, zorder=3,
+                    )
+
+                # Depth label on left
+                ax.text(
+                    0.002, -d, f"L{d+1}\n({n_nodes}ch)",
+                    va="center", ha="left", fontsize=7, color="dimgray",
+                )
+
+            # Colour bar
+            sm = plt.cm.ScalarMappable(cmap=cmap,
+                                        norm=plt.Normalize(vmin=-vmax, vmax=vmax))
+            sm.set_array([])
+            plt.colorbar(sm, ax=ax, fraction=0.015, pad=0.01,
+                         label="Activation value")
+
+            plt.tight_layout()
+            out_path = os.path.join(
+                tree_dir, f"img{img_idx+1:02d}_{name}_tree.png"
+            )
+            plt.savefig(out_path, dpi=180, bbox_inches="tight")
+            plt.close()
+            print(f"  img{img_idx+1} {name}: tree -> {out_path}")
+
+    print(f"Taxonomy tree activations saved to {tree_dir}")
+
+
+# ── 3. Latent space sparsity ──────────────────────────────────────────────────
+
+def analyze_latent_sparsity(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_batches: int = 50,
+    sparsity_threshold: float = 0.1,
+) -> None:
+    """Sparsity and norm statistics of the latent space."""
+    model.eval()
+    all_latents: List[np.ndarray] = []
+
+    print(f"Encoding {num_batches} batches for latent space analysis...")
+    with torch.no_grad():
+        for i, (images, _) in enumerate(tqdm(data_loader, desc="Latent stats")):
+            if i >= num_batches:
+                break
+            images = images.to(device)
+            z, _ = model.encode(images)
+            z_np = z.cpu().numpy()
+            if z_np.ndim > 2:
+                z_np = z_np.reshape(z_np.shape[0], -1)
+            all_latents.append(z_np)
+
+    Z = np.concatenate(all_latents, axis=0)
+    N, D = Z.shape
+    print(f"Collected {N} latent vectors, dim={D}")
+
+    mean_act = np.abs(Z).mean(axis=0)
+    std_act  = Z.std(axis=0)
+    sparsity = np.mean(np.abs(Z) < sparsity_threshold, axis=1)
+    l0 = np.sum(np.abs(Z) > sparsity_threshold, axis=1)
+    l1 = np.abs(Z).sum(axis=1)
+    l2 = np.sqrt((Z ** 2).sum(axis=1))
+
+    print(
+        f"  mean_sparsity={sparsity.mean():.4f}  mean_l0={l0.mean():.1f}  "
+        f"mean_l1={l1.mean():.4f}  mean_l2={l2.mean():.4f}"
+    )
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes[0, 0].bar(range(min(D, 256)), mean_act[:256])
+    axes[0, 0].set_title("Mean |activation| per dim (first 256)")
+
+    axes[0, 1].bar(range(min(D, 256)), std_act[:256], color="darkorange")
+    axes[0, 1].set_title("Std activation per dim (first 256)")
+
+    axes[0, 2].hist(sparsity, bins=50, edgecolor="black")
+    axes[0, 2].axvline(sparsity.mean(), color="red", linestyle="--",
+                       label=f"Mean={sparsity.mean():.3f}")
+    axes[0, 2].set_title("Sparsity per sample")
+    axes[0, 2].legend()
+
+    axes[1, 0].hist(l0, bins=50, edgecolor="black")
+    axes[1, 0].axvline(l0.mean(), color="red", linestyle="--",
+                       label=f"Mean={l0.mean():.1f}")
+    axes[1, 0].set_title("L0 norm per sample")
+    axes[1, 0].legend()
+
+    axes[1, 1].hist(l1, bins=50, edgecolor="black")
+    axes[1, 1].axvline(l1.mean(), color="red", linestyle="--",
+                       label=f"Mean={l1.mean():.2f}")
+    axes[1, 1].set_title("L1 norm per sample")
+    axes[1, 1].legend()
+
+    axes[1, 2].hist(l2, bins=50, edgecolor="black")
+    axes[1, 2].axvline(l2.mean(), color="red", linestyle="--",
+                       label=f"Mean={l2.mean():.2f}")
+    axes[1, 2].set_title("L2 norm per sample")
+    axes[1, 2].legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "latent_analysis.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    np.savez(
+        os.path.join(save_dir, "latent_statistics.npz"),
+        mean_activation=mean_act, std_activation=std_act,
+        sparsity_per_sample=sparsity, l0_norm=l0, l1_norm=l1, l2_norm=l2,
+        mean_sparsity=float(sparsity.mean()), mean_l0=float(l0.mean()),
+        mean_l1=float(l1.mean()), mean_l2=float(l2.mean()),
+        latent_dim=D, num_samples=N,
+    )
+    print(f"Latent space analysis saved to {save_dir}")
+
+
+# ── 4. Reconstruction quality ─────────────────────────────────────────────────
+
+def analyze_reconstruction_quality(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_batches: int = 20,
+) -> None:
+    """Per-sample MSE and MAE distributions."""
+    model.eval()
+    mse_list: List[float] = []
+    mae_list: List[float] = []
+
+    print(f"Computing reconstruction metrics on {num_batches} batches...")
+    with torch.no_grad():
+        for i, (images, _) in enumerate(tqdm(data_loader, desc="Recon quality")):
+            if i >= num_batches:
+                break
+            images = images.to(device)
+            recon, _, _ = model(images)
+            mse_list.extend(((images - recon) ** 2).mean(dim=(1, 2, 3)).cpu().numpy())
+            mae_list.extend(torch.abs(images - recon).mean(dim=(1, 2, 3)).cpu().numpy())
+
+    mse = np.array(mse_list)
+    mae = np.array(mae_list)
+    print(f"  Mean MSE={mse.mean():.6f}  Mean MAE={mae.mean():.6f}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].hist(mse, bins=50, edgecolor="black")
+    axes[0].axvline(mse.mean(), color="red", linestyle="--", label=f"Mean={mse.mean():.4f}")
+    axes[0].set_title("MSE distribution"); axes[0].legend()
+
+    axes[1].hist(mae, bins=50, edgecolor="black")
+    axes[1].axvline(mae.mean(), color="red", linestyle="--", label=f"Mean={mae.mean():.4f}")
+    axes[1].set_title("MAE distribution"); axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "reconstruction_metrics.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    np.savez(os.path.join(save_dir, "reconstruction_metrics.npz"), mse=mse, mae=mae)
+    print(f"Reconstruction metrics saved to {save_dir}")
+
+
+# ── 5. Multiple reconstructions ──────────────────────────────────────────────
+
+def visualize_multiple_reconstructions(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 8,
+    num_sets: int = 8,
+    normalized: bool = True,
+) -> None:
+    """Save side-by-side original/reconstruction grids."""
+    recon_dir = os.path.join(save_dir, "multiple_reconstructions")
+    os.makedirs(recon_dir, exist_ok=True)
+
+    model.eval()
+    it = iter(data_loader)
+
+    for set_idx in range(num_sets):
+        try:
+            images, _ = next(it)
+        except StopIteration:
+            it = iter(data_loader)
+            images, _ = next(it)
+
+        images = images[:num_images].to(device)
+        fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2.5, 5))
+
+        with torch.no_grad():
+            recon, _, _ = model(images)
+
+        for i in range(num_images):
+            axes[0, i].imshow(_to_display(images[i:i+1], normalized=normalized))
+            axes[0, i].axis("off")
+            if i == 0:
+                axes[0, i].set_title("Original", fontweight="bold")
+            axes[1, i].imshow(_to_display(recon[i:i+1], normalized=normalized))
+            axes[1, i].axis("off")
+            if i == 0:
+                axes[1, i].set_title("Reconstruction", fontweight="bold")
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(recon_dir, f"set_{set_idx+1:02d}.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  Set {set_idx+1}/{num_sets} saved.")
+
+    print(f"Reconstructions saved to {recon_dir}")
+
+
+# ── 6. Partonomy sparsity suite ───────────────────────────────────────────────
+
+def analyze_partonomy_sparsity(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_batches: int = 30,
+    sparsity_threshold: float = 0.1,
+    ablation_images: int = 16,
+    n_clusters: int = 8,
+) -> None:
+    """Five-part partonomy sparsity suite."""
+    prt_dir = os.path.join(save_dir, "partonomy_sparsity")
     os.makedirs(prt_dir, exist_ok=True)
 
     model.eval()
-
-    # ── Collect latents + per-layer encoder activations ──────────────────────
-    all_latents = []
-    hook_data = {}      # layer_idx -> list of (B, C, H, W) tensors
-    ablation_imgs = None
+    all_latents: List[np.ndarray] = []
+    hook_data: Dict[int, List[torch.Tensor]] = {}
+    ablation_imgs: Optional[torch.Tensor] = None
 
     hooks = []
-    for i, layer in enumerate(model.encoder.conv_layers):
+    for i, stage in enumerate(model.encoder.taxon_stages):
         def _make_hook(idx):
-            def _hook(module, inp, out):
-                # KL layers return (tensor, kl_loss) tuples — unpack
+            def _hook(m, inp, out):
                 t = out[0] if isinstance(out, tuple) else out
                 hook_data.setdefault(idx, []).append(t.detach().cpu())
             return _hook
-        hooks.append(layer.register_forward_hook(_make_hook(i)))
+        hooks.append(stage.register_forward_hook(_make_hook(i)))
 
     print(f"Collecting activations over {num_batches} batches...")
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(tqdm(data_loader, desc='Partonomy data')):
-            if batch_idx >= num_batches:
+        for b_idx, (images, _) in enumerate(tqdm(data_loader, desc="Partonomy data")):
+            if b_idx >= num_batches:
                 break
             images = images.to(device)
-            result = model.encode(images)
-            z = result[0] if isinstance(result, tuple) else result
-            z_np = z.detach().cpu().numpy()
+            z, _ = model.encode(images)
+            z_np = z.cpu().numpy()
             if z_np.ndim > 2:
                 z_np = z_np.reshape(z_np.shape[0], -1)
             all_latents.append(z_np)
@@ -1059,1125 +693,433 @@ def analyze_partonomy_sparsity(model, data_loader, device, save_dir,
     for h in hooks:
         h.remove()
 
-    all_latents = np.concatenate(all_latents, axis=0)   # (N, D)
-    N, D = all_latents.shape
-
-    # Spatially pool hook data
-    layer_acts = {}   # idx -> (N, C)
+    Z = np.concatenate(all_latents, axis=0)
+    N, D = Z.shape
+    stage_acts: Dict[int, np.ndarray] = {}
     for idx, act_list in hook_data.items():
-        pooled = [a.mean(dim=(2, 3)).numpy() for a in act_list]   # each (B, C)
-        layer_acts[idx] = np.concatenate(pooled, axis=0)          # (N, C)
+        pooled = [a.mean(dim=(2, 3)).numpy() for a in act_list]
+        stage_acts[idx] = np.concatenate(pooled, axis=0)
 
-    print(f"  {N} samples, latent dim={D}")
-    for idx, a in sorted(layer_acts.items()):
-        print(f"  Encoder layer {idx+1}: {a.shape[1]} channels")
+    print(f"  {N} samples, latent_dim={D}")
+    binary = (np.abs(Z) > sparsity_threshold).astype(np.float32)
 
-    binary = (np.abs(all_latents) > sparsity_threshold).astype(np.float32)   # (N, D)
-
-    # ── 1. Jaccard activation overlap ─────────────────────────────────────────
+    # 1. Jaccard
     print("  [1/5] Jaccard activation overlap...")
     rng = np.random.default_rng(0)
     n_pairs = min(3000, N * (N - 1) // 2)
-    idx_a = rng.integers(0, N, n_pairs)
-    idx_b = rng.integers(0, N, n_pairs)
-    idx_b[idx_a == idx_b] = (idx_b[idx_a == idx_b] + 1) % N
-
-    inter = (binary[idx_a] * binary[idx_b]).sum(axis=1)
-    union = ((binary[idx_a] + binary[idx_b]) > 0).sum(axis=1).astype(np.float32)
+    ia = rng.integers(0, N, n_pairs)
+    ib = rng.integers(0, N, n_pairs)
+    ib[ia == ib] = (ib[ia == ib] + 1) % N
+    inter = (binary[ia] * binary[ib]).sum(axis=1)
+    union = ((binary[ia] + binary[ib]) > 0).sum(axis=1).astype(np.float32)
     jaccard = np.where(union > 0, inter / union, 0.0)
-
-    lifetime_sparsity = binary.mean(axis=0)   # (D,) – fraction of samples activating each dim
+    lifetime_sp = binary.mean(axis=0)
+    dead = float((lifetime_sp < 0.01).mean())
+    selective = float(((lifetime_sp >= 0.01) & (lifetime_sp < 0.2)).mean())
+    dense = float((lifetime_sp >= 0.5).mean())
+    moderate = 1.0 - dead - selective - dense
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].hist(jaccard, bins=50, edgecolor='black', color='steelblue')
-    axes[0].axvline(jaccard.mean(), color='red', linestyle='--', label=f'Mean={jaccard.mean():.3f}')
-    axes[0].set_xlabel('Jaccard Similarity'); axes[0].set_ylabel('Count')
-    axes[0].set_title('Pairwise Activation Overlap\n(lower = more specialisation)')
-    axes[0].legend()
-
-    axes[1].bar(range(min(D, 200)), sorted(lifetime_sparsity, reverse=True)[:200], color='darkorange')
-    axes[1].set_xlabel('Rank-ordered Feature'); axes[1].set_ylabel('Fraction Active')
-    axes[1].set_title('Lifetime Sparsity per Dim (sorted)')
-
-    dead = float((lifetime_sparsity < 0.01).mean())
-    selective = float(((lifetime_sparsity >= 0.01) & (lifetime_sparsity < 0.2)).mean())
-    dense = float((lifetime_sparsity >= 0.5).mean())
-    moderate = 1.0 - dead - selective - dense
-    axes[2].bar(['Dead\n(<1%)', 'Selective\n(1-20%)', 'Moderate\n(20-50%)', 'Dense\n(>50%)'],
+    axes[0].hist(jaccard, bins=50, edgecolor="black", color="steelblue")
+    axes[0].axvline(jaccard.mean(), color="red", linestyle="--",
+                    label=f"Mean={jaccard.mean():.3f}")
+    axes[0].set_title("Pairwise Activation Overlap"); axes[0].legend()
+    axes[1].bar(range(min(D, 200)), sorted(lifetime_sp, reverse=True)[:200], color="darkorange")
+    axes[1].set_title("Lifetime Sparsity per Dim (sorted)")
+    axes[2].bar(["Dead\n(<1%)", "Selective\n(1-20%)", "Moderate\n(20-50%)", "Dense\n(>50%)"],
                 [v * 100 for v in [dead, selective, moderate, dense]],
-                color=['#d62728', '#2ca02c', '#ff7f0e', '#1f77b4'])
-    axes[2].set_ylabel('% of Features'); axes[2].set_title('Feature Activity Categories')
-    plt.suptitle('1. Activation Overlap & Feature Specialisation', fontweight='bold')
+                color=["#d62728", "#2ca02c", "#ff7f0e", "#1f77b4"])
+    axes[2].set_ylabel("% Features"); axes[2].set_title("Feature Activity Categories")
+    plt.suptitle("1. Activation Overlap & Specialisation", fontweight="bold")
     plt.tight_layout()
-    plt.savefig(os.path.join(prt_dir, '01_jaccard_overlap.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(prt_dir, "01_jaccard_overlap.png"), dpi=150, bbox_inches="tight")
     plt.close()
-    np.savez(os.path.join(prt_dir, '01_jaccard_stats.npz'),
-             jaccard=jaccard, lifetime_sparsity=lifetime_sparsity,
-             mean_jaccard=jaccard.mean(), median_jaccard=float(np.median(jaccard)),
-             dead_frac=dead, selective_frac=selective, dense_frac=dense)
-    print(f"    Mean Jaccard={jaccard.mean():.4f}  dead={dead*100:.1f}%  "
+    np.savez(os.path.join(prt_dir, "01_jaccard_stats.npz"), jaccard=jaccard,
+             lifetime_sparsity=lifetime_sp, dead_frac=dead, selective_frac=selective,
+             dense_frac=dense)
+    print(f"    Jaccard mean={jaccard.mean():.4f}  dead={dead*100:.1f}%  "
           f"selective={selective*100:.1f}%  dense={dense*100:.1f}%")
 
-    # ── 2. Feature selectivity and entropy ────────────────────────────────────
+    # 2. Selectivity
     print("  [2/5] Feature selectivity and entropy...")
-    p = lifetime_sparsity.clip(1e-6, 1 - 1e-6)
-    per_dim_entropy = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))   # bits
-
+    p = lifetime_sp.clip(1e-6, 1 - 1e-6)
+    per_dim_ent = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
     try:
         from scipy.stats import kurtosis as _sp_kurt
-        per_dim_kurtosis = np.array([_sp_kurt(np.abs(all_latents[:, d]), fisher=True)
-                                      for d in range(D)])
+        per_dim_kurt = np.array([_sp_kurt(np.abs(Z[:, d]), fisher=True) for d in range(D)])
     except Exception:
-        per_dim_kurtosis = np.zeros(D)
-
-    per_dim_max  = np.abs(all_latents).max(axis=0)
-    per_dim_mean = np.abs(all_latents).mean(axis=0)
-    selectivity_idx = (per_dim_max - per_dim_mean) / (per_dim_max + per_dim_mean + 1e-8)
-    polysemantic_frac = float((np.abs(p - 0.5) < 0.15).mean())
+        per_dim_kurt = np.zeros(D)
+    per_dim_max  = np.abs(Z).max(axis=0)
+    per_dim_mean = np.abs(Z).mean(axis=0)
+    sel_idx = (per_dim_max - per_dim_mean) / (per_dim_max + per_dim_mean + 1e-8)
+    poly_frac = float((np.abs(p - 0.5) < 0.15).mean())
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes[0, 0].hist(per_dim_entropy, bins=50, edgecolor='black', color='purple')
-    axes[0, 0].axvline(per_dim_entropy.mean(), color='red', linestyle='--',
-                       label=f'Mean={per_dim_entropy.mean():.3f} bits')
-    axes[0, 0].set_xlabel('Binary Entropy (bits)'); axes[0, 0].set_ylabel('Count')
-    axes[0, 0].set_title('Per-Dim Activation Entropy\n(0 bits = maximally selective)')
-    axes[0, 0].legend()
-
-    axes[0, 1].hist(per_dim_kurtosis.clip(-10, 50), bins=50, edgecolor='black', color='teal')
-    axes[0, 1].axvline(per_dim_kurtosis.mean(), color='red', linestyle='--',
-                       label=f'Mean={per_dim_kurtosis.mean():.2f}')
-    axes[0, 1].set_xlabel('Activation Kurtosis (Fisher)'); axes[0, 1].set_ylabel('Count')
-    axes[0, 1].set_title('Per-Dim Kurtosis\n(high = impulse-like / sparse)')
-    axes[0, 1].legend()
-
-    axes[1, 0].hist(selectivity_idx, bins=50, edgecolor='black', color='darkgreen')
-    axes[1, 0].axvline(selectivity_idx.mean(), color='red', linestyle='--',
-                       label=f'Mean={selectivity_idx.mean():.3f}')
-    axes[1, 0].set_xlabel('Selectivity Index (max-mean)/(max+mean)')
-    axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title('Feature Selectivity\n(1.0 = fires for one sample only)')
-    axes[1, 0].legend()
-
-    axes[1, 1].scatter(lifetime_sparsity, per_dim_entropy, alpha=0.3, s=8, c='navy')
-    axes[1, 1].set_xlabel('Lifetime Sparsity (frac. active)')
-    axes[1, 1].set_ylabel('Binary Entropy (bits)')
-    axes[1, 1].set_title(f'Sparsity vs Entropy\nPolysemantic (p≈0.5): {polysemantic_frac*100:.1f}%')
-
-    plt.suptitle('2. Feature Selectivity & Entropy', fontweight='bold')
+    axes[0, 0].hist(per_dim_ent, bins=50, edgecolor="black", color="purple")
+    axes[0, 0].axvline(per_dim_ent.mean(), color="red", linestyle="--",
+                       label=f"Mean={per_dim_ent.mean():.3f} bits")
+    axes[0, 0].set_title("Per-Dim Activation Entropy"); axes[0, 0].legend()
+    axes[0, 1].hist(per_dim_kurt.clip(-10, 50), bins=50, edgecolor="black", color="teal")
+    axes[0, 1].axvline(per_dim_kurt.mean(), color="red", linestyle="--",
+                       label=f"Mean={per_dim_kurt.mean():.2f}")
+    axes[0, 1].set_title("Per-Dim Kurtosis"); axes[0, 1].legend()
+    axes[1, 0].hist(sel_idx, bins=50, edgecolor="black", color="darkgreen")
+    axes[1, 0].axvline(sel_idx.mean(), color="red", linestyle="--",
+                       label=f"Mean={sel_idx.mean():.3f}")
+    axes[1, 0].set_title("Feature Selectivity Index"); axes[1, 0].legend()
+    axes[1, 1].scatter(lifetime_sp, per_dim_ent, alpha=0.3, s=8, c="navy")
+    axes[1, 1].set_title(f"Sparsity vs Entropy  (poly~{poly_frac*100:.1f}%)")
+    plt.suptitle("2. Feature Selectivity & Entropy", fontweight="bold")
     plt.tight_layout()
-    plt.savefig(os.path.join(prt_dir, '02_feature_selectivity.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(prt_dir, "02_feature_selectivity.png"), dpi=150, bbox_inches="tight")
     plt.close()
-    np.savez(os.path.join(prt_dir, '02_selectivity_stats.npz'),
-             per_dim_entropy=per_dim_entropy, per_dim_kurtosis=per_dim_kurtosis,
-             selectivity_idx=selectivity_idx, polysemantic_frac=polysemantic_frac,
-             mean_entropy=float(per_dim_entropy.mean()),
-             mean_kurtosis=float(per_dim_kurtosis.mean()))
-    print(f"    Mean entropy={per_dim_entropy.mean():.4f} bits  "
-          f"mean kurtosis={per_dim_kurtosis.mean():.3f}  "
-          f"polysemantic={polysemantic_frac*100:.1f}%")
+    np.savez(os.path.join(prt_dir, "02_selectivity_stats.npz"),
+             per_dim_entropy=per_dim_ent, per_dim_kurtosis=per_dim_kurt,
+             selectivity_idx=sel_idx, polysemantic_frac=poly_frac)
 
-    # ── 3. Causal unit ablations ──────────────────────────────────────────────
+    # 3. Ablations
     print("  [3/5] Causal ablation analysis...")
-    ablation_imgs = ablation_imgs.to(device)
+    if ablation_imgs is not None:
+        ablation_imgs = ablation_imgs.to(device)
+        with torch.no_grad():
+            z_orig, _ = model.encode(ablation_imgs)
+            spatial = (z_orig.ndim == 4)
+            n_units = z_orig.shape[1]
+            base_recon, _, _ = model(ablation_imgs)
+            if base_recon.shape[2:] != ablation_imgs.shape[2:]:
+                base_recon = F.interpolate(base_recon, size=ablation_imgs.shape[2:],
+                                           mode="bilinear", align_corners=False)
+            base_mse = ((ablation_imgs - base_recon) ** 2).mean(dim=(1, 2, 3))
 
-    with torch.no_grad():
-        result_abl = model.encode(ablation_imgs)
-        z_orig = result_abl[0] if isinstance(result_abl, tuple) else result_abl
-        spatial = (z_orig.ndim == 4)          # True if (B, C, H, W)
-        n_units = z_orig.shape[1]             # channels to ablate
-
-        # Baseline reconstruction
-        base_recon = model(ablation_imgs)
-        if isinstance(base_recon, (tuple, list)):
-            base_recon = base_recon[0]
-        if base_recon.shape[2:] != ablation_imgs.shape[2:]:
-            base_recon = F.interpolate(base_recon, size=ablation_imgs.shape[2:],
-                                       mode='bilinear', align_corners=False)
-        base_mse = ((ablation_imgs - base_recon) ** 2).mean(dim=(1, 2, 3))
-
-        # Active units across ablation images
-        if spatial:
-            unit_active = (z_orig.abs().mean(dim=(2, 3)) > sparsity_threshold).cpu().numpy()
-        else:
-            unit_active = (z_orig.abs() > sparsity_threshold).cpu().numpy()
-        candidate_units = np.where(unit_active.any(axis=0))[0]
-
-        if len(candidate_units) > 256:
-            mean_act_per_unit = (z_orig.abs().mean(dim=(2, 3)) if spatial
-                                 else z_orig.abs()).mean(dim=0).cpu().numpy()
-            candidate_units = candidate_units[
-                np.argsort(-mean_act_per_unit[candidate_units])[:256]]
-
-        print(f"    Ablating {len(candidate_units)} active units of {n_units} total...")
-        unit_importance = np.zeros(n_units)
-
-        for d in candidate_units:
-            z_abl = z_orig.clone()
             if spatial:
-                z_abl[:, d, :, :] = 0.0
+                unit_active = (z_orig.abs().mean(dim=(2, 3)) > sparsity_threshold).cpu().numpy()
             else:
+                unit_active = (z_orig.abs() > sparsity_threshold).cpu().numpy()
+            candidates = np.where(unit_active.any(axis=0))[0]
+            if len(candidates) > 256:
+                ma = (z_orig.abs().mean(dim=(2, 3)) if spatial else z_orig.abs()).mean(0).cpu().numpy()
+                candidates = candidates[np.argsort(-ma[candidates])[:256]]
+
+            print(f"    Ablating {len(candidates)}/{n_units} units...")
+            importance = np.zeros(n_units)
+            for d in candidates:
+                z_abl = z_orig.clone()
                 z_abl[:, d] = 0.0
+                recon_abl, _ = model.decode(z_abl)
+                if recon_abl.shape[2:] != ablation_imgs.shape[2:]:
+                    recon_abl = F.interpolate(recon_abl, size=ablation_imgs.shape[2:],
+                                              mode="bilinear", align_corners=False)
+                delta = ((ablation_imgs - recon_abl) ** 2).mean(dim=(1, 2, 3))
+                importance[d] = (delta - base_mse).clamp(min=0).mean().item()
 
-            if hasattr(model, 'decode'):
-                recon_abl = model.decode(z_abl)
-            else:
-                recon_abl = model.decoder(z_abl)
-            if isinstance(recon_abl, (tuple, list)):
-                recon_abl = recon_abl[0]
-            if recon_abl.shape[2:] != ablation_imgs.shape[2:]:
-                recon_abl = F.interpolate(recon_abl, size=ablation_imgs.shape[2:],
-                                          mode='bilinear', align_corners=False)
-            delta = ((ablation_imgs - recon_abl) ** 2).mean(dim=(1, 2, 3))
-            unit_importance[d] = (delta - base_mse).clamp(min=0).mean().item()
+        sorted_imp = np.sort(importance[importance > 0])[::-1]
+        total_imp = sorted_imp.sum()
+        cumulative = np.cumsum(sorted_imp) / (total_imp + 1e-12)
+        p50 = int(np.searchsorted(cumulative, 0.5)) + 1 if total_imp > 0 else 0
+        p90 = int(np.searchsorted(cumulative, 0.9)) + 1 if total_imp > 0 else 0
 
-    sorted_imp = np.sort(unit_importance[unit_importance > 0])[::-1]
-    total_imp = sorted_imp.sum()
-    cumulative = np.cumsum(sorted_imp) / (total_imp + 1e-12)
-    p50 = int(np.searchsorted(cumulative, 0.5)) + 1 if total_imp > 0 else 0
-    p90 = int(np.searchsorted(cumulative, 0.9)) + 1 if total_imp > 0 else 0
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        show_n = min(50, len(sorted_imp))
+        axes[0].bar(range(show_n), sorted_imp[:show_n], color="firebrick")
+        axes[0].set_title(f"Top-{show_n} Units by Ablation Importance")
+        axes[1].hist(sorted_imp, bins=40, edgecolor="black", color="salmon")
+        if len(sorted_imp):
+            axes[1].axvline(sorted_imp.mean(), color="blue", linestyle="--",
+                            label=f"Mean={sorted_imp.mean():.5f}")
+        axes[1].set_title("Ablation Importance Distribution"); axes[1].legend()
+        if len(sorted_imp):
+            axes[2].plot(range(1, len(sorted_imp) + 1), cumulative * 100, color="darkblue")
+            axes[2].axvline(p50, color="orange", linestyle="--", label=f"50% in top-{p50}")
+            axes[2].axvline(p90, color="red",    linestyle="--", label=f"90% in top-{p90}")
+        axes[2].set_title("Cumulative Importance"); axes[2].legend()
+        plt.suptitle("3. Causal Ablation: Unit Indispensability", fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(os.path.join(prt_dir, "03_causal_ablations.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+        np.savez(os.path.join(prt_dir, "03_ablation_importance.npz"),
+                 unit_importance=importance, p50_units=p50, p90_units=p90)
+        print(f"    50% importance in top-{p50};  90% in top-{p90}")
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    show_n = min(50, len(sorted_imp))
-    axes[0].bar(range(show_n), sorted_imp[:show_n], color='firebrick')
-    axes[0].set_xlabel('Unit (rank)'); axes[0].set_ylabel('Mean MSE Increase')
-    axes[0].set_title(f'Top-{show_n} Units by Ablation Importance')
-
-    axes[1].hist(sorted_imp, bins=40, edgecolor='black', color='salmon')
-    if len(sorted_imp):
-        axes[1].axvline(sorted_imp.mean(), color='blue', linestyle='--',
-                        label=f'Mean={sorted_imp.mean():.5f}')
-    axes[1].set_xlabel('MSE Increase when Zeroed'); axes[1].set_ylabel('Count')
-    axes[1].set_title('Ablation Importance Distribution'); axes[1].legend()
-
-    if len(sorted_imp):
-        axes[2].plot(range(1, len(sorted_imp) + 1), cumulative * 100, color='darkblue')
-        axes[2].axvline(p50, color='orange', linestyle='--', label=f'50% in top-{p50}')
-        axes[2].axvline(p90, color='red',    linestyle='--', label=f'90% in top-{p90}')
-    axes[2].set_xlabel('Number of Units'); axes[2].set_ylabel('Cumulative Importance (%)')
-    axes[2].set_title('Cumulative Ablation Importance\n(concentrated vs. distributed)')
-    axes[2].legend()
-
-    plt.suptitle('3. Causal Ablation: Unit Indispensability', fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(prt_dir, '03_causal_ablations.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    np.savez(os.path.join(prt_dir, '03_ablation_importance.npz'),
-             unit_importance=unit_importance,
-             top_units=np.argsort(-unit_importance)[:50],
-             p50_units=p50, p90_units=p90)
-    print(f"    50% importance in top-{p50} units;  90% in top-{p90} units")
-
-    # ── 4. Cross-layer sparsity dependency ────────────────────────────────────
-    print("  [4/5] Cross-layer sparsity dependency...")
-    enc_indices = sorted(layer_acts.keys())
-    n_enc = len(enc_indices)
-
-    if n_enc >= 2:
+    # 4. Cross-stage dependency
+    print("  [4/5] Cross-stage sparsity dependency...")
+    stage_indices = sorted(stage_acts.keys())
+    n_st = len(stage_indices)
+    if n_st >= 2:
         max_ch = 64
-        layer_bin = {}
-        for idx in enc_indices:
-            a = layer_acts[idx]
+        stage_bin: Dict[int, np.ndarray] = {}
+        for idx in stage_indices:
+            a = stage_acts[idx]
             thr = sparsity_threshold * np.abs(a).mean()
-            layer_bin[idx] = (np.abs(a) > thr).astype(np.float32)
-
-        n_pairs = n_enc - 1
+            stage_bin[idx] = (np.abs(a) > thr).astype(np.float32)
+        n_pairs = n_st - 1
         fig, axes = plt.subplots(1, n_pairs, figsize=(8 * n_pairs, 7), squeeze=False)
-        dep_sparsities = []
-
-        for pi, (l1, l2) in enumerate(zip(enc_indices[:-1], enc_indices[1:])):
-            B1 = layer_bin[l1][:, :min(layer_bin[l1].shape[1], max_ch)]
-            B2 = layer_bin[l2][:, :min(layer_bin[l2].shape[1], max_ch)]
+        dep_sp_list = []
+        for pi, (s1, s2) in enumerate(zip(stage_indices[:-1], stage_indices[1:])):
+            B1 = stage_bin[s1][:, :min(stage_bin[s1].shape[1], max_ch)]
+            B2 = stage_bin[s2][:, :min(stage_bin[s2].shape[1], max_ch)]
             sup1 = B1.sum(axis=0) + 1e-8
             M = (B1.T @ B2) / sup1[:, None]
             dep_sp = float((M < 0.1).mean())
-            dep_sparsities.append(dep_sp)
-
+            dep_sp_list.append(dep_sp)
             ax = axes[0, pi]
-            im = ax.imshow(M, aspect='auto', cmap='hot', vmin=0, vmax=1)
+            im = ax.imshow(M, aspect="auto", cmap="hot", vmin=0, vmax=1)
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_xlabel(f'Layer {l2+1} channels')
-            ax.set_ylabel(f'Layer {l1+1} channels')
-            ax.set_title(f'Layer {l1+1}→{l2+1} Cond. Co-activation\n'
-                         f'Dep. sparsity: {dep_sp*100:.1f}% near-zero')
-
-        plt.suptitle('4. Cross-Layer Sparsity Dependency', fontweight='bold')
+            ax.set_xlabel(f"Stage {s2+1} channels")
+            ax.set_ylabel(f"Stage {s1+1} channels")
+            ax.set_title(f"Stage {s1+1}->{s2+1}  dep={dep_sp*100:.1f}%")
+        plt.suptitle("4. Cross-Stage Sparsity Dependency", fontweight="bold")
         plt.tight_layout()
-        plt.savefig(os.path.join(prt_dir, '04_cross_layer_dependency.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(prt_dir, "04_cross_stage_dependency.png"),
+                    dpi=150, bbox_inches="tight")
         plt.close()
-        np.savez(os.path.join(prt_dir, '04_dependency_stats.npz'),
-                 dep_sparsity_per_pair=np.array(dep_sparsities),
-                 mean_dep_sparsity=float(np.mean(dep_sparsities)))
-        print(f"    Mean cross-layer dep. sparsity: {np.mean(dep_sparsities)*100:.1f}%")
+        np.savez(os.path.join(prt_dir, "04_dependency_stats.npz"),
+                 dep_sparsity_per_pair=np.array(dep_sp_list))
+        print(f"    Mean dep. sparsity: {np.mean(dep_sp_list)*100:.1f}%")
     else:
-        print("    Skipping cross-layer analysis (<2 encoder layers captured).")
+        print("    Skipping (<2 stages captured).")
 
-    # ── 5. Cluster active dimensions ──────────────────────────────────────────
+    # 5. Clustering
     print("  [5/5] Clustering latent dimensions...")
     try:
         from sklearn.cluster import KMeans
-        from sklearn.metrics import silhouette_score
         from sklearn.decomposition import PCA as _PCA
+        from sklearn.metrics import silhouette_score
         _sklearn_ok = True
     except ImportError:
         _sklearn_ok = False
-        print("    sklearn not available; skipping clustering.")
+        print("    sklearn not available; skipping.")
 
     if _sklearn_ok and N >= n_clusters * 5:
         n_pca = min(50, D, N - 1)
-        X = all_latents
-        if D > n_pca:
-            X = _PCA(n_components=n_pca).fit_transform(X)
+        X = Z if D <= n_pca else _PCA(n_components=n_pca).fit_transform(Z)
         km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
         labels = km.fit_predict(X)
         sil = float(silhouette_score(X, labels)) if len(np.unique(labels)) > 1 else 0.0
-
+        cluster_sizes = np.bincount(labels, minlength=n_clusters)
         cluster_mean = np.zeros((n_clusters, D))
         for c in range(n_clusters):
             m = labels == c
             if m.sum() > 0:
-                cluster_mean[c] = np.abs(all_latents[m]).mean(axis=0)
-
+                cluster_mean[c] = np.abs(Z[m]).mean(axis=0)
         exclusivity = cluster_mean.max(axis=0) / (cluster_mean.sum(axis=0) + 1e-8)
-        cluster_sizes = np.bincount(labels, minlength=n_clusters)
         n_show = min(D, 64)
         top_dims = np.argsort(-cluster_mean.mean(axis=0))[:n_show]
-
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        axes[0].bar(range(n_clusters), cluster_sizes, color='steelblue')
-        axes[0].set_xlabel('Cluster'); axes[0].set_ylabel('Samples')
-        axes[0].set_title(f'Cluster Sizes  (Silhouette={sil:.3f})')
-
-        im = axes[1].imshow(cluster_mean[:, top_dims], aspect='auto', cmap='viridis')
+        axes[0].bar(range(n_clusters), cluster_sizes, color="steelblue")
+        axes[0].set_title(f"Cluster Sizes (Silhouette={sil:.3f})")
+        im = axes[1].imshow(cluster_mean[:, top_dims], aspect="auto", cmap="viridis")
         plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-        axes[1].set_xlabel(f'Top-{n_show} Features'); axes[1].set_ylabel('Cluster')
-        axes[1].set_title('Cluster × Feature Activation')
-
-        axes[2].hist(exclusivity, bins=40, edgecolor='black', color='darkorange')
-        axes[2].axvline(exclusivity.mean(), color='red', linestyle='--',
-                        label=f'Mean={exclusivity.mean():.3f}')
-        axes[2].set_xlabel('Exclusivity (max_c / sum_c)'); axes[2].set_ylabel('Count')
-        axes[2].set_title('Per-Dim Cluster Exclusivity\n(1.0 = used by one cluster only)')
-        axes[2].legend()
-
-        plt.suptitle('5. Latent Dimension Clustering & Alignment', fontweight='bold')
+        axes[1].set_title(f"Cluster x Feature (top-{n_show})")
+        axes[2].hist(exclusivity, bins=40, edgecolor="black", color="darkorange")
+        axes[2].axvline(exclusivity.mean(), color="red", linestyle="--",
+                        label=f"Mean={exclusivity.mean():.3f}")
+        axes[2].set_title("Per-Dim Cluster Exclusivity"); axes[2].legend()
+        plt.suptitle("5. Latent Dimension Clustering", fontweight="bold")
         plt.tight_layout()
-        plt.savefig(os.path.join(prt_dir, '05_dimension_clustering.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(prt_dir, "05_dimension_clustering.png"),
+                    dpi=150, bbox_inches="tight")
         plt.close()
-        np.savez(os.path.join(prt_dir, '05_cluster_stats.npz'),
-                 labels=labels, cluster_sizes=cluster_sizes, silhouette=sil,
-                 exclusivity=exclusivity, mean_exclusivity=float(exclusivity.mean()),
-                 cluster_mean_acts=cluster_mean)
+        np.savez(os.path.join(prt_dir, "05_cluster_stats.npz"),
+                 labels=labels, cluster_sizes=cluster_sizes,
+                 silhouette=sil, exclusivity=exclusivity)
         print(f"    Silhouette={sil:.4f}  mean exclusivity={exclusivity.mean():.4f}")
 
     print(f"Partonomy sparsity analysis saved to {prt_dir}")
 
 
-def analyze_weight_sparsity(model, save_dir):
-    """Analyse the sparsity and structure of learned filter weights.
+# ── 7. Stage activation maps ──────────────────────────────────────────────────
 
-    Per taxonomic layer:
-      a. Leaf filter diversity  – pairwise cosine similarity between leaf filters.
-      b. Spatial concentration  – Gini coefficient of absolute weight magnitudes.
-      c. Parent-child similarity – cosine similarity between a parent and each child
-                                   filter, measures how much the tree structure
-                                   forces filters to inherit from parents.
-    """
-    wt_dir = os.path.join(save_dir, 'weight_sparsity')
-    os.makedirs(wt_dir, exist_ok=True)
+def visualize_stage_activations(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 3,
+    normalized: bool = True,
+) -> None:
+    """For a few images, save feature-map grids at each encoder stage."""
+    act_dir = os.path.join(save_dir, "stage_activations")
+    os.makedirs(act_dir, exist_ok=True)
 
-    all_layer_data = []
-    for i, layer in enumerate(model.encoder.conv_layers):
-        if _is_any_taxon_layer(layer):
-            all_layer_data.append((f'enc{i+1}', layer))
-    for i, layer in enumerate(model.decoder.deconv_layers):
-        if _is_any_taxon_layer(layer):
-            all_layer_data.append((f'dec{i+1}', layer))
-
-    if not all_layer_data:
-        print("No taxonomic layers found; skipping weight sparsity analysis.")
-        return
-
-    def _gini(arr):
-        arr = np.abs(arr).flatten()
-        arr = np.sort(arr)
-        n = len(arr)
-        if n == 0 or arr.sum() == 0:
-            return 0.0
-        index = np.arange(1, n + 1)
-        return (2 * (index * arr).sum() - (n + 1) * arr.sum()) / (n * arr.sum())
-
-    results = {}
-    for layer_key, layer in all_layer_data:
-        for sub_layer, h_idx in _get_sub_layers(layer):
-            key = f"{layer_key}_h{h_idx:02d}"
-            is_classic_deconv = isinstance(sub_layer, TaxonDeconv)
-            is_resnet = isinstance(sub_layer, (TaxonConv, TaxonDeconv))
-            is_resnet_deconv = isinstance(sub_layer, TaxonDeconv)
-            weights = sub_layer.get_hierarchy_weights()   # list, root → leaves
-            n_levels = len(weights)
-
-            # ── a. Leaf filter diversity ──────────────────────────────────────
-            leaf_w = weights[-1].detach().cpu().numpy()
-            if is_resnet_deconv:
-                # Resnet deconv: weight shape (in_ch, out_ch*2^i, k, k)
-                # Transpose to (out_ch*2^i, in_ch, k, k) and treat each as a node
-                leaf_w = leaf_w.transpose(1, 0, 2, 3)
-                n_leaves = leaf_w.shape[0]
-            elif is_classic_deconv:
-                n_leaves = 2 ** sub_layer.n_layers
-                oc = sub_layer.out_channels
-                leaf_w = leaf_w.transpose(1, 0, 2, 3)
-                leaf_w = leaf_w.reshape(n_leaves, oc,
-                                        sub_layer.in_channels,
-                                        leaf_w.shape[-2], leaf_w.shape[-1])
-                leaf_w = leaf_w.mean(axis=1)
-            else:
-                n_leaves = leaf_w.shape[0]
-
-            leaf_flat = leaf_w.reshape(n_leaves, -1)
-            norms = np.linalg.norm(leaf_flat, axis=1, keepdims=True) + 1e-8
-            cos_mat = (leaf_flat / norms) @ (leaf_flat / norms).T
-            off_diag = cos_mat[np.triu_indices(n_leaves, k=1)]
-
-            # ── b. Spatial concentration (Gini) per leaf filter ───────────────
-            gini_vals = np.array([_gini(leaf_flat[i]) for i in range(n_leaves)])
-
-            # ── c. Parent-child cosine similarity ────────────────────────────
-            pc_sims = []
-            for lv in range(1, n_levels):
-                pw = weights[lv - 1].detach().cpu().numpy()
-                cw = weights[lv].detach().cpu().numpy()
-                if is_resnet_deconv:
-                    # Resnet deconv: transpose to get nodes in first dim
-                    pf = pw.transpose(1, 0, 2, 3)
-                    cf = cw.transpose(1, 0, 2, 3)
-                    n_p = pf.shape[0]
-                    n_c = cf.shape[0]
-                    pf = pf.reshape(n_p, -1)
-                    cf = cf.reshape(n_c, -1)
-                elif is_classic_deconv:
-                    n_p = 2 ** (lv - 1)
-                    n_c = 2 ** lv
-                    oc = sub_layer.out_channels
-                    ic = sub_layer.in_channels
-                    def _reshape(w, n_nodes):
-                        w = w.transpose(1, 0, 2, 3)
-                        w = w.reshape(n_nodes, oc, ic, w.shape[-2], w.shape[-1])
-                        return w.mean(axis=1).reshape(n_nodes, -1)
-                    pf = _reshape(pw, n_p)
-                    cf = _reshape(cw, n_c)
-                else:
-                    n_p = pw.shape[0]
-                    n_c = cw.shape[0]
-                    pf = pw.reshape(n_p, -1)
-                    cf = cw.reshape(n_c, -1)
-                p_norm = pf / (np.linalg.norm(pf, axis=1, keepdims=True) + 1e-8)
-                c_norm = cf / (np.linalg.norm(cf, axis=1, keepdims=True) + 1e-8)
-                if p_norm.shape[1] != c_norm.shape[1]:
-                    # Flattened feature dims differ between levels; skip this pair
-                    continue
-                for pi in range(n_p):
-                    c0, c1 = pi * 2, pi * 2 + 1
-                    if c1 < n_c:
-                        pc_sims.append(float(p_norm[pi] @ c_norm[c0]))
-                        pc_sims.append(float(p_norm[pi] @ c_norm[c1]))
-            pc_sims = np.array(pc_sims)
-
-            results[key] = dict(
-                n_leaves=n_leaves, n_levels=n_levels,
-                leaf_cosine_offdiag=off_diag, mean_leaf_cosine=float(off_diag.mean()),
-                gini_per_filter=gini_vals,   mean_gini=float(gini_vals.mean()),
-                parent_child_sims=pc_sims,
-                mean_pc_sim=float(pc_sims.mean()) if len(pc_sims) else float('nan'),
-            )
-            print(f"    {key}: n_leaves={n_leaves}  leaf_cosine={off_diag.mean():.4f}  "
-                  f"gini={gini_vals.mean():.4f}  pc_sim={results[key]['mean_pc_sim']:.4f}")
-
-    keys = list(results.keys())
-    n_k = len(keys)
-    if n_k == 0:
-        return
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    cos_means = [results[k]['mean_leaf_cosine'] for k in keys]
-    axes[0, 0].bar(range(n_k), cos_means, color='steelblue')
-    axes[0, 0].set_xticks(range(n_k)); axes[0, 0].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
-    axes[0, 0].set_ylabel('Mean Cosine'); axes[0, 0].axhline(0, color='k', lw=0.5)
-    axes[0, 0].set_title('Leaf Filter Diversity\n(lower = more independent)')
-
-    gini_means = [results[k]['mean_gini'] for k in keys]
-    axes[0, 1].bar(range(n_k), gini_means, color='darkorange')
-    axes[0, 1].set_xticks(range(n_k)); axes[0, 1].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
-    axes[0, 1].set_ylabel('Mean Gini'); axes[0, 1].set_title('Spatial Concentration\n(higher = more localised)')
-
-    pc_means = [results[k]['mean_pc_sim'] for k in keys]
-    axes[0, 2].bar(range(n_k), [v if not np.isnan(v) else 0 for v in pc_means], color='mediumpurple')
-    axes[0, 2].set_xticks(range(n_k)); axes[0, 2].set_xticklabels(keys, rotation=40, ha='right', fontsize=8)
-    axes[0, 2].set_ylabel('Mean Cosine'); axes[0, 2].set_title('Parent-Child Filter Similarity\n(lower = more differentiation)')
-
-    k0 = keys[0]
-    axes[1, 0].hist(results[k0]['leaf_cosine_offdiag'], bins=30, edgecolor='black', color='steelblue')
-    axes[1, 0].axvline(results[k0]['mean_leaf_cosine'], color='red', linestyle='--',
-                       label=f"Mean={results[k0]['mean_leaf_cosine']:.3f}")
-    axes[1, 0].set_xlabel('Cosine Similarity'); axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title(f'Leaf Pairwise Cosine Dist. ({k0})'); axes[1, 0].legend()
-
-    axes[1, 1].hist(results[k0]['gini_per_filter'], bins=30, edgecolor='black', color='darkorange')
-    axes[1, 1].axvline(results[k0]['mean_gini'], color='red', linestyle='--',
-                       label=f"Mean={results[k0]['mean_gini']:.3f}")
-    axes[1, 1].set_xlabel('Gini Coefficient'); axes[1, 1].set_ylabel('Count')
-    axes[1, 1].set_title(f'Filter Spatial Concentration ({k0})'); axes[1, 1].legend()
-
-    pcs = results[k0]['parent_child_sims']
-    if len(pcs):
-        axes[1, 2].hist(pcs, bins=30, edgecolor='black', color='mediumpurple')
-        axes[1, 2].axvline(pcs.mean(), color='red', linestyle='--', label=f'Mean={pcs.mean():.3f}')
-        axes[1, 2].set_xlabel('Parent-Child Cosine'); axes[1, 2].set_ylabel('Count')
-        axes[1, 2].set_title(f'Parent-Child Similarity Dist. ({k0})'); axes[1, 2].legend()
-    axes[1, 2].axis('on')
-
-    plt.suptitle('Weight Sparsity & Filter Structure Analysis', fontweight='bold', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(os.path.join(wt_dir, 'weight_sparsity_summary.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    for k, v in results.items():
-        np.savez(os.path.join(wt_dir, f'{k}_weight_stats.npz'),
-                 **{kk: vv for kk, vv in v.items() if isinstance(vv, (np.ndarray, float, int))})
-
-    print(f"Weight sparsity analysis saved to {wt_dir}")
-
-
-def analyze_latent_sparsity(model, data_loader, device, save_dir, num_batches=50):
-    """Analyze sparsity and statistics of the latent space."""
-    
     model.eval()
-    all_latents = []
-    
-    print(f"Encoding {num_batches} batches for latent space analysis...")
-    with torch.no_grad():
-        for i, (images, _) in enumerate(tqdm(data_loader)):
-            if i >= num_batches:
-                break
-            images = images.to(device)
-            result = model.encode(images)
-            # Handle tuple return (latents, kl) from KL layers
-            if isinstance(result, tuple):
-                latents = result[0]
-            else:
-                latents = result
-            all_latents.append(latents.cpu().numpy())
-    
-    all_latents = np.concatenate(all_latents, axis=0)
-    print(f"Collected {all_latents.shape[0]} latent vectors")
-    
-    # Handle spatial latent representations (flatten if needed)
-    if all_latents.ndim > 2:
-        print(f"Spatial latent shape detected: {all_latents.shape}")
-        batch_size = all_latents.shape[0]
-        all_latents = all_latents.reshape(batch_size, -1)
-        print(f"Flattened to: {all_latents.shape}")
-    
-    # Compute statistics
-    mean_activation = np.mean(np.abs(all_latents), axis=0)
-    std_activation = np.std(all_latents, axis=0)
-    
-    # Sparsity metrics
-    sparsity_per_sample = np.mean(np.abs(all_latents) < 0.1, axis=1)
-    mean_sparsity = np.mean(sparsity_per_sample)
-    
-    # L0 norm (number of non-zero/significant activations)
-    l0_norm = np.sum(np.abs(all_latents) > 0.1, axis=1)
-    mean_l0 = np.mean(l0_norm)
-    
-    # L1 and L2 norms
-    l1_norm = np.sum(np.abs(all_latents), axis=1)
-    l2_norm = np.sqrt(np.sum(all_latents**2, axis=1))
-    
-    print(f"\nLatent Space Statistics:")
-    print(f"  Average sparsity: {mean_sparsity:.4f} (fraction near-zero)")
-    print(f"  Average L0 norm: {mean_l0:.2f} active dimensions")
-    print(f"  Average L1 norm: {np.mean(l1_norm):.4f}")
-    print(f"  Average L2 norm: {np.mean(l2_norm):.4f}")
-    
-    # Save statistics
-    stats = {
-        'mean_sparsity': float(mean_sparsity),
-        'mean_l0': float(mean_l0),
-        'mean_l1': float(np.mean(l1_norm)),
-        'mean_l2': float(np.mean(l2_norm)),
-        'latent_dim': all_latents.shape[1],
-        'num_samples': all_latents.shape[0]
-    }
-    
-    np.savez(
-        os.path.join(save_dir, 'latent_statistics.npz'),
-        all_latents=all_latents,
-        mean_activation=mean_activation,
-        std_activation=std_activation,
-        sparsity_per_sample=sparsity_per_sample,
-        l0_norm=l0_norm,
-        l1_norm=l1_norm,
-        l2_norm=l2_norm,
-        **stats
-    )
-    
-    # Visualizations
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Mean activation per dimension
-    axes[0, 0].bar(range(len(mean_activation)), mean_activation)
-    axes[0, 0].set_xlabel('Latent Dimension')
-    axes[0, 0].set_ylabel('Mean |Activation|')
-    axes[0, 0].set_title('Mean Activation per Dimension')
-    
-    # Std activation per dimension
-    axes[0, 1].bar(range(len(std_activation)), std_activation)
-    axes[0, 1].set_xlabel('Latent Dimension')
-    axes[0, 1].set_ylabel('Std Activation')
-    axes[0, 1].set_title('Activation Std per Dimension')
-    
-    # Sparsity distribution
-    axes[0, 2].hist(sparsity_per_sample, bins=50, edgecolor='black')
-    axes[0, 2].axvline(mean_sparsity, color='red', linestyle='--', label=f'Mean: {mean_sparsity:.3f}')
-    axes[0, 2].set_xlabel('Sparsity (fraction near-zero)')
-    axes[0, 2].set_ylabel('Count')
-    axes[0, 2].set_title('Sparsity Distribution')
-    axes[0, 2].legend()
-    
-    # L0 norm distribution
-    axes[1, 0].hist(l0_norm, bins=50, edgecolor='black')
-    axes[1, 0].axvline(mean_l0, color='red', linestyle='--', label=f'Mean: {mean_l0:.1f}')
-    axes[1, 0].set_xlabel('L0 Norm (active dimensions)')
-    axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title('L0 Norm Distribution')
-    axes[1, 0].legend()
-    
-    # L1 norm distribution
-    axes[1, 1].hist(l1_norm, bins=50, edgecolor='black')
-    axes[1, 1].axvline(np.mean(l1_norm), color='red', linestyle='--', label=f'Mean: {np.mean(l1_norm):.2f}')
-    axes[1, 1].set_xlabel('L1 Norm')
-    axes[1, 1].set_ylabel('Count')
-    axes[1, 1].set_title('L1 Norm Distribution')
-    axes[1, 1].legend()
-    
-    # L2 norm distribution
-    axes[1, 2].hist(l2_norm, bins=50, edgecolor='black')
-    axes[1, 2].axvline(np.mean(l2_norm), color='red', linestyle='--', label=f'Mean: {np.mean(l2_norm):.2f}')
-    axes[1, 2].set_xlabel('L2 Norm')
-    axes[1, 2].set_ylabel('Count')
-    axes[1, 2].set_title('L2 Norm Distribution')
-    axes[1, 2].legend()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'latent_analysis.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Latent space analysis saved to {save_dir}")
-
-
-def visualize_multiple_reconstructions(model, data_loader, device, save_dir, num_images=8, num_reconstructions=8):
-    """Visualize reconstructions for multiple sets of images in grids (originals on top, reconstructions below)."""
-    
-    model.eval()
-    
-    # Create subdirectory for reconstructions
-    recon_dir = os.path.join(save_dir, 'multiple_reconstructions')
-    os.makedirs(recon_dir, exist_ok=True)
-    
-    # Get multiple batches to create multiple sets
-    data_iter = iter(data_loader)
-    
-    # Create num_reconstructions sets (each with num_images images)
-    for set_idx in range(num_reconstructions):
-        try:
-            images, _ = next(data_iter)
-        except StopIteration:
-            # Reset iterator if we run out
-            data_iter = iter(data_loader)
-            images, _ = next(data_iter)
-        
-        images = images[:num_images].to(device)
-        
-        # Create figure: 2 rows (originals + reconstructions), num_images columns
-        fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2.5, 5))
-        
-        with torch.no_grad():
-            for i in range(num_images):
-                img = images[i:i+1]
-                
-                # Original image (denormalize based on output_activation)
-                img_display = _to_display(img, model)
-                axes[0, i].imshow(img_display)
-                axes[0, i].axis('off')
-                if i == 0:
-                    axes[0, i].set_title('Original', fontsize=12, fontweight='bold')
-                
-                # Generate single reconstruction
-                reconstructed = model(img)
-                if isinstance(reconstructed, (tuple, list)):
-                    reconstructed = reconstructed[0]
-                recon_display = _to_display(reconstructed, model)
-                axes[1, i].imshow(recon_display)
-                axes[1, i].axis('off')
-                if i == 0:
-                    axes[1, i].set_title('Reconstruction', fontsize=12, fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(recon_dir, f'reconstructions_set_{set_idx+1}.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  Saved reconstruction set {set_idx+1}/{num_reconstructions} with {num_images} images")
-    
-    print(f"Reconstructions saved to {recon_dir}")
-
-
-def analyze_reconstruction_quality(model, data_loader, device, save_dir, num_batches=20):
-    """Analyze reconstruction quality metrics."""
-    
-    model.eval()
-    mse_losses = []
-    mae_losses = []
-    
-    print(f"Computing reconstruction metrics on {num_batches} batches...")
-    with torch.no_grad():
-        for i, (images, _) in enumerate(tqdm(data_loader)):
-            if i >= num_batches:
-                break
-            images = images.to(device)
-            reconstructed = model(images)
-            if isinstance(reconstructed, (tuple, list)):
-                reconstructed = reconstructed[0]
-
-            mse = ((images - reconstructed) ** 2).mean(dim=(1, 2, 3)).cpu().numpy()
-            mae = torch.abs(images - reconstructed).mean(dim=(1, 2, 3)).cpu().numpy()
-            
-            mse_losses.extend(mse)
-            mae_losses.extend(mae)
-    
-    mse_losses = np.array(mse_losses)
-    mae_losses = np.array(mae_losses)
-    
-    print(f"\nReconstruction Quality:")
-    print(f"  Mean MSE: {np.mean(mse_losses):.6f}")
-    print(f"  Mean MAE: {np.mean(mae_losses):.6f}")
-    
-    # Plot distributions
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    
-    axes[0].hist(mse_losses, bins=50, edgecolor='black')
-    axes[0].axvline(np.mean(mse_losses), color='red', linestyle='--', 
-                    label=f'Mean: {np.mean(mse_losses):.4f}')
-    axes[0].set_xlabel('MSE Loss')
-    axes[0].set_ylabel('Count')
-    axes[0].set_title('MSE Distribution')
-    axes[0].legend()
-    
-    axes[1].hist(mae_losses, bins=50, edgecolor='black')
-    axes[1].axvline(np.mean(mae_losses), color='red', linestyle='--',
-                    label=f'Mean: {np.mean(mae_losses):.4f}')
-    axes[1].set_xlabel('MAE Loss')
-    axes[1].set_ylabel('Count')
-    axes[1].set_title('MAE Distribution')
-    axes[1].legend()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'reconstruction_metrics.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    np.savez(
-        os.path.join(save_dir, 'reconstruction_metrics.npz'),
-        mse_losses=mse_losses,
-        mae_losses=mae_losses
-    )
-    
-    print(f"Reconstruction metrics saved to {save_dir}")
-
-
-def visualize_layer_activations(model, data_loader, device, save_dir, num_images=3):
-    """Visualize activations at each layer for random images."""
-    
-    model.eval()
-    
-    # Get random images
     images, _ = next(iter(data_loader))
     images = images[:num_images].to(device)
-    
+
     with torch.no_grad():
         for img_idx in range(num_images):
-            img = images[img_idx:img_idx+1]
-            
-            # Create directory for this image
-            img_dir = os.path.join(save_dir, f'activations_image_{img_idx+1}')
+            img_dir = os.path.join(act_dir, f"image_{img_idx+1:02d}")
             os.makedirs(img_dir, exist_ok=True)
-            
-            # Save original image
-            img_display = _to_display(img, model)
-            plt.figure(figsize=(4, 4))
-            plt.imshow(img_display)
-            plt.axis('off')
-            plt.title(f'Original Image {img_idx+1}')
-            plt.savefig(os.path.join(img_dir, 'original.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            # Encoder activations
-            x = img
-            
-            # Process each encoder layer
-            for i, conv_layer in enumerate(model.encoder.conv_layers):
-                x = conv_layer(x)
-                # KL layers return (tensor, kl_loss) tuples — unpack
-                if isinstance(x, tuple):
-                    x = x[0]
-                
-                # Check if this is any taxonomic layer (single or multi-hierarchy)
-                if _is_any_taxon_layer(conv_layer):
-                    ch_per_h = _channels_per_single_hierarchy(conv_layer)
-                    sub_layers_enc = _get_sub_layers(conv_layer)
-                    multi_enc = len(sub_layers_enc) > 1
-                    for sub_layer, h_idx in sub_layers_enc:
-                        if multi_enc:
-                            h_name = f'Encoder Layer {i+1} H{h_idx:02d}'
-                            h_tree_dir = os.path.join(img_dir, f'encoder_layer_{i+1}',
-                                                      f'hierarchy_{h_idx:02d}')
-                            h_subtree_dir = h_tree_dir
-                        else:
-                            h_name = f'Encoder Layer {i+1}'
-                            h_tree_dir = img_dir
-                            h_subtree_dir = os.path.join(img_dir, f'encoder_layer_{i+1}')
-                        # Slice activation channels that belong to this hierarchy
-                        act_slice = x[:, h_idx * ch_per_h:(h_idx + 1) * ch_per_h, :, :]
-                        visualize_taxonomy_tree(sub_layer, h_name, h_tree_dir,
-                                                max_depth=4, activations=act_slice)
-                        visualize_all_subtree_hierarchies(
-                            sub_layer, h_name, h_subtree_dir, activations=act_slice)
-                else:
-                    # Regular conv - use grid visualization
-                    visualize_feature_maps(x, os.path.join(img_dir, f'encoder_layer_{i+1}.png'),
-                                         f'Encoder Layer {i+1}', max_maps=16)
-                
-                # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_resnet_layer(conv_layer):
-                    x = F.leaky_relu(x, negative_slope=0.01)
-                # Only pool when use_maxpool=True; strided layers handle their
-                # own downsampling when use_maxpool=False.
-                if model.encoder.use_maxpool and model.encoder.strides[i] > 1:
-                    x = F.max_pool2d(x, kernel_size=model.encoder.strides[i],
-                                     stride=model.encoder.strides[i])
-            
-            # Latent (may be spatial or flat, so flatten for visualization)
-            result = model.encode(img)
-            # Handle tuple return (latents, kl) from KL layers
-            if isinstance(result, tuple):
-                latent = result[0]
-            else:
-                latent = result
-            
-            # Flatten if spatial
-            if latent.ndim > 2:
-                latent_flat = latent.view(latent.size(0), -1)
-            else:
-                latent_flat = latent
-            
-            plt.figure(figsize=(12, 3))
-            plt.bar(range(latent_flat.shape[1]), latent_flat.cpu().squeeze().numpy())
-            plt.xlabel('Latent Dimension')
-            plt.ylabel('Activation')
-            plt.title(f'Latent Space (dim={latent_flat.shape[1]})')
-            plt.tight_layout()
-            plt.savefig(os.path.join(img_dir, 'latent.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            # Decoder activations - latent is already spatial (B, C, H, W)
-            x = latent
-            
-            # Process each decoder layer
-            for i, deconv_layer in enumerate(model.decoder.deconv_layers):
-                x = deconv_layer(x)
-                # KL layers return (tensor, kl_loss) tuples — unpack
-                if isinstance(x, tuple):
-                    x = x[0]
-                
-                # Check if this is any taxonomic layer (single or multi-hierarchy)
-                if _is_any_taxon_layer(deconv_layer):
-                    ch_per_h = _channels_per_single_hierarchy(deconv_layer)
-                    sub_layers_dec = _get_sub_layers(deconv_layer)
-                    multi_dec = len(sub_layers_dec) > 1
-                    for sub_layer, h_idx in sub_layers_dec:
-                        if multi_dec:
-                            h_name = f'Decoder Layer {i+1} H{h_idx:02d}'
-                            h_tree_dir = os.path.join(img_dir, f'decoder_layer_{i+1}',
-                                                      f'hierarchy_{h_idx:02d}')
-                            h_subtree_dir = h_tree_dir
-                        else:
-                            h_name = f'Decoder Layer {i+1}'
-                            h_tree_dir = img_dir
-                            h_subtree_dir = os.path.join(img_dir, f'decoder_layer_{i+1}')
-                        # Slice activation channels that belong to this hierarchy
-                        act_slice = x[:, h_idx * ch_per_h:(h_idx + 1) * ch_per_h, :, :]
-                        visualize_taxonomy_tree(sub_layer, h_name, h_tree_dir,
-                                                max_depth=4, activations=act_slice)
-                        visualize_all_subtree_hierarchies(
-                            sub_layer, h_name, h_subtree_dir, activations=act_slice)
-                else:
-                    # Regular deconv - use grid visualization
-                    visualize_feature_maps(x, os.path.join(img_dir, f'decoder_layer_{i+1}.png'),
-                                         f'Decoder Layer {i+1}', max_maps=16)
-                
-                # KL/Resnet layers output log-probabilities — skip ReLU
-                if not _is_resnet_layer(deconv_layer):
-                    x = F.leaky_relu(x, negative_slope=0.01)
-            
-            # Apply batch norm before final conv if present (matches decoder forward)
-            if model.decoder.pre_final_norm is not None:
-                x = model.decoder.pre_final_norm(x)
-            
-            # Final Conv2D layer to RGB
-            x = model.decoder.final_conv(x)
-            visualize_feature_maps(x, os.path.join(img_dir, 'decoder_final_conv.png'), 'Final Conv (RGB)', max_maps=3)
-            
-            # Final reconstruction
-            reconstructed = model(img)
-            if isinstance(reconstructed, (tuple, list)):
-                reconstructed = reconstructed[0]
-            recon_display = _to_display(reconstructed, model)
-            plt.figure(figsize=(4, 4))
-            plt.imshow(recon_display)
-            plt.axis('off')
-            plt.title('Reconstruction')
-            plt.savefig(os.path.join(img_dir, 'reconstruction.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            print(f"  Activations for image {img_idx+1} saved to {img_dir}")
-    
-    print(f"Layer activations saved to {save_dir}")
+            plt.imsave(os.path.join(img_dir, "original.png"),
+                       _to_display(images[img_idx:img_idx+1], normalized=normalized))
+
+            img_t = images[img_idx:img_idx+1]
+            x = model.encoder.stem(img_t)
+
+            for s_idx, stage in enumerate(model.encoder.taxon_stages, start=1):
+                x_out, _, _ = stage(x)
+                maps = x_out[0].detach().cpu()
+                n_show = min(maps.shape[0], 16)
+                nrow = 4
+                fig, axes = plt.subplots(nrow, nrow, figsize=(8, 8))
+                axes = np.array(axes).flatten()
+                for k in range(n_show):
+                    fm = maps[k].numpy()
+                    fm = (fm - fm.min()) / (fm.max() - fm.min() + 1e-8)
+                    axes[k].imshow(fm, cmap="viridis")
+                    axes[k].axis("off")
+                for ax in axes[n_show:]:
+                    ax.axis("off")
+                plt.suptitle(
+                    f"Stage {s_idx} activations (ch={maps.shape[0]}, showing {n_show})",
+                    fontsize=10,
+                )
+                plt.tight_layout()
+                plt.savefig(os.path.join(img_dir, f"stage{s_idx}.png"),
+                            dpi=150, bbox_inches="tight")
+                plt.close()
+                x = x_out
+
+            print(f"  Image {img_idx+1}: saved to {img_dir}")
+
+    print(f"Stage activations saved to {act_dir}")
 
 
-def visualize_feature_maps(feature_tensor, save_path, title, max_maps=16, nrow=4):
-    """Helper to visualize feature maps from a layer."""
-    
-    # feature_tensor: (1, C, H, W)
-    maps = feature_tensor[0].detach().cpu()
-    num_maps = min(maps.shape[0], max_maps)
-    
-    fig, axes = plt.subplots(nrow, nrow, figsize=(nrow * 2, nrow * 2))
-    axes = axes.flatten()
-    
-    for i in range(num_maps):
-        ax = axes[i]
-        fmap = maps[i].numpy()
-        # Normalize for visualization
-        fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
-        ax.imshow(fmap, cmap='viridis')
-        ax.axis('off')
-    
-    # Turn off extra axes
-    for ax in axes[num_maps:]:
-        ax.axis('off')
-    
-    plt.suptitle(f'{title} (showing {num_maps}/{maps.shape[0]} feature maps)', fontsize=12)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Analyze ResNet Taxon Autoencoder")
+    parser.add_argument("--config", type=str, default="configs/celeba_hq.json",
+                        help="Path to JSON config; must set analysis.checkpoint_path")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Override checkpoint path from config")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    return parser.parse_args()
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Analyze CelebA-HQ Autoencoder')
-    parser.add_argument('--config', type=str, required=True, help='Path to JSON config file (must specify checkpoint_path in analysis section)')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to model checkpoint (overrides config)')
-    parser.add_argument('--batch-size', type=int, default=None)
-    parser.add_argument('--data-root', type=str, default=None)
-    parser.add_argument('--num-workers', type=int, default=None)
-
-    args = parser.parse_args()
-
-    # Load config (now required)
+def main() -> None:
+    args = parse_args()
     config = load_config(args.config)
-    batch_size = config['data'].get('batch_size', 16)
-    num_workers = config['data'].get('num_workers', 4)
-    data_root = config['data']['data_root']
-    image_size = config['data'].get('image_size', 256)
-    val_split = config['data'].get('val_split', 0.05)
-    experiment_name = config.get('experiment_name', None)
-    save_dir_prefix = config.get('output', {}).get('analysis_save_dir', 'outputs/celebahq/analysis')
-    
-    # Analysis settings from config
-    analysis_config = config.get('analysis', {})
-    checkpoint_path = args.checkpoint or analysis_config.get('checkpoint_path')
-    num_latent_batches = analysis_config.get('num_latent_batches', 50)
-    num_reconstruction_batches = analysis_config.get('num_reconstruction_batches', 20)
-    num_multiple_recon_images = analysis_config.get('num_multiple_recon_images', 8)
-    num_reconstructions_per_image = analysis_config.get('num_reconstructions_per_image', 8)
-    num_activation_images = analysis_config.get('num_activation_images', 3)
 
-    if not checkpoint_path:
-        raise ValueError("Must specify checkpoint_path in config file under 'analysis' section or provide --checkpoint argument")
+    data_cfg = config.get("data", {})
+    batch_size   = args.batch_size  or data_cfg.get("batch_size", 16)
+    num_workers  = args.num_workers or data_cfg.get("num_workers", 4)
+    data_root    = args.data_root   or data_cfg["data_root"]
+    image_size   = data_cfg.get("image_size", 256)
+    val_split    = data_cfg.get("val_split", 0.05)
 
-    # CLI overrides
-    if args.batch_size is not None:
-        batch_size = args.batch_size
-    if args.data_root is not None:
-        data_root = args.data_root
-    if args.num_workers is not None:
-        num_workers = args.num_workers
+    analysis_cfg = config.get("analysis", {})
+    num_latent_batches  = analysis_cfg.get("num_latent_batches", 50)
+    num_recon_batches   = analysis_cfg.get("num_reconstruction_batches", 20)
+    num_recon_images    = analysis_cfg.get("num_multiple_recon_images", 8)
+    num_recon_sets      = analysis_cfg.get("num_reconstructions_per_image", 8)
+    num_act_images      = analysis_cfg.get("num_activation_images", 3)
+    num_taxon_batches   = analysis_cfg.get("num_taxonomy_batches", 10)
 
-    save_dir = save_dir_prefix if experiment_name else os.path.join(save_dir_prefix, datetime.now().strftime('%Y%m%d_%H%M%S'))
+    dkl_weight  = config.get("training", {}).get("dkl_weight", None)
+    temperature = config.get("model", {}).get("temperature", None)
+    hard        = config.get("model", {}).get("hard", False)
+    dkl_suffix  = f"_dkl_{dkl_weight:.0e}" if dkl_weight is not None else ""
+    temp_str    = f"{temperature:g}".replace(".", "p") if temperature is not None else ""
+    temp_suffix = f"_temp_{temp_str}" if temp_str else ""
+    hard_suffix = "_hard" if hard else ""
+    run_suffix  = dkl_suffix + temp_suffix + hard_suffix
+
+    save_dir_base = config.get("output", {}).get("analysis_save_dir", "outputs/analysis")
+    out_base = config.get("output", {}).get("output_dir", "")
+    # Insert the dkl suffix right after the output_dir prefix so the analysis
+    # directory lives inside the same dkl-tagged run folder as the checkpoints.
+    if out_base and run_suffix and save_dir_base.startswith(out_base):
+        save_dir_prefix = out_base + run_suffix + save_dir_base[len(out_base):]
+    else:
+        save_dir_prefix = save_dir_base.rstrip("/").rstrip("\\") + run_suffix
+    experiment_name = config.get("experiment_name", "")
+    save_dir = (save_dir_prefix if experiment_name
+                else os.path.join(save_dir_prefix, datetime.now().strftime("%Y%m%d_%H%M%S")))
     os.makedirs(save_dir, exist_ok=True)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # If checkpoint_path contains the base output_dir, patch in the dkl suffix too.
+    checkpoint_path = args.checkpoint or analysis_cfg.get("checkpoint_path")
+    if checkpoint_path and run_suffix and out_base and checkpoint_path.startswith(out_base):
+        checkpoint_path = out_base + run_suffix + checkpoint_path[len(out_base):]
+    if not checkpoint_path:
+        raise ValueError(
+            "Provide checkpoint_path via --checkpoint or config['analysis']['checkpoint_path']"
+        )
 
-    print('=' * 80)
-    print('CelebA-HQ Taxonomic Autoencoder Analysis')
-    print('=' * 80)
-    print(f'Device: {device}')
-    print(f'Checkpoint: {checkpoint_path}')
-    print(f'Data root: {data_root}')
-    print(f'Image size: {image_size}')
-    print(f'Batch size: {batch_size}')
-    print(f'Save dir: {save_dir}')
-    print('=' * 80)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load data
-    print("\nLoading CelebA-HQ dataset...")
+    print("=" * 80)
+    print("Taxon ResNet Autoencoder — Analysis")
+    print("=" * 80)
+    print(f"  device={device}  checkpoint={checkpoint_path}")
+    print(f"  data_root={data_root}  image_size={image_size}  batch_size={batch_size}")
+    print(f"  save_dir={save_dir}")
+    print("=" * 80)
+
+    print("\nLoading dataset...")
+    normalize = data_cfg.get("normalize", True)   # default: same normalization as training
+    if normalize:
+        tf = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+    else:
+        tf = None  # CelebAHQLoader default (ToTensor only)
     loader = CelebAHQLoader(
         data_root=data_root,
         batch_size=batch_size,
         num_workers=num_workers,
         image_size=image_size,
         val_split=val_split,
+        transform=tf,
     )
-    train_loader, val_loader = loader.get_loaders()
-    eval_loader = val_loader if val_loader is not None else train_loader
+    _, val_loader = loader.get_loaders()
+    eval_loader = val_loader if val_loader is not None else loader.train_loader
 
-    # Load model
     print("\nLoading model...")
-    model, checkpoint = load_model(checkpoint_path, device, config)
+    model, _ = load_model(checkpoint_path, device, config)
 
-    # Analysis 1: Visualize encoder Conv filters
-    print("\n" + "=" * 80)
-    print("1. Visualizing Encoder TaxonConv Filters")
-    print("=" * 80)
-    for i in range(len(model.encoder.conv_layers)):
-        layer_name = f'encoder_layer_{i+1}'
-        print(f"\nProcessing {layer_name}...")
-        visualize_taxonconv_filters(model, save_dir, layer_name=layer_name, n_cols=8)
+    print("\n" + "=" * 80 + "\n1. Stage Filter Visualization\n" + "=" * 80)
+    visualize_stage_filters(model, save_dir)
 
-    # Analysis 2: Visualize taxonomy trees for encoder
-    print("\n" + "=" * 80)
-    print("2. Visualizing Encoder Taxonomy Trees")
-    print("=" * 80)
-    encoder_layers = []
-    for i, layer in enumerate(model.encoder.conv_layers):
-        layer_name = f'encoder_layer_{i+1}'
-        encoder_layers.append((layer, layer_name))
-    
-    for layer, layer_name in encoder_layers:
-        print(f"\nProcessing {layer_name}...")
-        if not _is_any_taxon_layer(layer):
-            print(f"  Skipping {layer_name} — not a taxonomic layer, no hierarchy tree to visualize")
-            continue
-        layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
-        sub_layers = _get_sub_layers(layer)
-        multi = len(sub_layers) > 1
-        if multi:
-            print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
-        for sub_layer, h_idx in sub_layers:
-            if multi:
-                h_name = f"{layer_name} H{h_idx:02d}"
-                h_save_dir = os.path.join(layer_save_dir, f'hierarchy_{h_idx:02d}')
-            else:
-                h_name = layer_name
-                h_save_dir = layer_save_dir
-            visualize_taxonomy_tree(sub_layer, h_name, h_save_dir, max_depth=4)
-            visualize_all_subtree_hierarchies(sub_layer, h_name, h_save_dir)
+    print("\n" + "=" * 80 + "\n2. Taxonomy Probability Distributions\n" + "=" * 80)
+    visualize_taxonomy_distributions(model, eval_loader, device, save_dir,
+                                     num_batches=num_taxon_batches)
 
-    # Analysis 3: Visualize decoder Deconv filters
-    print("\n" + "=" * 80)
-    print("3. Visualizing Decoder TaxonDeconv Filters")
-    print("=" * 80)
-    for i in range(len(model.decoder.deconv_layers)):
-        layer_name = f'decoder_layer_{i+1}'
-        print(f"\nProcessing {layer_name}...")
-        visualize_taxondeconv_filters(model, save_dir, layer_name=layer_name, n_cols=8)
+    print("\n" + "=" * 80 + "\n2b. Taxonomy Path Probability Plots\n" + "=" * 80)
+    visualize_taxonomy_path_probs(model, eval_loader, device, save_dir)
 
-    # Analysis 4: Visualize taxonomy trees for decoder
-    print("\n" + "=" * 80)
-    print("4. Visualizing Decoder Taxonomy Trees")
-    print("=" * 80)
-    decoder_layers = []
-    for i, layer in enumerate(model.decoder.deconv_layers):
-        layer_name = f'decoder_layer_{i+1}'
-        decoder_layers.append((layer, layer_name))
-    
-    for layer, layer_name in decoder_layers:
-        print(f"\nProcessing {layer_name}...")
-        if not _is_any_taxon_layer(layer):
-            print(f"  Skipping {layer_name} — not a taxonomic layer, no hierarchy tree to visualize")
-            continue
-        layer_save_dir = os.path.join(save_dir, f"{layer_name}_filters")
-        sub_layers = _get_sub_layers(layer)
-        multi = len(sub_layers) > 1
-        if multi:
-            print(f"  {layer_name}: {len(sub_layers)} independent hierarchies")
-        for sub_layer, h_idx in sub_layers:
-            if multi:
-                h_name = f"{layer_name} H{h_idx:02d}"
-                h_save_dir = os.path.join(layer_save_dir, f'hierarchy_{h_idx:02d}')
-            else:
-                h_name = layer_name
-                h_save_dir = layer_save_dir
-            visualize_taxonomy_tree(sub_layer, h_name, h_save_dir, max_depth=4)
-            visualize_all_subtree_hierarchies(sub_layer, h_name, h_save_dir)
+    print("\n" + "=" * 80 + "\n2c. Taxonomy Tree Activations\n" + "=" * 80)
+    visualize_taxonomy_tree(model, eval_loader, device, save_dir,
+                            num_images=num_act_images)
 
-    # Note: final_conv is now a regular Conv2D, not a TaxonConv, so we skip its visualization
-    print(f"\nSkipping final_conv - it's a regular Conv2D for RGB projection")
+    print("\n" + "=" * 80 + "\n3. Latent Space Analysis\n" + "=" * 80)
+    analyze_latent_sparsity(model, eval_loader, device, save_dir,
+                            num_batches=num_latent_batches)
 
-    # Analysis 5: Latent space sparsity
-    print("\n" + "=" * 80)
-    print("5. Analyzing Latent Space")
-    print("=" * 80)
-    analyze_latent_sparsity(model, eval_loader, device, save_dir, num_batches=num_latent_batches)
+    print("\n" + "=" * 80 + "\n4. Reconstruction Quality Metrics\n" + "=" * 80)
+    analyze_reconstruction_quality(model, eval_loader, device, save_dir,
+                                   num_batches=num_recon_batches)
 
-    # Analysis 6: Reconstruction quality metrics
-    print("\n" + "=" * 80)
-    print("6. Analyzing Reconstruction Quality")
-    print("=" * 80)
-    analyze_reconstruction_quality(model, eval_loader, device, save_dir, num_batches=num_reconstruction_batches)
+    print("\n" + "=" * 80 + "\n5. Multiple Reconstruction Visualizations\n" + "=" * 80)
+    visualize_multiple_reconstructions(model, eval_loader, device, save_dir,
+                                       num_images=num_recon_images, num_sets=num_recon_sets,
+                                       normalized=normalize)
 
-    # Analysis 7: Multiple reconstructions
-    print("\n" + "=" * 80)
-    print("7. Visualizing Multiple Reconstructions")
-    print("=" * 80)
-    visualize_multiple_reconstructions(
-        model, eval_loader, device, save_dir,
-        num_images=num_multiple_recon_images,
-        num_reconstructions=num_reconstructions_per_image
-    )
-
-    # Analysis 8: Layer activations for random images
-    print("\n" + "=" * 80)
-    print("8. Visualizing Layer Activations")
-    print("=" * 80)
-    visualize_layer_activations(model, eval_loader, device, save_dir, num_images=num_activation_images)
-
-    # Analysis 9: Partonomy sparsity suite
-    print("\n" + "=" * 80)
-    print("9. Partonomy Sparsity Analysis")
-    print("=" * 80)
+    print("\n" + "=" * 80 + "\n6. Partonomy Sparsity Suite\n" + "=" * 80)
     analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
 
-    # Analysis 10: Weight sparsity
-    print("\n" + "=" * 80)
-    print("10. Weight Sparsity Analysis")
-    print("=" * 80)
-    analyze_weight_sparsity(model, save_dir)
+    print("\n" + "=" * 80 + "\n7. Encoder Stage Activation Maps\n" + "=" * 80)
+    visualize_stage_activations(model, eval_loader, device, save_dir, num_images=num_act_images,
+                                normalized=normalize)
 
     print("\n" + "=" * 80)
-    print("Analysis complete!")
-    print(f"All outputs saved to: {save_dir}")
+    print("Analysis complete! All outputs saved to:", save_dir)
     print("=" * 80)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

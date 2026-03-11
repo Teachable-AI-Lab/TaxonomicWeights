@@ -1,446 +1,465 @@
-"""
-Training script for CelebA-HQ Autoencoder (256x256x3).
+#!/usr/bin/env python3
+"""Train TaxonAutoencoder on full CelebA-HQ with ResNet-18 stage layout.
+
+Common-practice defaults used here:
+- AdamW optimizer
+- cosine learning-rate decay with warmup
+- full precision training (no AMP)
+- MSE reconstruction loss
+- optional taxonomy regularizer (aggregated coverage DKL)
 """
 
-import os
-import sys
-import json
+from __future__ import annotations
+
 import argparse
-from datetime import datetime
+import json
+import math
+import random
+import time
+from pathlib import Path
 
-import torch
-import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.utils import make_grid, save_image
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Local module imports.
+import sys
 
-from src.model.taxon_ae import CelebAHQTaxonAutoencoder
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.model.taxon_ae import TaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 
 
-def parse_layer_config(config_layers):
-    """Parse layer configuration from JSON into model parameters."""
-    if not config_layers:
-        return None, None, None, None, None, None, None, None
-
-    n_layers_list = []
-    n_filters_list = []
-    layer_types_list = []
-    kernel_sizes_list = []
-    strides_list = []
-    paddings_list = []
-    output_paddings_list = []
-
-    for layer in config_layers:
-        layer_type = layer.get('layer_type', 'taxonomic_conv')
-        layer_types_list.append(layer_type)
-
-        if 'n_layers' in layer:
-            n_layers_list.append(layer['n_layers'])
-        else:
-            n_layers_list.append(None)
-
-        if 'n_filters' in layer:
-            n_filters_list.append(layer['n_filters'])
-        else:
-            n_filters_list.append(None)
-
-        kernel_sizes_list.append(layer.get('kernel_size', 3))
-        strides_list.append(layer.get('stride', 1))
-        paddings_list.append(layer.get('padding', None))
-        output_paddings_list.append(layer.get('output_padding', 0))
-
-    # Clean up None lists
-    n_layers_out = n_layers_list if any(x is not None for x in n_layers_list) else None
-    n_filters_out = n_filters_list if any(x is not None for x in n_filters_list) else None
-    paddings_out = paddings_list if any(x is not None for x in paddings_list) else None
-
-    return (n_layers_out, n_filters_out, layer_types_list,
-            kernel_sizes_list, strides_list, paddings_out, output_paddings_list)
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return json.load(f)
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    steps_per_epoch: int,
+    epochs: int,
+    warmup_epochs: int,
+) -> LambdaLR:
+    """Cosine decay with linear warmup (step-wise)."""
+    total_steps = max(1, steps_per_epoch * epochs)
+    warmup_steps = max(1, steps_per_epoch * warmup_epochs)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def visualize_reconstructions(model, data_loader, device, save_dir, num_images=8, epoch=None):
+@torch.no_grad()
+def run_validation(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    hard: bool,
+    dkl_weight: float,
+) -> dict:
     model.eval()
-    images, _ = next(iter(data_loader))
+    total_loss = 0.0
+    total_recon = 0.0
+    total_dkl = 0.0
+    total_entropy = 0.0
+    num_batches = 0
+
+    for images, _ in loader:
+        images = images.to(device, non_blocking=True)
+        recon, dkl, entropy = model(images, hard=hard)
+        recon_loss = F.mse_loss(recon, images)
+        loss = recon_loss + dkl_weight * dkl
+
+        total_loss += float(loss.item())
+        total_recon += float(recon_loss.item())
+        total_dkl += float(dkl.item())
+        total_entropy += float(entropy.item())
+        num_batches += 1
+
+    if num_batches == 0:
+        return {"loss": 0.0, "recon": 0.0, "dkl": 0.0, "entropy": 0.0}
+
+    return {
+        "loss": total_loss / num_batches,
+        "recon": total_recon / num_batches,
+        "dkl": total_dkl / num_batches,
+        "entropy": total_entropy / num_batches,
+    }
+
+
+def save_recon_preview(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    save_path: Path,
+    hard: bool,
+    num_images: int = 8,
+) -> None:
+    model.eval()
+    images, _ = next(iter(loader))
     images = images[:num_images].to(device)
 
     with torch.no_grad():
-        result = model(images)
-        # Handle both (reconstruction, kl) and just reconstruction returns
-        if isinstance(result, tuple):
-            recons = result[0]
-        else:
-            recons = result
+        recon, _, _ = model(images, hard=hard)
 
-    images = images.cpu()
-    recons = recons.cpu()
+    # Convert from [-1, 1] to [0, 1] for visualization.
+    vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
+    vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
 
-    fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2, 4))
-    for i in range(num_images):
-        axes[0, i].imshow(images[i].permute(1, 2, 0).clamp(0, 1))
-        axes[0, i].axis('off')
-        if i == 0:
-            axes[0, i].set_title('Original', fontsize=10)
-
-        axes[1, i].imshow(recons[i].permute(1, 2, 0).clamp(0, 1))
-        axes[1, i].axis('off')
-        if i == 0:
-            axes[1, i].set_title('Reconstructed', fontsize=10)
-
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    filename = f'reconstructions_epoch_{epoch}.png' if epoch is not None else 'reconstructions.png'
-    plt.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches='tight')
-    plt.close()
+    grid = make_grid(torch.cat([vis_input, vis_recon], dim=0), nrow=num_images)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    save_image(grid, save_path)
 
 
-def train(
-    model,
-    train_loader,
-    val_loader,
-    epochs,
-    lr,
-    device,
-    save_dir,
-    entropy_weight=0.0,
-    batch_kl_weight=0.0,
-    resume_from=None
-):
-    """Train the autoencoder.
-    
-    Args:
-        entropy_weight: Weight for per-instance entropy term.
-        batch_kl_weight: Weight for batch-marginal KL-to-uniform term.
-        resume_from: Path to checkpoint to resume training from (optional).
+def save_training_curves(history: dict, output_dir: Path) -> None:
+    """Save loss/DKL training curves to ``output_dir/training_curves.png``.
+
+    Three panels (one row):
+    1. Total loss   — train vs val
+    2. Recon loss   — train vs val
+    3. DKL penalty  — train vs val
+
+    The raw history is also dumped to ``training_history.json`` so it can be
+    replotted offline without re-running training.
     """
-    os.makedirs(save_dir, exist_ok=True)
+    import json as _json
 
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    epochs = history["epochs"]
+    if not epochs:
+        return
 
-    train_losses = []
-    val_losses = []
-    start_epoch = 0
+    # Persist raw numbers.
+    with open(output_dir / "training_history.json", "w") as _f:
+        _json.dump(history, _f, indent=2)
 
-    # Resume from checkpoint if specified
-    if resume_from and os.path.isfile(resume_from):
-        print(f"Resuming training from checkpoint: {resume_from}")
-        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
-        train_losses = checkpoint.get('train_losses', [])
-        val_losses = checkpoint.get('val_losses', [])
-        print(f"Resumed from epoch {start_epoch}")
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    for epoch in range(start_epoch, epochs):
+    panels = [
+        ("Total loss",   "train_loss",  "val_loss"),
+        ("Recon loss",   "train_recon", "val_recon"),
+        ("DKL penalty",  "train_dkl",   "val_dkl"),
+    ]
+
+    for ax, (title, train_key, val_key) in zip(axes, panels):
+        ax.plot(epochs, history[train_key], label="train", linewidth=1.5)
+        ax.plot(epochs, history[val_key],   label="val",   linewidth=1.5, linestyle="--")
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        # Mark best-val epoch on Total loss panel.
+        if train_key == "train_loss":
+            best_ep = epochs[int(min(range(len(history[val_key])),
+                                    key=lambda i: history[val_key][i]))]
+            ax.axvline(best_ep, color="red", linestyle=":", linewidth=1.0,
+                       label=f"best val (ep {best_ep})")
+            ax.legend(fontsize=8)
+
+    plt.suptitle("Training curves", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+
+    out_path = output_dir / "training_curves.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Training curves saved to {out_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    # First pass: extract --config so we can use it as a source of defaults.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default="")
+    pre_args, _ = pre.parse_known_args()
+
+    cfg: dict = {}
+    if pre_args.config:
+        with open(pre_args.config) as f:
+            cfg = json.load(f)
+
+    d = cfg.get("data", {})
+    m = cfg.get("model", {})
+    t = cfg.get("training", {})
+    o = cfg.get("output", {})
+
+    parser = argparse.ArgumentParser(description="Train Taxon ResNet-18 AE on CelebA-HQ")
+    parser.add_argument("--config", type=str, default="", help="Path to JSON config file")
+    # data
+    parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
+    parser.add_argument("--output-dir", type=str, default=o.get("output_dir", "./outputs/taxon_ae_celeba_hq"))
+    parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
+    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
+    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
+    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
+    # model
+    parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
+    parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
+                        default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
+    parser.add_argument("--stage-strides", type=int, nargs=4,
+                        default=m.get("stage_strides", [1, 2, 2, 2]))
+    parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
+    parser.add_argument("--hard", action="store_true", default=m.get("hard", False),
+                        help="Use hard straight-through routing in taxonomy softmax")
+    # training
+    parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
+    parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
+    parser.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
+    parser.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
+    parser.add_argument("--dkl-weight", type=float, default=t.get("dkl_weight", 1e-3))
+    parser.add_argument("--save-every", type=int, default=t.get("save_every", 5))
+    parser.add_argument("--seed", type=int, default=t.get("seed", 42))
+    parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
+    parser.add_argument("--resume", type=str, default="")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    seed_everything(args.seed)
+
+    # Build run suffix from hyperparams so different runs don't collide.
+    dkl_suffix  = f"_dkl_{args.dkl_weight:.0e}"
+    temp_str    = f"{args.temperature:g}".replace(".", "p")
+    temp_suffix = f"_temp_{temp_str}"
+    hard_suffix = "_hard" if args.hard else ""
+    run_suffix  = dkl_suffix + temp_suffix + hard_suffix
+    output_dir = Path(args.output_dir + run_suffix)
+    ckpt_dir = output_dir / "checkpoints"
+    preview_dir = output_dir / "previews"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tf = transforms.Compose(
+        [
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
+
+    celeba_loader = CelebAHQLoader(
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=args.image_size,
+        val_split=args.val_split,
+        seed=args.seed,
+        pin_memory=(device.type == "cuda"),
+        transform=tf,
+    )
+    train_loader, val_loader = celeba_loader.get_loaders()
+    if val_loader is None:
+        raise RuntimeError("val_split must be > 0 to produce a validation loader")
+
+    # Read extra model params from config if available.
+    _mc = {}
+    if args.config:
+        with open(args.config) as _f:
+            _mc = json.load(_f).get("model", {})
+
+    model = TaxonAutoencoder(
+        in_channels=_mc.get("in_channels", 3),
+        resnet_variant=args.resnet_variant,
+        stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
+        stage_strides=tuple(args.stage_strides),
+        stage_blocks=_mc.get("stage_blocks", None),
+        temperature=args.temperature,
+        hard=args.hard,
+        kernel_size=_mc.get("kernel_size", 3),
+        use_stem=_mc.get("use_stem", True),
+        stem_channels=_mc.get("stem_channels", 64),
+        stem_stride=_mc.get("stem_stride", 2),
+        use_stem_maxpool=_mc.get("use_stem_maxpool", True),
+        output_activation=_mc.get("output_activation", "none"),
+        depth_decay=_mc.get("depth_decay", 0.5),
+    ).to(device)
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+    )
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        steps_per_epoch=max(1, len(train_loader)),
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+    )
+    start_epoch = 1
+    global_step = 0
+    best_val = float("inf")
+
+    if args.resume:
+        resume_path = Path(args.resume)
+        state = torch.load(resume_path, map_location="cpu")
+        model.load_state_dict(state["model_state"])
+        optimizer.load_state_dict(state["optimizer_state"])
+        scheduler.load_state_dict(state["scheduler_state"])
+        start_epoch = int(state["epoch"]) + 1
+        global_step = int(state.get("global_step", 0))
+        best_val = float(state.get("best_val", float("inf")))
+        print(f"Resumed from {resume_path} at epoch={start_epoch}")
+
+    print(
+        "Training setup:\n"
+        f"  device={device}\n"
+        f"  amp=False\n"
+        f"  hard={args.hard}\n"
+        f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
+        f"  batch_size={args.batch_size} epochs={args.epochs}\n"
+        f"  lr={args.learning_rate} wd={args.weight_decay}\n"
+        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
+    )
+
+    history: dict = {
+        "epochs":      [],
+        "train_loss":  [],
+        "train_recon": [],
+        "train_dkl":   [],
+        "val_loss":    [],
+        "val_recon":   [],
+        "val_dkl":     [],
+    }
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        epoch_start = time.time()
+
         running_loss = 0.0
-        running_recon_loss = 0.0
-        running_entropy_loss = 0.0
-        running_batch_kl_loss = 0.0
-        nan_count = 0
-        for images, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
-            images = images.to(device)
-            optimizer.zero_grad()
+        running_recon = 0.0
+        running_dkl = 0.0
+        running_entropy = 0.0
+        num_batches = 0
 
-            result = model(images)
-            if isinstance(result, tuple) and len(result) == 3:
-                recons, entropy_reg, batch_kl_reg = result
-                recon_loss = criterion(recons, images)
-                loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
-                running_entropy_loss += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
-                running_batch_kl_loss += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
-            else:
-                recons = result if not isinstance(result, tuple) else result[0]
-                recon_loss = criterion(recons, images)
-                loss = recon_loss
-            running_recon_loss += recon_loss.item() * images.size(0)
+        for batch_idx, (images, _) in enumerate(train_loader, start=1):
+            images = images.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
 
-            if not torch.isfinite(loss):
-                optimizer.zero_grad()
-                nan_count += 1
-                continue
+            recon, dkl, entropy = model(images, hard=args.hard)
+            recon_loss = F.mse_loss(recon, images)
+            loss = recon_loss + args.dkl_weight * dkl
 
             loss.backward()
             optimizer.step()
-            running_loss += loss.item() * images.size(0)
+            scheduler.step()
 
-        epoch_train_loss = running_loss / len(train_loader.dataset)
-        epoch_train_recon = running_recon_loss / len(train_loader.dataset)
-        epoch_train_entropy = running_entropy_loss / len(train_loader.dataset)
-        epoch_train_bkl = running_batch_kl_loss / len(train_loader.dataset)
-        train_losses.append(epoch_train_loss)
+            running_loss += float(loss.item())
+            running_recon += float(recon_loss.item())
+            running_dkl += float(dkl.item())
+            running_entropy += float(entropy.item())
+            num_batches += 1
+            global_step += 1
 
-        if val_loader is not None:
-            model.eval()
-            val_running = 0.0
-            val_running_recon = 0.0
-            val_running_entropy = 0.0
-            val_running_bkl = 0.0
-            with torch.no_grad():
-                for images, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
-                    images = images.to(device)
-                    result = model(images)
-                    if isinstance(result, tuple) and len(result) == 3:
-                        recons, entropy_reg, batch_kl_reg = result
-                        recon_loss = criterion(recons, images)
-                        loss = recon_loss + entropy_weight * entropy_reg + batch_kl_weight * batch_kl_reg
-                        val_running_entropy += (entropy_reg.item() if hasattr(entropy_reg, 'item') else entropy_reg) * images.size(0)
-                        val_running_bkl += (batch_kl_reg.item() if hasattr(batch_kl_reg, 'item') else batch_kl_reg) * images.size(0)
-                    else:
-                        recons = result if not isinstance(result, tuple) else result[0]
-                        recon_loss = criterion(recons, images)
-                        loss = recon_loss
-                    val_running_recon += recon_loss.item() * images.size(0)
-                    val_running += loss.item() * images.size(0)
+            if batch_idx % 50 == 0:
+                avg_loss = running_loss / num_batches
+                avg_recon = running_recon / num_batches
+                avg_dkl = running_dkl / num_batches
+                avg_entropy = running_entropy / num_batches
+                lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
+                    f"lr={lr:.3e} loss={avg_loss:.5f} recon={avg_recon:.5f} "
+                    f"dkl={avg_dkl:.5f} entropy={avg_entropy:.5f}"
+                )
 
-            epoch_val_loss = val_running / len(val_loader.dataset)
-            epoch_val_recon = val_running_recon / len(val_loader.dataset)
-            epoch_val_entropy = val_running_entropy / len(val_loader.dataset)
-            epoch_val_bkl = val_running_bkl / len(val_loader.dataset)
-        else:
-            epoch_val_loss = None
-            epoch_val_recon = None
-            epoch_val_entropy = None
-            epoch_val_bkl = None
-        val_losses.append(epoch_val_loss)
+            if args.max_train_steps > 0 and global_step >= args.max_train_steps:
+                break
 
-        # Print all three loss terms
-        train_str = (f"Epoch {epoch+1}/{epochs} - train loss: {epoch_train_loss:.6f} "
-                     f"(recon: {epoch_train_recon:.6f}, entropy: {epoch_train_entropy:.6f}, "
-                     f"batch_kl: {epoch_train_bkl:.6f})")
-        if epoch_val_loss is not None:
-            train_str += (f", val loss: {epoch_val_loss:.6f} "
-                          f"(recon: {epoch_val_recon:.6f}, entropy: {epoch_val_entropy:.6f}, "
-                          f"batch_kl: {epoch_val_bkl:.6f})")
-        print(train_str)
-        if nan_count > 0:
-            print(f"  WARNING: {nan_count} batches had NaN/Inf loss and were skipped")
+        train_stats = {
+            "loss": running_loss / max(1, num_batches),
+            "recon": running_recon / max(1, num_batches),
+            "dkl": running_dkl / max(1, num_batches),
+            "entropy": running_entropy / max(1, num_batches),
+        }
 
-        # Save reconstructions every epoch
-        visualize_reconstructions(model, val_loader or train_loader, device, save_dir, epoch=epoch+1)
+        val_stats = run_validation(
+            model=model,
+            loader=val_loader,
+            device=device,
+            hard=args.hard,
+            dkl_weight=args.dkl_weight,
+        )
 
-        if (epoch + 1) % 5 == 0:
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': epoch_train_loss,
-                'val_loss': epoch_val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
+        elapsed = time.time() - epoch_start
+        print(
+            f"epoch={epoch:03d} time={elapsed:.1f}s "
+            f"train_loss={train_stats['loss']:.5f} train_recon={train_stats['recon']:.5f} "
+            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f}"
+        )
+
+        history["epochs"].append(epoch)
+        history["train_loss"].append(train_stats["loss"])
+        history["train_recon"].append(train_stats["recon"])
+        history["train_dkl"].append(train_stats["dkl"])
+        history["val_loss"].append(val_stats["loss"])
+        history["val_recon"].append(val_stats["recon"])
+        history["val_dkl"].append(val_stats["dkl"])
+
+        if epoch % args.save_every == 0:
+            ckpt_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"
+            state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_val": best_val,
+                "args": vars(args),
+                "train_stats": train_stats,
+                "val_stats": val_stats,
             }
-            torch.save(checkpoint, os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt'))
+            torch.save(state, ckpt_path)
+            torch.save(state, ckpt_dir / "latest.pt")
 
-    # Final save
-    final_ckpt = {
-        'epoch': epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_loss': train_losses[-1],
-        'val_loss': val_losses[-1],
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-    }
-    torch.save(final_ckpt, os.path.join(save_dir, 'final_model.pt'))
+        if val_stats["loss"] < best_val:
+            best_val = val_stats["loss"]
+            best_state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_val": best_val,
+                "args": vars(args),
+                "train_stats": train_stats,
+                "val_stats": val_stats,
+            }
+            torch.save(best_state, ckpt_dir / "best.pt")
 
-    # Plot curves
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Train Loss')
-    if any(v is not None for v in val_losses):
-        plt.plot([v for v in val_losses if v is not None], label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Curves')
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
-    plt.close()
+        save_recon_preview(
+            model=model,
+            loader=val_loader,
+            device=device,
+            save_path=preview_dir / f"epoch_{epoch:03d}.png",
+            hard=args.hard,
+            num_images=8,
+        )
 
-    return model, train_losses, val_losses
+        if args.max_train_steps > 0 and global_step >= args.max_train_steps:
+            print(f"Reached max_train_steps={args.max_train_steps}; stopping early.")
+            break
 
-
-def main():
-    parser = argparse.ArgumentParser(description='Train CelebA-HQ Autoencoder')
-    parser.add_argument('--config', type=str, default=None, help='Path to JSON config file')
-    parser.add_argument('--batch-size', type=int, default=None)
-    parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--data-root', type=str, default=None)
-    parser.add_argument('--num-workers', type=int, default=None)
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume training from')
-
-    args = parser.parse_args()
-
-    if args.config:
-        config = load_config(args.config)
-        batch_size = config['data']['batch_size']
-        num_workers = config['data'].get('num_workers', 4)
-        data_root = config['data']['data_root']
-        image_size = config['data'].get('image_size', 256)
-        val_split = config['data'].get('val_split', 0.05)
-        train_subset = config['data'].get('train_subset', None)
-        val_subset = config['data'].get('val_subset', None)
-        epochs = config['training'].get('epochs', 20)
-        lr = config['training'].get('learning_rate', 1e-4)
-        entropy_weight = config['training'].get('entropy_weight', 0.0)
-        batch_kl_weight = config['training'].get('batch_kl_weight', 0.0)
-        experiment_name = config.get('experiment_name', None)
-        save_dir_prefix = config.get('output', {}).get('training_save_dir', 'outputs/celebahq/training')
-        
-        # Model configuration - check if taxonomic or baseline
-        model_config = config.get('model', {})
-        use_taxonomic = 'encoder_layers' in model_config or 'decoder_layers' in model_config
-    else:
-        batch_size = 16
-        num_workers = 4
-        data_root = './data/celeba_hq'
-        image_size = 256
-        val_split = 0.05
-        train_subset = None
-        val_subset = None
-        epochs = 20
-        lr = 1e-4
-        entropy_weight = 0.0
-        batch_kl_weight = 0.0
-        experiment_name = None
-        save_dir_prefix = 'outputs/celebahq/training'
-        use_taxonomic = False
-        model_config = {}
-
-    # CLI overrides
-    if args.batch_size is not None:
-        batch_size = args.batch_size
-    if args.epochs is not None:
-        epochs = args.epochs
-    if args.lr is not None:
-        lr = args.lr
-    if args.data_root is not None:
-        data_root = args.data_root
-    if args.num_workers is not None:
-        num_workers = args.num_workers
-
-    save_dir = save_dir_prefix if experiment_name else os.path.join(save_dir_prefix, datetime.now().strftime('%Y%m%d_%H%M%S'))
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    print('=' * 60)
-    print('CelebA-HQ Autoencoder Training')
-    print('=' * 60)
-    print(f'Device: {device}')
-    print(f'Model type: {"Taxonomic" if use_taxonomic else "Baseline"}')
-    print(f'Batch size: {batch_size}')
-    print(f'Epochs: {epochs}')
-    print(f'Learning rate: {lr}')
-    print(f'Data root: {data_root}')
-    print(f'Image size: {image_size}')
-    print(f'Val split: {val_split}')
-    print(f'Train subset: {train_subset if train_subset else "Full dataset"}')
-    print(f'Val subset: {val_subset if val_subset else "Full dataset"}')
-    print(f'Save dir: {save_dir}')
-    print('=' * 60)
-
-    print("\nLoading CelebA-HQ dataset...")
-    loader = CelebAHQLoader(
-        data_root=data_root,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        image_size=image_size,
-        val_split=val_split,
-        train_subset=train_subset,
-        val_subset=val_subset,
-    )
-    train_loader, val_loader = loader.get_loaders()
-    
-    print(f"Train samples: {len(train_loader.dataset)}")
-    if val_loader is not None:
-        print(f"Val samples: {len(val_loader.dataset)}")
-    else:
-        print("Val samples: 0 (no validation split)")
-
-    print("\nCreating CelebAHQTaxonAutoencoder...")
-    # Parse encoder and decoder layers from config
-    encoder_layers = model_config.get('encoder_layers', [])
-    decoder_layers = model_config.get('decoder_layers', [])
-    
-    (enc_n_layers, enc_n_filters, enc_layer_types, enc_kernel_sizes,
-        enc_strides, enc_paddings, enc_output_paddings) = parse_layer_config(encoder_layers)
-
-    (dec_n_layers, dec_n_filters, dec_layer_types, dec_kernel_sizes,
-        dec_strides, dec_paddings, dec_output_paddings) = parse_layer_config(decoder_layers)
-    
-    # Get taxonomic-specific settings
-    temperature = model_config.get('temperature', 1.0)
-    use_maxpool = model_config.get('use_maxpool', True)
-    output_activation = model_config.get('output_activation', 'sigmoid')
-    
-    model = CelebAHQTaxonAutoencoder(
-        latent_dim=model_config.get('latent_dim', 256),
-        temperature=temperature,
-        encoder_kernel_sizes=enc_kernel_sizes,
-        decoder_kernel_sizes=dec_kernel_sizes,
-        encoder_strides=enc_strides,
-        decoder_strides=dec_strides,
-        encoder_n_layers=enc_n_layers,
-        decoder_n_layers=dec_n_layers,
-        encoder_n_filters=enc_n_filters,
-        decoder_n_filters=dec_n_filters,
-        encoder_layer_types=enc_layer_types,
-        decoder_layer_types=dec_layer_types,
-        decoder_paddings=dec_paddings,
-        decoder_output_paddings=dec_output_paddings,
-        use_maxpool=use_maxpool,
-        output_activation=output_activation,
-    )
-    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
-
-    print('\nStarting training...\n')
-
-    # Auto-detect resume checkpoint if --resume=auto
-    resume_from = args.resume
-    if resume_from == 'auto':
-        # Find the latest checkpoint in save_dir
-        if os.path.isdir(save_dir):
-            ckpts = sorted([f for f in os.listdir(save_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')])
-            if ckpts:
-                resume_from = os.path.join(save_dir, ckpts[-1])
-                print(f"Auto-resume: found {resume_from}")
-            else:
-                resume_from = None
-        else:
-            resume_from = None
-
-    model, train_losses, val_losses = train(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=epochs,
-        lr=lr,
-        device=device,
-        save_dir=save_dir,
-        entropy_weight=entropy_weight,
-        batch_kl_weight=batch_kl_weight,
-        resume_from=resume_from
-    )
-
-    print('\n' + '=' * 60)
-    print('Training complete!')
-    print(f'Final train loss: {train_losses[-1]:.6f}')
-    if val_losses[-1] is not None:
-        print(f'Final val loss: {val_losses[-1]:.6f}')
-    print(f'Outputs saved to: {save_dir}')
-    print('=' * 60)
+    save_training_curves(history, output_dir)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

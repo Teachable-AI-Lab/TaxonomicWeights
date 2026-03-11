@@ -1,40 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=analyze_celeba_hq_ae
-#SBATCH --time=12:00:00
-#SBATCH --mem=48G
-#SBATCH --gpus-per-node=a40
-#SBATCH --exclude=spot,heistotron,clippy
-#SBATCH --output=TaxonomicWeights/slurm/slurm_outputs/analyze_celeba_hq_ae_%j.out
-#SBATCH --error=TaxonomicWeights/slurm/slurm_errors/analyze_celeba_hq_ae_%j.err
-#SBATCH --account="overcap"
-#SBATCH --partition="overcap"
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --qos="short"
+#SBATCH --job-name=analyze_taxon_ae
+#SBATCH --output=slurm/slurm_outputs/analyze_taxon_ae_%j.out
+#SBATCH --error=slurm/slurm_errors/analyze_taxon_ae_%j.err
+#SBATCH --partition=overcap
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=02:00:00
 
-export PYTHONUNBUFFERED=TRUE
-source ~/.bashrc
+# ── Environment ────────────────────────────────────────────────────────────────
+source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
-cd ~/flash/TaxonomicWeights
-export PYTHONPATH=$(pwd)
 
-# Usage:
-#   sbatch scripts/analyze_celeba_hq_ae.sh [optional_config.json]
-# If no args are provided, defaults are used.
-# Checkpoint path should be specified in the config file under analysis.checkpoint_path
+# ── Working directory ──────────────────────────────────────────────────────────
+cd /nethome/ksingara3/flash/TaxonomicWeights
 
-CONFIG_FILE=${1:-"configs/celebahq_ae.json"}
+# ── Run analysis ───────────────────────────────────────────────────────────────
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_celeba_hq_ae (job $SLURM_JOB_ID)"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "Config file not found: $CONFIG_FILE" >&2
-  exit 1
-fi
+python tests/analyze_celeba_hq_ae.py \
+    --config configs/celeba_hq.json
 
-echo "=== SLURM JOB ID: $SLURM_JOB_ID ==="
-echo "Starting CelebA-HQ Autoencoder analysis at $(date)"
-echo "Using config: $CONFIG_FILE"
-
-srun python tests/analyze_celeba_hq_ae.py --config "$CONFIG_FILE"
-
-echo "Analysis script completed at $(date)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_celeba_hq_ae (job $SLURM_JOB_ID)"
