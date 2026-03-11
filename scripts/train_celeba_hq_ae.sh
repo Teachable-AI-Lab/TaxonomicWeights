@@ -15,12 +15,12 @@
 
 export PYTHONUNBUFFERED=TRUE
 source ~/.bashrc
-conda activate taxon-weights
-cd ~/flash/TaxonomicWeights
+conda activate aryan_exp
+cd /nethome/aroy389/flash/aroy389/taxon/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Config file - can be overridden by command line argument
-CONFIG_FILE=${1:-"configs/celebahq_ae.json"}
+CONFIG_FILE=${1:-"configs/celebahq_asymmetric_kl.json"}
 
 echo "Starting CelebA-HQ Autoencoder training at $(date)"
 echo "Using config: $CONFIG_FILE"

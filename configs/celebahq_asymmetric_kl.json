@@ -1,7 +1,7 @@
 {
   "_comment": "Asymmetric autoencoder with KL divergence layers - no linear latent layer, keeps spatial structure throughout, using 511 filters at latent",
   "description": "Asymmetric CelebA-HQ Taxonomic Autoencoder with KL: 5 encoder layers (256x256->16x16) and 4 decoder layers (16x16->256x256) with no linear bottleneck",
-  "experiment_name": "celebahq_asymmetric_kl_511",
+  "experiment_name": "celebahq_asymmetric_kl_ar",
   "data": {
     "data_root": "./data/celeba_hq",
     "batch_size": 128,
