@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=compare_cifar10
+#SBATCH --output=slurm/slurm_outputs/compare_cifar10_%j.out
+#SBATCH --error=slurm/slurm_errors/compare_cifar10_%j.err
+#SBATCH --partition=overcap
+#SBATCH --account=tail-lab
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --gres=gpu:1
+#SBATCH --time=1:00:00
+#SBATCH --qos=short
+
+cd /nethome/ksingara3/flash/TaxonomicWeights
+
+source ~/flash/miniconda3/etc/profile.d/conda.sh
+conda activate taxon-weights
+
+python tests/compare_cifar10.py \
+    --outputs-dir       ./outputs \
+    --save-dir          ./outputs/comparison_cifar10 \
+    --data-root         ./data \
+    --batch-size        128 \
+    --n-latent-batches  20 \
+    --n-recon-batches   10 \
+    --n-recon-images    8 \
+    --device            cuda
