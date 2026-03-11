@@ -74,130 +74,8 @@ class ResidualConvBlock(nn.Module):
             else nn.Identity()
         )
 
-<<<<<<< HEAD
-        self.num_layers = num_layers
-        self.n_layers = n_layers
-        self.strides = strides
-        self.layer_types = layer_types
-
-        # Build conv layers dynamically (taxonomic or regular)
-        self.conv_layers = nn.ModuleList()
-        in_ch = 3
-        for i in range(self.num_layers):
-            layer_type = layer_types[i]
-            layer_seed = None if alpha_init_seed is None else int(alpha_init_seed) + i
-
-            # Determine stride for layer (only used by regular Conv2d)
-            layer_stride = 1 if use_maxpool else strides[i]
-
-            if layer_type == 'taxonomic_conv' or layer_type == 'taxonomic':
-                n_hier = n_hierarchies[i] if n_hierarchies else 1
-                _n_lay = n_layers[i] if n_layers else 4
-                # When use_maxpool=False, bake the stride into TaxonConv directly.
-                # When use_maxpool=True, TaxonConv keeps stride=1 and MaxPool2d
-                # (applied in forward()) handles downsampling.
-                conv_stride = 1 if use_maxpool else layer_stride
-                if n_hier > 1:
-                    conv = MultiHierarchyTaxonConv(
-                        in_channels=in_ch,
-                        kernel_size=kernel_sizes[i],
-                        n_layers=_n_lay,
-                        temperature=temperature,
-                        n_hierarchies=n_hier,
-                        stride=conv_stride,
-                        random_init_alphas=random_init_alphas,
-                        alpha_init_distribution=alpha_init_distribution,
-                        alpha_init_range=alpha_init_range,
-                        alpha_init_seed=layer_seed
-                    )
-                else:
-                    conv = TaxonConv(
-                        in_channels=in_ch,
-                        kernel_size=kernel_sizes[i],
-                        n_layers=_n_lay,
-                        temperature=temperature,
-                        stride=conv_stride,
-                        random_init_alphas=random_init_alphas,
-                        alpha_init_distribution=alpha_init_distribution,
-                        alpha_init_range=alpha_init_range,
-                        alpha_init_seed=layer_seed
-                    )
-                out_ch = n_hier * sum(2**j for j in range(_n_lay + 1))
-            elif layer_type == 'taxonomic_conv_kl':
-                # Use TaxonConvKL (returns output, dkl)
-                conv = TaxonConvKL(
-                    in_channels=in_ch,
-                    kernel_size=kernel_sizes[i],
-                    n_layers=n_layers[i] if n_layers else 4,
-                    temperature=temperature,
-                    random_init_alphas=random_init_alphas,
-                    alpha_init_distribution=alpha_init_distribution,
-                    alpha_init_range=alpha_init_range,
-                    alpha_init_seed=layer_seed
-                )
-                out_ch = sum(2**j for j in range(1, (n_layers[i] if n_layers else 4) + 1))
-            elif layer_type == 'conv':
-                # Use regular Conv2d
-                out_ch = n_filters[i] if n_filters else 64
-                conv = nn.Conv2d(
-                    in_channels=in_ch,
-                    out_channels=out_ch,
-                    kernel_size=kernel_sizes[i],
-                    stride=layer_stride,
-                    padding=kernel_sizes[i] // 2,
-                    bias=True
-                )
-            else:
-                raise ValueError(f"Unknown layer_type in encoder: {layer_type}")
-            
-            self.conv_layers.append(conv)
-            in_ch = out_ch
-        
-        # Calculate final spatial size and channels (keep for decoder initialization)
-        final_size = 32
-        for stride in strides[:self.num_layers]:
-            if stride > 1:
-                final_size = final_size // stride
-        
-        self.final_channels = in_ch
-        self.final_size = final_size
-        
-    def forward(self, x):
-        total_kl = 0.0
-        has_kl_layers = False
-        
-        for i, conv in enumerate(self.conv_layers):
-            # KL layers may return either a tensor or (tensor, dkl). Accept both.
-            if isinstance(conv, TaxonConvKL):
-                res = conv(x)
-                if isinstance(res, tuple) and len(res) == 2:
-                    x, dkl = res
-                else:
-                    x = res
-                    # attempt to retrieve stored KL if available
-                    dkl = getattr(conv, '_last_dkl', None)
-                
-                # Accumulate KL divergence
-                if dkl is not None:
-                    total_kl = total_kl + dkl
-                    has_kl_layers = True
-                # KL layers output log-probabilities (always negative); skip ReLU
-            else:
-                x = conv(x)
-                x = F.relu(x)
-            # Apply pooling for downsampling if use_maxpool is True
-            if self.use_maxpool and self.strides[i] > 1:
-                x = F.max_pool2d(x, kernel_size=self.strides[i], stride=self.strides[i])
-        
-        # Return spatial features and KL divergence (if any KL layers present)
-        if has_kl_layers:
-            return x, total_kl
-        else:
-            return x
-=======
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.main(x) + self.skip(x)
->>>>>>> origin/karthik-branch
 
 
 class TaxonResNetStage(nn.Module):
@@ -555,9 +433,191 @@ class TaxonResNetEncoder(nn.Module):
         return x, details
 
 
+
+
+class TaxonResNetStageWithAttention(TaxonResNetStage):
+    """ResNet stage that applies cross-depth attention to taxonomy logits.
+
+    After computing the usual per-depth logits we treat each "pair" of
+    channels as a 2‑dimensional token and run a simple multi‑head
+    self‑attention sequence across depths.  The idea is to let later depths
+    condition their logits on the routing decisions made at earlier depths.
+
+    The attention is very lightweight: by default it uses a single head in an
+    embedding space of dimension two (one logit per sibling).  Only a small
+    amount of extra computation is incurred, and the existing entropy/DKL
+    regularizers still operate on the final, attended probabilities.
+    """
+
+    def __init__(
+        self,
+        *args,
+        attn_heads: int = 1,
+        **kwargs,
+    ) -> None:
+        # ``args`` and ``kwargs`` are passed through to the base class
+        super().__init__(*args, **kwargs)
+        if attn_heads < 1 or attn_heads > 2:
+            raise ValueError("attn_heads currently must be 1 or 2 (embed_dim=2)")
+        # each token is a pair of logits => embed_dim==2
+        self.attn_heads = attn_heads
+        self.attn = nn.MultiheadAttention(embed_dim=2, num_heads=attn_heads, batch_first=False)
+
+    def _apply_cross_depth_attention(
+        self, logits_list: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Run sequential attention across depths.
+
+        Args:
+            logits_list: list of tensors ``[B, C_d, H, W]`` for each depth.
+
+        Returns: new list of logits with the same shapes.
+        """
+        # build tokens per depth: shape (B*H*W, pairs, 2)
+        b, _, h, w = logits_list[0].shape
+        tokens_per_depth: List[torch.Tensor] = []
+        for logits in logits_list:
+            c = logits.shape[1]
+            pairs = c // 2
+            # [B, pairs, 2, H, W]
+            t = logits.view(b, pairs, 2, h, w)
+            # [B, H, W, pairs, 2]
+            t = t.permute(0, 3, 4, 1, 2)
+            tokens_per_depth.append(t.reshape(b * h * w, pairs, 2))
+
+        prev_kv: Optional[torch.Tensor] = None
+        attended_tokens: List[torch.Tensor] = []
+        for t in tokens_per_depth:
+            if prev_kv is None:
+                attended = t
+            else:
+                # attention expects seq,len-first: (seq_len, batch, embed_dim)
+                q = t.permute(1, 0, 2)  # [pairs, N, 2]
+                kv = prev_kv.permute(1, 0, 2)  # [K, N, 2]
+                att_out, _ = self.attn(q, kv, kv)
+                attended = att_out.permute(1, 0, 2)  # [N, pairs, 2]
+            attended_tokens.append(attended)
+            prev_kv = attended if prev_kv is None else torch.cat([prev_kv, attended], dim=1)
+
+        # convert tokens back into logits
+        new_logits_list: List[torch.Tensor] = []
+        for idx, attended in enumerate(attended_tokens):
+            pairs = attended.shape[1]
+            c = pairs * 2
+            out = attended.view(b, h, w, pairs, 2).permute(0, 3, 4, 1, 2).reshape(b, c, h, w)
+            new_logits_list.append(out)
+        return new_logits_list
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        # replicate parent logic but insert attention step
+        outputs: List[torch.Tensor] = []
+        logps: List[torch.Tensor] = []
+        prev: Optional[torch.Tensor] = None
+
+        total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
+
+        # calculate raw logits per depth then run attention
+        logits_list = self._taxon_logits_per_depth(x)
+        logits_list = self._apply_cross_depth_attention(logits_list)
+
+        for depth_idx, logits in enumerate(logits_list):
+            log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
+            logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
+            prob = logp.exp()
+            out = logits * prob
+
+            entropy_i, dkl_i = self._regularization_terms(prob, logp)
+            depth_weight = self.depth_decay ** depth_idx
+            total_entropy = total_entropy + depth_weight * entropy_i
+            total_dkl = total_dkl + depth_weight * dkl_i
+
+            outputs.append(out)
+            logps.append(logp)
+            prev = logp
+
+        return (
+            torch.cat(outputs, dim=1),
+            torch.cat(logps, dim=1),
+            {"entropy": total_entropy, "dkl": total_dkl},
+        )
+
+
+class TaxonResNetEncoderWithAttention(TaxonResNetEncoder):
+    """Encoder using the attention‑enhanced stages.
+
+    Parameters are identical to :class:`TaxonResNetEncoder` plus an
+    ``attn_heads`` argument passed through to the underlying stages.
+    """
+
+    def __init__(
+        self,
+        *args,
+        attn_heads: int = 1,
+        **kwargs,
+    ) -> None:
+        # copy most of TaxonResNetEncoder.__init__ but create
+        # TaxonResNetStageWithAttention instances instead of the vanilla ones.
+        in_channels = kwargs.get("in_channels", 3) if "in_channels" in kwargs else args[0] if args else 3
+        resnet_variant = kwargs.get("resnet_variant", "18")
+        stage_taxonomy_layers = kwargs.get("stage_taxonomy_layers", (5, 6, 7, 8))
+        stage_strides = kwargs.get("stage_strides", (1, 2, 2, 2))
+        stage_blocks = kwargs.get("stage_blocks", None)
+        temperature = kwargs.get("temperature", 1.0)
+        hard = kwargs.get("hard", False)
+        kernel_size = kwargs.get("kernel_size", 3)
+        use_stem = kwargs.get("use_stem", True)
+        stem_channels = kwargs.get("stem_channels", 64)
+        stem_stride = kwargs.get("stem_stride", 2)
+        use_stem_maxpool = kwargs.get("use_stem_maxpool", True)
+        depth_decay = kwargs.get("depth_decay", 0.5)
+
+        super().__init__(
+            in_channels=in_channels,
+            resnet_variant=resnet_variant,
+            stage_taxonomy_layers=stage_taxonomy_layers,
+            stage_strides=stage_strides,
+            stage_blocks=stage_blocks,
+            temperature=temperature,
+            hard=hard,
+            kernel_size=kernel_size,
+            use_stem=use_stem,
+            stem_channels=stem_channels,
+            stem_stride=stem_stride,
+            use_stem_maxpool=use_stem_maxpool,
+            depth_decay=depth_decay,
+        )
+
+        # override the stages created by the base class
+        self.taxon_stages = nn.ModuleList()
+        current_channels = self.stage_input_channels[0] if self.stage_input_channels else in_channels
+        for blocks, n_layers, stride in zip(self.stage_blocks, self.stage_taxonomy_layers, self.stage_strides):
+            stage = TaxonResNetStageWithAttention(
+                in_channels=current_channels,
+                n_taxonomy_layers=n_layers,
+                n_blocks=blocks,
+                stride=stride,
+                kernel_size=kernel_size,
+                temperature=self.temperature,
+                hard=self.default_hard,
+                depth_decay=depth_decay,
+                attn_heads=attn_heads,
+            )
+            self.taxon_stages.append(stage)
+            current_channels = stage.total_out_channels
+
+        self.final_channels = current_channels
+
+
 __all__ = [
     "resolve_resnet_stage_blocks",
     "ResidualConvBlock",
     "TaxonResNetStage",
     "TaxonResNetEncoder",
+    "TaxonResNetStageWithAttention",
+    "TaxonResNetEncoderWithAttention",
 ]
