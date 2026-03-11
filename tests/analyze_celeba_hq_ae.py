@@ -87,6 +87,7 @@ def load_model(
         use_stem_maxpool=mc.get("use_stem_maxpool", True),
         output_activation=mc.get("output_activation", "none"),
         depth_decay=mc.get("depth_decay", 0.5),
+        attn_heads=mc.get("attn_heads", 0),
     )
 
     state = checkpoint.get("model_state", checkpoint)

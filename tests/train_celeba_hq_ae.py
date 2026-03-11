@@ -216,6 +216,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False),
                         help="Use hard straight-through routing in taxonomy softmax")
+    parser.add_argument("--attn-heads", type=int, default=m.get("attn_heads", 0),
+                        help="Enable cross-depth attention by specifying # heads (0 disables)")
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
     parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
@@ -290,6 +292,7 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
+        attn_heads=args.attn_heads,
     ).to(device)
 
     optimizer = AdamW(

@@ -23,7 +23,15 @@ from .encoder import TaxonResNetEncoder
 
 
 class TaxonAutoencoder(nn.Module):
-    """ResNet-style taxonomic autoencoder."""
+    """ResNet-style taxonomic autoencoder.
+
+    The autoencoder can optionally use the attention-enhanced encoder variant by
+    specifying ``attn_heads`` &gt; 0.  This keeps the external API the same so
+    that existing scripts and config files continue to work; old configs simply
+    omit ``attn_heads`` or set it to ``0``.  Analysis routines that reconstruct
+    the model from a config will also automatically pick up the correct
+    encoder class.
+    """
 
     def __init__(
         self,
@@ -41,13 +49,17 @@ class TaxonAutoencoder(nn.Module):
         use_stem_maxpool: bool = True,
         output_activation: str = "none",
         depth_decay: float = 0.5,
+        attn_heads: int = 0,
     ) -> None:
         super().__init__()
 
         self.default_hard = bool(hard)
         self.output_activation = output_activation.lower()
 
-        self.encoder = TaxonResNetEncoder(
+        encoder_cls = (
+            TaxonResNetEncoderWithAttention if (attn_heads and attn_heads > 0) else TaxonResNetEncoder
+        )
+        encoder_kwargs = dict(
             in_channels=in_channels,
             resnet_variant=resnet_variant,
             stage_taxonomy_layers=stage_taxonomy_layers,
@@ -62,6 +74,10 @@ class TaxonAutoencoder(nn.Module):
             use_stem_maxpool=use_stem_maxpool,
             depth_decay=depth_decay,
         )
+        if encoder_cls is TaxonResNetEncoderWithAttention:
+            encoder_kwargs["attn_heads"] = attn_heads
+
+        self.encoder = encoder_cls(**encoder_kwargs)
 
         self.decoder = TaxonResNetDecoder(
             latent_channels=self.encoder.final_channels,
