@@ -20,11 +20,11 @@ cd /nethome/aroy389/flash/aroy389/taxon/TaxonomicWeights
 export PYTHONPATH=$(pwd)
 
 # Config file - can be overridden by command line argument
-CONFIG_FILE=${1:-"configs/cifar10_asymmetric_kl.json"}
+CONFIG_FILE=${1:-"configs/celeba_hq_attention.json"}
 
 echo "Starting CIFAR-10 Taxonomic Autoencoder training at $(date)"
 echo "Using config: $CONFIG_FILE"
 
-srun python tests/train_cifar10_ae.py --config "$CONFIG_FILE"
+srun python tests/train_celeba_hq_ae.py --config "$CONFIG_FILE"
 
 echo "Training script completed at $(date)"

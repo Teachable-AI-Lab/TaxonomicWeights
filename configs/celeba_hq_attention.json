@@ -1,5 +1,5 @@
 {
-  "experiment_name": "taxon_ae_celeba_hq_attn",
+  "experiment_name": "taxon_ae_celeba_hq_attn2",
   "data": {
     "data_root": "./data/celeba_hq",
     "image_size": 256,
@@ -29,13 +29,13 @@
     "learning_rate": 3e-4,
     "weight_decay": 1e-4,
     "warmup_epochs": 3,
-    "dkl_weight": 1e-2,
+    "dkl_weight": 5e-3,
     "save_every": 5,
     "seed": 42,
     "max_train_steps": 0
   },
   "analysis": {
-    "checkpoint_path": "./outputs/taxon_ae_celeba_hq_attn/checkpoints/best.pt",
+    "checkpoint_path": "./outputs/taxon_ae_celeba_hq_attn2/checkpoints/best.pt",
     "num_latent_batches": 50,
     "num_reconstruction_batches": 20,
     "num_multiple_recon_images": 8,
@@ -44,7 +44,7 @@
     "num_taxonomy_batches": 10
   },
   "output": {
-    "output_dir": "./outputs/taxon_ae_celeba_hq_attn",
-    "analysis_save_dir": "./outputs/taxon_ae_celeba_hq_attn/analysis"
+    "output_dir": "./outputs/taxon_ae_celeba_hq_attn2",
+    "analysis_save_dir": "./outputs/taxon_ae_celeba_hq_attn2/analysis"
   }
 }
