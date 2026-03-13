@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Architecture test for SparseConvAutoencoder.
 
-Mirrors tests/test_taxon_ae.py — validates shapes, forward pass, parameter
+Mirrors src/test/test_taxon_ae.py — validates shapes, forward pass, parameter
 counts, and sparsity behaviour for both CelebA-HQ (256×256) and CIFAR-10
 (32×32) configurations.
 """
@@ -16,7 +16,7 @@ import torch
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

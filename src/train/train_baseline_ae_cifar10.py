@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Train BaselineConvAutoencoder on CelebA-HQ (ResNet-18 stage layout).
+"""Train BaselineConvAutoencoder on CIFAR-10 (ResNet-18 stage layout).
 
-Mirrors tests/train_sae_celeba_hq.py exactly, but uses the baseline model
-which has no sparsity penalty.  The ``reg_term`` in the training loop is
-always 0 — kept to share the same checkpoint schema as SAE.
+Mirrors src/train/train_baseline_ae_celeba_hq.py but uses CIFAR10Loader
+(32×32, stem_stride=1, no maxpool).
 
 Loss:
     total = MSE(recon, x)
@@ -26,18 +25,17 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
-from torchvision import transforms
+from torch.utils.data import DataLoader, random_split
 from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.baseline_ae import BaselineConvAutoencoder
-from src.utils.dataloader import CelebAHQLoader
+from src.utils.dataloader import CIFAR10Loader
 
 
 # ---------------------------------------------------------------------------
@@ -69,28 +67,19 @@ def build_scheduler(
 
 
 @torch.no_grad()
-def run_validation(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> dict:
+def run_validation(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
     model.eval()
-    total_loss = total_recon = 0.0
+    total_recon = 0.0
     num_batches = 0
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
         recon, _ = model(images)
-        recon_loss = F.mse_loss(recon, images)
-        total_loss  += float(recon_loss.item())
-        total_recon += float(recon_loss.item())
+        total_recon += float(F.mse_loss(recon, images).item())
         num_batches += 1
     if num_batches == 0:
         return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0}
-    return {
-        "loss":     total_loss  / num_batches,
-        "recon":    total_recon / num_batches,
-        "sparsity": 0.0,
-    }
+    v = total_recon / num_batches
+    return {"loss": v, "recon": v, "sparsity": 0.0}
 
 
 def save_recon_preview(
@@ -116,7 +105,6 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     epochs = history["epochs"]
     if not epochs:
         return
-
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
 
@@ -129,14 +117,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
         ax.plot(epochs, history[vk], label="val",   linewidth=1.5, linestyle="--")
         ax.set_title(title, fontsize=11); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
         ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-        if tk == "train_loss":
-            best_ep = epochs[int(min(range(len(history[vk])),
-                                     key=lambda i: history[vk][i]))]
-            ax.axvline(best_ep, color="red", linestyle=":", linewidth=1.0,
-                       label=f"best val (ep {best_ep})")
-            ax.legend(fontsize=8)
-
-    plt.suptitle("Baseline AE CelebA-HQ training curves", fontsize=13, fontweight="bold")
+    plt.suptitle("Baseline AE CIFAR-10 training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
     out_path = output_dir / "training_curves.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -160,33 +141,32 @@ def parse_args() -> argparse.Namespace:
 
     d = cfg.get("data", {}); m = cfg.get("model", {}); t = cfg.get("training", {}); o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train BaselineConvAutoencoder on CelebA-HQ")
-    parser.add_argument("--config",        type=str,   default="")
-    parser.add_argument("--data-root",     type=str,   default=d.get("data_root",    "./data/celeba_hq"))
-    parser.add_argument("--output-dir",    type=str,   default=o.get("output_dir",   "./outputs/baseline_ae_celeba_hq"))
-    parser.add_argument("--image-size",    type=int,   default=d.get("image_size",   256))
-    parser.add_argument("--batch-size",    type=int,   default=d.get("batch_size",   32))
-    parser.add_argument("--num-workers",   type=int,   default=d.get("num_workers",  8))
-    parser.add_argument("--val-split",     type=float, default=d.get("val_split",    0.05))
-    parser.add_argument("--resnet-variant",type=str,   default=m.get("resnet_variant", "18"))
-    parser.add_argument("--stage-channels",type=int,   nargs=4,
+    parser = argparse.ArgumentParser(description="Train BaselineConvAutoencoder on CIFAR-10")
+    parser.add_argument("--config",         type=str,   default="")
+    parser.add_argument("--data-root",      type=str,   default=d.get("data_root",   "./data"))
+    parser.add_argument("--output-dir",     type=str,   default=o.get("output_dir",  "./outputs/baseline_ae_cifar10"))
+    parser.add_argument("--batch-size",     type=int,   default=d.get("batch_size",  128))
+    parser.add_argument("--num-workers",    type=int,   default=d.get("num_workers", 4))
+    parser.add_argument("--resnet-variant", type=str,   default=m.get("resnet_variant", "18"))
+    parser.add_argument("--stage-channels", type=int,   nargs=4,
                         default=m.get("stage_channels", [64, 128, 256, 512]))
-    parser.add_argument("--stage-strides", type=int,   nargs=4,
+    parser.add_argument("--stage-strides",  type=int,   nargs=4,
                         default=m.get("stage_strides",  [1, 2, 2, 2]))
-    parser.add_argument("--stem-stride",   type=int,   default=m.get("stem_stride",  2))
+    parser.add_argument("--stem-stride",    type=int,   default=m.get("stem_stride", 1))
     parser.add_argument(
         "--use-stem-maxpool",
         action=argparse.BooleanOptionalAction,
-        default=m.get("use_stem_maxpool", True),
+        default=m.get("use_stem_maxpool", False),
     )
-    parser.add_argument("--epochs",        type=int,   default=t.get("epochs",       90))
-    parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate",3e-4))
-    parser.add_argument("--weight-decay",  type=float, default=t.get("weight_decay", 1e-4))
-    parser.add_argument("--warmup-epochs", type=int,   default=t.get("warmup_epochs",3))
-    parser.add_argument("--save-every",    type=int,   default=t.get("save_every",   5))
-    parser.add_argument("--seed",          type=int,   default=t.get("seed",         42))
-    parser.add_argument("--max-train-steps",type=int,  default=t.get("max_train_steps", 0))
-    parser.add_argument("--resume",        type=str,   default="")
+    parser.add_argument("--epochs",         type=int,   default=t.get("epochs",       90))
+    parser.add_argument("--learning-rate",  type=float, default=t.get("learning_rate",3e-4))
+    parser.add_argument("--weight-decay",   type=float, default=t.get("weight_decay", 1e-4))
+    parser.add_argument("--warmup-epochs",  type=int,   default=t.get("warmup_epochs",3))
+    parser.add_argument("--save-every",     type=int,   default=t.get("save_every",   5))
+    parser.add_argument("--seed",           type=int,   default=t.get("seed",         42))
+    parser.add_argument("--max-train-steps",type=int,   default=t.get("max_train_steps", 0))
+    parser.add_argument("--val-split",      type=float, default=0.1)
+    parser.add_argument("--resume",         type=str,   default="")
     return parser.parse_args()
 
 
@@ -206,24 +186,26 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tf = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    celeba_loader = CelebAHQLoader(
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        image_size=args.image_size,
-        val_split=args.val_split,
-        seed=args.seed,
-        pin_memory=(device.type == "cuda"),
-        transform=tf,
+    cifar = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
+    full_train_loader, test_loader = cifar.get_loaders()
+
+    # Carve a small validation split from the training set.
+    full_train = cifar.trainset
+    val_size   = int(len(full_train) * args.val_split)
+    train_size = len(full_train) - val_size
+    train_set, val_set = random_split(
+        full_train,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed),
     )
-    train_loader, val_loader = celeba_loader.get_loaders()
-    if val_loader is None:
-        raise RuntimeError("val_split must be > 0 to produce a validation loader")
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+    )
 
     _mc: dict = {}
     if args.config:
@@ -231,7 +213,7 @@ def main() -> None:
             _mc = json.load(f).get("model", {})
 
     model = BaselineConvAutoencoder(
-        in_channels=_mc.get("in_channels", 3),
+        in_channels=3,
         resnet_variant=args.resnet_variant,
         stage_channels=tuple(args.stage_channels),
         stage_strides=tuple(args.stage_strides),
@@ -256,10 +238,8 @@ def main() -> None:
         epochs=args.epochs,
         warmup_epochs=args.warmup_epochs,
     )
-    start_epoch = 1
-    global_step = 0
-    best_val    = float("inf")
 
+    start_epoch = 1; global_step = 0; best_val = float("inf")
     if args.resume:
         state = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model_state"])
@@ -271,9 +251,9 @@ def main() -> None:
         print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
     print(
-        "Training setup (Baseline AE CelebA-HQ):\n"
+        "Training setup (Baseline AE CIFAR-10):\n"
         f"  device={device}\n"
-        f"  train_size={len(celeba_loader.trainset)}  val_size={len(celeba_loader.valset)}\n"
+        f"  train_size={train_size}  val_size={val_size}\n"
         f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
         f"  lr={args.learning_rate}  wd={args.weight_decay}\n"
         f"  stage_channels={tuple(args.stage_channels)}"
@@ -289,37 +269,43 @@ def main() -> None:
         "val_sparsity":   [],
     }
 
+    _ckpt_args = {
+        "in_channels":       3,
+        "resnet_variant":    args.resnet_variant,
+        "stage_channels":    list(args.stage_channels),
+        "stage_strides":     list(args.stage_strides),
+        "stage_blocks":      _mc.get("stage_blocks", None),
+        "kernel_size":       _mc.get("kernel_size", 3),
+        "use_stem":          _mc.get("use_stem", True),
+        "stem_channels":     _mc.get("stem_channels", 64),
+        "stem_stride":       args.stem_stride,
+        "use_stem_maxpool":  args.use_stem_maxpool,
+        "output_activation": _mc.get("output_activation", "none"),
+    }
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start  = time.time()
-        running_loss = running_recon = 0.0
-        num_batches  = 0
+        running_recon = 0.0
+        num_batches   = 0
 
-        for batch_idx, (images, _) in enumerate(train_loader, start=1):
+        for images, _ in train_loader:
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-
             recon, _ = model(images)
             loss = F.mse_loss(recon, images)
-
             loss.backward()
             optimizer.step()
             scheduler.step()
-
-            running_loss  += float(loss.item())
             running_recon += float(loss.item())
             num_batches   += 1
             global_step   += 1
-
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                 break
 
-        train_stats = {
-            "loss":     running_loss  / max(1, num_batches),
-            "recon":    running_recon / max(1, num_batches),
-            "sparsity": 0.0,
-        }
-        val_stats = run_validation(model, val_loader, device)
+        train_stats = {"loss": running_recon / max(1, num_batches),
+                       "recon": running_recon / max(1, num_batches), "sparsity": 0.0}
+        val_stats   = run_validation(model, val_loader, device)
 
         elapsed = time.time() - epoch_start
         print(
@@ -338,67 +324,28 @@ def main() -> None:
         history["val_sparsity"].append(0.0)
 
         if epoch % args.save_every == 0 or epoch == args.epochs:
-            ckpt_path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            torch.save(
-                {
-                    "epoch":            epoch,
-                    "global_step":      global_step,
-                    "model_state":      model.state_dict(),
-                    "optimizer_state":  optimizer.state_dict(),
-                    "scheduler_state":  scheduler.state_dict(),
-                    "best_val":         best_val,
-                    "args": {
-                        "in_channels":        3,
-                        "resnet_variant":     args.resnet_variant,
-                        "stage_channels":     list(args.stage_channels),
-                        "stage_strides":      list(args.stage_strides),
-                        "stage_blocks":       _mc.get("stage_blocks", None),
-                        "kernel_size":        _mc.get("kernel_size", 3),
-                        "use_stem":           _mc.get("use_stem", True),
-                        "stem_channels":      _mc.get("stem_channels", 64),
-                        "stem_stride":        args.stem_stride,
-                        "use_stem_maxpool":   args.use_stem_maxpool,
-                        "output_activation":  _mc.get("output_activation", "none"),
-                    },
-                    "train_stats":      train_stats,
-                    "val_stats":        val_stats,
-                },
-                ckpt_path,
-            )
+            torch.save({"epoch": epoch, "global_step": global_step,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "best_val": best_val, "args": _ckpt_args,
+                        "train_stats": train_stats, "val_stats": val_stats},
+                       ckpt_dir / f"epoch_{epoch:04d}.pt")
 
         if val_stats["recon"] < best_val:
             best_val = val_stats["recon"]
-            torch.save(
-                {
-                    "epoch":           epoch,
-                    "global_step":     global_step,
-                    "model_state":     model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict(),
-                    "best_val":        best_val,
-                    "args": {
-                        "in_channels":       3,
-                        "resnet_variant":    args.resnet_variant,
-                        "stage_channels":    list(args.stage_channels),
-                        "stage_strides":     list(args.stage_strides),
-                        "stage_blocks":      _mc.get("stage_blocks", None),
-                        "kernel_size":       _mc.get("kernel_size", 3),
-                        "use_stem":          _mc.get("use_stem", True),
-                        "stem_channels":     _mc.get("stem_channels", 64),
-                        "stem_stride":       args.stem_stride,
-                        "use_stem_maxpool":  args.use_stem_maxpool,
-                        "output_activation": _mc.get("output_activation", "none"),
-                    },
-                    "train_stats":     train_stats,
-                    "val_stats":       val_stats,
-                },
-                ckpt_dir / "best.pt",
-            )
+            torch.save({"epoch": epoch, "global_step": global_step,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "best_val": best_val, "args": _ckpt_args,
+                        "train_stats": train_stats, "val_stats": val_stats},
+                       ckpt_dir / "best.pt")
             print(f"  -> New best val_recon={best_val:.6f}  (saved best.pt)")
 
         if epoch % args.save_every == 0:
-            preview_path = preview_dir / f"epoch_{epoch:04d}.png"
-            save_recon_preview(model, val_loader, device, preview_path)
+            save_recon_preview(model, val_loader, device,
+                               preview_dir / f"epoch_{epoch:04d}.png")
             save_training_curves(history, output_dir)
 
     save_training_curves(history, output_dir)

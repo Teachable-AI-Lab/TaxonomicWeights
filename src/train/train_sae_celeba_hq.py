@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train SparseConvAutoencoder on full CelebA-HQ with a ResNet-18 stage layout.
 
-Mirrors tests/train_celeba_hq_ae.py — same training loop structure, same
+Mirrors src/train/train_taxon_ae_celeba_hq.py — same training loop structure, same
 optimizer / scheduler, same checkpoint and preview logic — but uses the SAE
 instead of TaxonAutoencoder.
 
@@ -32,7 +32,7 @@ from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -41,7 +41,7 @@ from src.utils.dataloader import CelebAHQLoader
 
 
 # ---------------------------------------------------------------------------
-# Utilities (identical pattern to train_celeba_hq_ae.py)
+# Utilities (identical pattern to train_taxon_ae_celeba_hq.py)
 # ---------------------------------------------------------------------------
 
 def seed_everything(seed: int) -> None:

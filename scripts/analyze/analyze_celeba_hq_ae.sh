@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Run analysis ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_celeba_hq_ae (job $SLURM_JOB_ID)"
 
-python tests/analyze_celeba_hq_ae.py \
-    --config configs/celeba_hq.json
+python src/analyze/analyze_celeba_hq_ae.py \
+    --config configs/taxon_ae_celeba_hq.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_celeba_hq_ae (job $SLURM_JOB_ID)"

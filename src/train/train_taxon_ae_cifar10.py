@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Train TaxonAutoencoder on full CelebA-HQ with ResNet-18 stage layout.
+"""Train TaxonAutoencoder on CIFAR-10 with a ResNet-18 stage layout.
 
-Common-practice defaults used here:
-- AdamW optimizer
-- cosine learning-rate decay with warmup
-- full precision training (no AMP)
-- MSE reconstruction loss
-- optional taxonomy regularizer (aggregated coverage DKL)
+Same structure as src/train/train_taxon_ae_celeba_hq.py but uses CIFAR10Loader
+and defaults suited to 32×32 images (stem_stride=1, no max-pool, larger batches).
+
+Loss:
+    total = MSE(recon, x) + dkl_weight * dkl + entropy_weight * entropy
 """
 
 from __future__ import annotations
@@ -26,20 +25,22 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
-from torchvision import transforms
+from torch.utils.data import DataLoader, random_split
 from torchvision.utils import make_grid, save_image
 
-# Local module imports.
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.taxon_ae import TaxonAutoencoder
-from src.utils.dataloader import CelebAHQLoader
+from src.utils.dataloader import CIFAR10Loader
 
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -54,7 +55,7 @@ def build_scheduler(
     warmup_epochs: int,
 ) -> LambdaLR:
     """Cosine decay with linear warmup (step-wise)."""
-    total_steps = max(1, steps_per_epoch * epochs)
+    total_steps  = max(1, steps_per_epoch * epochs)
     warmup_steps = max(1, steps_per_epoch * warmup_epochs)
 
     def lr_lambda(step: int) -> float:
@@ -73,33 +74,31 @@ def run_validation(
     device: torch.device,
     hard: bool,
     dkl_weight: float,
+    entropy_weight: float,
 ) -> dict:
     model.eval()
-    total_loss = 0.0
-    total_recon = 0.0
-    total_dkl = 0.0
-    total_entropy = 0.0
+    total_loss = total_recon = total_dkl = total_entropy = 0.0
     num_batches = 0
 
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
         recon, dkl, entropy = model(images, hard=hard)
         recon_loss = F.mse_loss(recon, images)
-        loss = recon_loss + dkl_weight * dkl
+        loss = recon_loss + dkl_weight * dkl + entropy_weight * entropy
 
-        total_loss += float(loss.item())
-        total_recon += float(recon_loss.item())
-        total_dkl += float(dkl.item())
+        total_loss    += float(loss.item())
+        total_recon   += float(recon_loss.item())
+        total_dkl     += float(dkl.item())
         total_entropy += float(entropy.item())
-        num_batches += 1
+        num_batches   += 1
 
     if num_batches == 0:
         return {"loss": 0.0, "recon": 0.0, "dkl": 0.0, "entropy": 0.0}
 
     return {
-        "loss": total_loss / num_batches,
-        "recon": total_recon / num_batches,
-        "dkl": total_dkl / num_batches,
+        "loss":    total_loss    / num_batches,
+        "recon":   total_recon   / num_batches,
+        "dkl":     total_dkl     / num_batches,
         "entropy": total_entropy / num_batches,
     }
 
@@ -119,7 +118,7 @@ def save_recon_preview(
     with torch.no_grad():
         recon, _, _ = model(images, hard=hard)
 
-    # Convert from [-1, 1] to [0, 1] for visualization.
+    # CIFAR10Loader normalises to [-1, 1] — undo here.
     vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
     vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
 
@@ -129,32 +128,20 @@ def save_recon_preview(
 
 
 def save_training_curves(history: dict, output_dir: Path) -> None:
-    """Save loss/DKL training curves to ``output_dir/training_curves.png``.
-
-    Three panels (one row):
-    1. Total loss   — train vs val
-    2. Recon loss   — train vs val
-    3. DKL penalty  — train vs val
-
-    The raw history is also dumped to ``training_history.json`` so it can be
-    replotted offline without re-running training.
-    """
-    import json as _json
-
+    """Save loss/DKL/entropy training curves and raw JSON history."""
     epochs = history["epochs"]
     if not epochs:
         return
 
-    # Persist raw numbers.
     with open(output_dir / "training_history.json", "w") as _f:
-        _json.dump(history, _f, indent=2)
+        json.dump(history, _f, indent=2)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
     panels = [
-        ("Total loss",   "train_loss",  "val_loss"),
-        ("Recon loss",   "train_recon", "val_recon"),
-        ("DKL penalty",  "train_dkl",   "val_dkl"),
+        ("Total loss",      "train_loss",    "val_loss"),
+        ("Recon loss",      "train_recon",   "val_recon"),
+        ("DKL penalty",     "train_dkl",     "val_dkl"),
+        ("Entropy penalty", "train_entropy", "val_entropy"),
     ]
 
     for ax, (title, train_key, val_key) in zip(axes, panels):
@@ -165,7 +152,6 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
         ax.set_ylabel("Loss")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-        # Mark best-val epoch on Total loss panel.
         if train_key == "train_loss":
             best_ep = epochs[int(min(range(len(history[val_key])),
                                     key=lambda i: history[val_key][i]))]
@@ -173,7 +159,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
-    plt.suptitle("Training curves", fontsize=13, fontweight="bold")
+    plt.suptitle("Taxon AE CIFAR-10 training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -182,8 +168,11 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     print(f"Training curves saved to {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
-    # First pass: extract --config so we can use it as a source of defaults.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
     pre_args, _ = pre.parse_known_args()
@@ -198,15 +187,15 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train Taxon ResNet-18 AE on CelebA-HQ")
-    parser.add_argument("--config", type=str, default="", help="Path to JSON config file")
+    parser = argparse.ArgumentParser(description="Train Taxon ResNet-18 AE on CIFAR-10")
+    parser.add_argument("--config", type=str, default="")
     # data
-    parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
-    parser.add_argument("--output-dir", type=str, default=o.get("output_dir", "./outputs/taxon_ae_celeba_hq"))
-    parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
-    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
-    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
-    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
+    parser.add_argument("--data-root",   type=str,   default=d.get("data_root",   "./data"))
+    parser.add_argument("--output-dir",  type=str,   default=o.get("output_dir",  "./outputs/taxon_ae_cifar10"))
+    parser.add_argument("--image-size",  type=int,   default=d.get("image_size",  32))
+    parser.add_argument("--batch-size",  type=int,   default=d.get("batch_size",  128))
+    parser.add_argument("--num-workers", type=int,   default=d.get("num_workers", 4))
+    parser.add_argument("--val-split",   type=float, default=d.get("val_split",   0.1))
     # model
     parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
     parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
@@ -217,60 +206,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False),
                         help="Use hard straight-through routing in taxonomy softmax")
     # training
-    parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
-    parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
-    parser.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
-    parser.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
-    parser.add_argument("--dkl-weight", type=float, default=t.get("dkl_weight", 1e-3))
-    parser.add_argument("--save-every", type=int, default=t.get("save_every", 5))
-    parser.add_argument("--seed", type=int, default=t.get("seed", 42))
-    parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
+    parser.add_argument("--epochs",          type=int,   default=t.get("epochs",          90))
+    parser.add_argument("--learning-rate",   type=float, default=t.get("learning_rate",   3e-4))
+    parser.add_argument("--weight-decay",    type=float, default=t.get("weight_decay",    1e-4))
+    parser.add_argument("--warmup-epochs",   type=int,   default=t.get("warmup_epochs",   3))
+    parser.add_argument("--dkl-weight",      type=float, default=t.get("dkl_weight",      1e-2))
+    parser.add_argument("--entropy-weight",  type=float, default=t.get("entropy_weight",  0.0))
+    parser.add_argument("--save-every",      type=int,   default=t.get("save_every",      5))
+    parser.add_argument("--seed",            type=int,   default=t.get("seed",            42))
+    parser.add_argument("--max-train-steps", type=int,   default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    # Build run suffix from hyperparams so different runs don't collide.
-    dkl_suffix  = f"_dkl_{args.dkl_weight:.0e}"
-    temp_str    = f"{args.temperature:g}".replace(".", "p")
-    temp_suffix = f"_temp_{temp_str}"
-    hard_suffix = "_hard" if args.hard else ""
-    run_suffix  = dkl_suffix + temp_suffix + hard_suffix
-    output_dir = Path(args.output_dir + run_suffix)
-    ckpt_dir = output_dir / "checkpoints"
+    dkl_suffix     = f"_dkl_{args.dkl_weight:.0e}"
+    temp_str       = f"{args.temperature:g}".replace(".", "p")
+    temp_suffix    = f"_temp_{temp_str}"
+    hard_suffix    = "_hard" if args.hard else ""
+    entropy_suffix = f"_ew_{args.entropy_weight:.0e}" if args.entropy_weight else ""
+    run_suffix     = dkl_suffix + temp_suffix + hard_suffix + entropy_suffix
+    output_dir  = Path(args.output_dir + run_suffix)
+    ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tf = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
+    # CIFAR10Loader applies its own normalisation (mean/std=0.5); no extra tf needed.
+    cifar_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
+    full_train_loader, _ = cifar_loader.get_loaders()
 
-    celeba_loader = CelebAHQLoader(
-        data_root=args.data_root,
+    # Carve a proper validation split out of the training set.
+    trainset  = cifar_loader.trainset
+    val_size  = int(len(trainset) * args.val_split)
+    train_size = len(trainset) - val_size
+    generator = torch.Generator().manual_seed(args.seed)
+    train_subset, val_subset = random_split(trainset, [train_size, val_size],
+                                            generator=generator)
+
+    train_loader = DataLoader(
+        train_subset,
         batch_size=args.batch_size,
+        shuffle=True,
         num_workers=args.num_workers,
-        image_size=args.image_size,
-        val_split=args.val_split,
-        seed=args.seed,
         pin_memory=(device.type == "cuda"),
-        transform=tf,
     )
-    train_loader, val_loader = celeba_loader.get_loaders()
-    if val_loader is None:
-        raise RuntimeError("val_split must be > 0 to produce a validation loader")
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
-    # Read extra model params from config if available.
-    _mc = {}
+    # Read model params that are not exposed as CLI flags from config.
+    _mc: dict = {}
     if args.config:
         with open(args.config) as _f:
             _mc = json.load(_f).get("model", {})
@@ -286,8 +285,8 @@ def main() -> None:
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
-        stem_stride=_mc.get("stem_stride", 2),
-        use_stem_maxpool=_mc.get("use_stem_maxpool", True),
+        stem_stride=_mc.get("stem_stride", 1),
+        use_stem_maxpool=_mc.get("use_stem_maxpool", False),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
@@ -306,49 +305,49 @@ def main() -> None:
     )
     start_epoch = 1
     global_step = 0
-    best_val = float("inf")
+    best_val    = float("inf")
 
     if args.resume:
-        resume_path = Path(args.resume)
-        state = torch.load(resume_path, map_location="cpu")
+        state = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(state["model_state"])
         optimizer.load_state_dict(state["optimizer_state"])
         scheduler.load_state_dict(state["scheduler_state"])
-        start_epoch = int(state["epoch"]) + 1
-        global_step = int(state.get("global_step", 0))
-        best_val = float(state.get("best_val", float("inf")))
-        print(f"Resumed from {resume_path} at epoch={start_epoch}")
+        start_epoch  = int(state["epoch"]) + 1
+        global_step  = int(state.get("global_step", 0))
+        best_val     = float(state.get("best_val", float("inf")))
+        print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
     print(
-        "Training setup:\n"
+        "Training setup (Taxon AE CIFAR-10):\n"
         f"  device={device}\n"
-        f"  amp=False\n"
         f"  hard={args.hard}\n"
-        f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
-        f"  batch_size={args.batch_size} epochs={args.epochs}\n"
-        f"  lr={args.learning_rate} wd={args.weight_decay}\n"
+        f"  dkl_weight={args.dkl_weight}  entropy_weight={args.entropy_weight}\n"
+        f"  train_size={train_size}  val_size={val_size}\n"
+        f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
+        f"  lr={args.learning_rate}  wd={args.weight_decay}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 
     history: dict = {
-        "epochs":      [],
-        "train_loss":  [],
-        "train_recon": [],
-        "train_dkl":   [],
-        "val_loss":    [],
-        "val_recon":   [],
-        "val_dkl":     [],
+        "epochs":        [],
+        "train_loss":    [],
+        "train_recon":   [],
+        "train_dkl":     [],
+        "train_entropy": [],
+        "val_loss":      [],
+        "val_recon":     [],
+        "val_dkl":       [],
+        "val_entropy":   [],
     }
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        epoch_start = time.time()
-
-        running_loss = 0.0
-        running_recon = 0.0
-        running_dkl = 0.0
+        epoch_start     = time.time()
+        running_loss    = 0.0
+        running_recon   = 0.0
+        running_dkl     = 0.0
         running_entropy = 0.0
-        num_batches = 0
+        num_batches     = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
@@ -356,23 +355,23 @@ def main() -> None:
 
             recon, dkl, entropy = model(images, hard=args.hard)
             recon_loss = F.mse_loss(recon, images)
-            loss = recon_loss + args.dkl_weight * dkl
+            loss = recon_loss + args.dkl_weight * dkl + args.entropy_weight * entropy
 
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            running_loss += float(loss.item())
-            running_recon += float(recon_loss.item())
-            running_dkl += float(dkl.item())
+            running_loss    += float(loss.item())
+            running_recon   += float(recon_loss.item())
+            running_dkl     += float(dkl.item())
             running_entropy += float(entropy.item())
-            num_batches += 1
-            global_step += 1
+            num_batches     += 1
+            global_step     += 1
 
-            if batch_idx % 50 == 0:
-                avg_loss = running_loss / num_batches
-                avg_recon = running_recon / num_batches
-                avg_dkl = running_dkl / num_batches
+            if batch_idx % 100 == 0:
+                avg_loss    = running_loss    / num_batches
+                avg_recon   = running_recon   / num_batches
+                avg_dkl     = running_dkl     / num_batches
                 avg_entropy = running_entropy / num_batches
                 lr = optimizer.param_groups[0]["lr"]
                 print(
@@ -385,9 +384,9 @@ def main() -> None:
                 break
 
         train_stats = {
-            "loss": running_loss / max(1, num_batches),
-            "recon": running_recon / max(1, num_batches),
-            "dkl": running_dkl / max(1, num_batches),
+            "loss":    running_loss    / max(1, num_batches),
+            "recon":   running_recon   / max(1, num_batches),
+            "dkl":     running_dkl     / max(1, num_batches),
             "entropy": running_entropy / max(1, num_batches),
         }
 
@@ -397,6 +396,7 @@ def main() -> None:
             device=device,
             hard=args.hard,
             dkl_weight=args.dkl_weight,
+            entropy_weight=args.entropy_weight,
         )
 
         elapsed = time.time() - epoch_start
@@ -410,22 +410,24 @@ def main() -> None:
         history["train_loss"].append(train_stats["loss"])
         history["train_recon"].append(train_stats["recon"])
         history["train_dkl"].append(train_stats["dkl"])
+        history["train_entropy"].append(train_stats["entropy"])
         history["val_loss"].append(val_stats["loss"])
         history["val_recon"].append(val_stats["recon"])
         history["val_dkl"].append(val_stats["dkl"])
+        history["val_entropy"].append(val_stats["entropy"])
 
         if epoch % args.save_every == 0:
             ckpt_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"
             state = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "model_state": model.state_dict(),
+                "epoch":           epoch,
+                "global_step":     global_step,
+                "model_state":     model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "best_val": best_val,
-                "args": vars(args),
-                "train_stats": train_stats,
-                "val_stats": val_stats,
+                "best_val":        best_val,
+                "args":            vars(args),
+                "train_stats":     train_stats,
+                "val_stats":       val_stats,
             }
             torch.save(state, ckpt_path)
             torch.save(state, ckpt_dir / "latest.pt")
@@ -433,15 +435,15 @@ def main() -> None:
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
             best_state = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "model_state": model.state_dict(),
+                "epoch":           epoch,
+                "global_step":     global_step,
+                "model_state":     model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "best_val": best_val,
-                "args": vars(args),
-                "train_stats": train_stats,
-                "val_stats": val_stats,
+                "best_val":        best_val,
+                "args":            vars(args),
+                "train_stats":     train_stats,
+                "val_stats":       val_stats,
             }
             torch.save(best_state, ckpt_dir / "best.pt")
 

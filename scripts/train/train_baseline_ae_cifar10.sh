@@ -17,7 +17,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
-python tests/train_baseline_ae_cifar10.py \
+python src/train/train_baseline_ae_cifar10.py \
     --config          ./configs/baseline_ae_cifar10.json \
     --output-dir      ./outputs/baseline_ae_cifar10_r18 \
     --data-root       ./data \

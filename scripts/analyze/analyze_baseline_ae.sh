@@ -23,6 +23,6 @@ conda activate taxon-weights
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_baseline_ae config=$CONFIG (job $SLURM_JOB_ID)"
 
-python tests/analyze_baseline_ae.py --config "$CONFIG"
+python src/analyze/analyze_baseline_ae.py --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_baseline_ae config=$CONFIG (job $SLURM_JOB_ID)"

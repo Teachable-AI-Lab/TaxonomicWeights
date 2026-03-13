@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 # ── path setup ──────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -462,6 +462,714 @@ def visualize_taxonomy_tree(
             print(f"  img{img_idx+1} {name}: tree -> {out_path}")
 
     print(f"Taxonomy tree activations saved to {tree_dir}")
+
+
+# ── 2d. Parse tree analysis and visualization ───────────────────────────────
+
+def extract_parse_tree(
+    model: TaxonAutoencoder,
+    images: torch.Tensor,
+    device: torch.device,
+) -> List[list]:
+    """Extract taxonomy parse-tree decisions for each sample in ``images``.
+
+    For each stage and each depth, this records spatially pooled joint path
+    probabilities, the selected node, decoded path bits/labels, and the
+    per-depth conditional decision probability versus sibling.
+    """
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        raise ValueError("model has no .encoder attribute")
+
+    model.eval()
+    images = images.to(device)
+    batch_size = images.shape[0]
+
+    stage_data = []
+    with torch.no_grad():
+        x = enc.stem(images)
+        for stage_idx, stage in enumerate(enc.taxon_stages):
+            out, logp_all, _ = stage(x)
+            depths = []
+            for depth_idx, (n_ch, logp_chunk) in enumerate(
+                zip(stage.layer_channels, torch.split(logp_all, stage.layer_channels, dim=1))
+            ):
+                prob = logp_chunk.exp()
+                prob_pooled = prob.mean(dim=(2, 3)).cpu().numpy()
+                depths.append((depth_idx + 1, n_ch, prob_pooled))
+            stage_data.append((
+                stage_idx + 1,
+                stage.n_taxonomy_layers,
+                stage.total_out_channels,
+                depths,
+            ))
+            x = out
+
+    per_sample: List[list] = []
+    for sample_idx in range(batch_size):
+        sample_stages = []
+        for stage_num, n_depths, total_ch, depths in stage_data:
+            depths_out = []
+            for depth_num, n_nodes, prob_pooled in depths:
+                probs = prob_pooled[sample_idx]
+                selected = int(probs.argmax())
+                bits = [
+                    (selected >> (depth_num - 1 - b)) & 1
+                    for b in range(depth_num)
+                ]
+                path_str = "-".join("R" if b else "L" for b in bits)
+                sibling = selected ^ 1
+                pair_total = float(probs[selected]) + float(probs[sibling])
+                cond_prob = float(probs[selected]) / max(pair_total, 1e-9)
+                depths_out.append({
+                    "depth": depth_num,
+                    "n_nodes": n_nodes,
+                    "probs": probs,
+                    "selected": selected,
+                    "path_bits": bits,
+                    "path_str": path_str,
+                    "cond_prob": cond_prob,
+                })
+
+            sample_stages.append({
+                "stage": stage_num,
+                "n_depths": n_depths,
+                "total_channels": total_ch,
+                "depths": depths_out,
+            })
+        per_sample.append(sample_stages)
+
+    return per_sample
+
+
+def print_parse_tree(per_sample: List[list], max_samples: int = 4) -> None:
+    """Print a concise parse-tree summary for up to ``max_samples`` samples."""
+    for sample_idx, stages in enumerate(per_sample[:max_samples]):
+        print(f"\n{'='*60}")
+        print(f"  Parse tree — Sample {sample_idx}")
+        print(f"{'='*60}")
+        for stage_info in stages:
+            print(
+                f"\n  Stage {stage_info['stage']} "
+                f"({stage_info['n_depths']} depths, {stage_info['total_channels']} latent channels)"
+            )
+            for d_info in stage_info["depths"]:
+                depth = d_info["depth"]
+                bits = d_info["path_bits"]
+                direction = "R" if bits[-1] else "L"
+                direction_opp = "L" if bits[-1] else "R"
+                cond = d_info["cond_prob"]
+                leaf_p = float(d_info["probs"][d_info["selected"]])
+                indent = "  " * (depth + 1)
+                print(
+                    f"  {indent}depth {depth:2d}: "
+                    f"[{direction} p={cond:.3f} | {direction_opp} p={1-cond:.3f}] "
+                    f"-> path={d_info['path_str']} joint_p={leaf_p:.5f}"
+                )
+
+            leaf = stage_info["depths"][-1]
+            leaf_node = leaf["selected"]
+            print(
+                f"\n  Stage {stage_info['stage']} leaf: node {leaf_node}/{leaf['n_nodes'] - 1} "
+                f"({leaf['path_str']}) joint_p={float(leaf['probs'][leaf_node]):.5f}"
+            )
+
+
+def save_parse_tree_json(per_sample: List[list], path: str) -> None:
+    """Save parse-tree summary to JSON without raw probability arrays."""
+    serialisable = []
+    for stages in per_sample:
+        stage_list = []
+        for stage_info in stages:
+            depth_list = []
+            for depth in stage_info["depths"]:
+                depth_list.append({
+                    "depth": depth["depth"],
+                    "n_nodes": depth["n_nodes"],
+                    "selected": depth["selected"],
+                    "path_bits": depth["path_bits"],
+                    "path_str": depth["path_str"],
+                    "cond_prob": round(float(depth["cond_prob"]), 6),
+                    "joint_prob": round(float(depth["probs"][depth["selected"]]), 6),
+                })
+            stage_list.append({
+                "stage": stage_info["stage"],
+                "n_depths": stage_info["n_depths"],
+                "total_channels": stage_info["total_channels"],
+                "depths": depth_list,
+            })
+        serialisable.append(stage_list)
+
+    with open(path, "w") as f:
+        json.dump(serialisable, f, indent=2)
+    print(f"Parse tree JSON saved to {path}")
+
+
+def visualize_parse_tree(
+    per_sample: List[list],
+    images: torch.Tensor,
+    save_dir: str,
+    max_samples: int = 4,
+) -> None:
+    """Render one parse-tree PNG per sample with one panel per stage."""
+    import matplotlib.cm as cm
+    import matplotlib.patches as mpatches
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    for sample_idx, stages in enumerate(per_sample[:max_samples]):
+        n_stages = len(stages)
+        fig_w = 3.5 + 4.5 * n_stages
+        fig_h = 6
+        fig, axes = plt.subplots(1, n_stages + 1, figsize=(fig_w, fig_h))
+        fig.patch.set_facecolor("#1a1a2e")
+        for ax in axes:
+            ax.set_facecolor("#1a1a2e")
+
+        ax_img = axes[0]
+        img_np = images[sample_idx].cpu().float().numpy()
+        img_np = np.clip(img_np * 0.5 + 0.5, 0, 1)
+        if img_np.shape[0] == 3:
+            img_np = img_np.transpose(1, 2, 0)
+        elif img_np.shape[0] == 1:
+            img_np = img_np[0]
+        ax_img.imshow(img_np, cmap="gray" if img_np.ndim == 2 else None)
+        ax_img.set_title(f"Sample {sample_idx}", color="white", fontsize=10, pad=6)
+        ax_img.axis("off")
+
+        cmap = cm.get_cmap("YlOrRd")
+        for col, stage_info in enumerate(stages):
+            ax = axes[col + 1]
+            ax.set_xlim(-1, 1)
+            depths = stage_info["depths"]
+            n_depths = len(depths)
+            ax.set_ylim(-0.5, n_depths + 0.5)
+            ax.set_title(
+                f"Stage {stage_info['stage']}\n({n_depths} depths)",
+                color="white",
+                fontsize=9,
+                pad=6,
+            )
+            ax.axis("off")
+
+            selected_per_depth = [d["selected"] for d in depths]
+
+            for d_idx, d_info in enumerate(depths):
+                y = n_depths - d_idx
+                n_nodes = d_info["n_nodes"]
+                probs = d_info["probs"]
+                selected = d_info["selected"]
+                xs = np.linspace(-0.9, 0.9, n_nodes)
+
+                if d_idx + 1 < n_depths:
+                    y_child = n_depths - (d_idx + 1)
+                    n_children = n_nodes * 2
+                    xs_child = np.linspace(-0.9, 0.9, n_children)
+                    for node_i, x_parent in enumerate(xs):
+                        lc = node_i * 2
+                        rc = node_i * 2 + 1
+                        for child_i in (lc, rc):
+                            on_path = (
+                                selected_per_depth[d_idx] == node_i
+                                and selected_per_depth[d_idx + 1] == child_i
+                            )
+                            ax.plot(
+                                [x_parent, xs_child[child_i]],
+                                [y, y_child],
+                                color="#e63946" if on_path else "#444466",
+                                lw=2.5 if on_path else 0.7,
+                                zorder=1,
+                            )
+
+                for node_i, (x_node, prob_val) in enumerate(zip(xs, probs)):
+                    colour = cmap(float(prob_val) / max(probs.max(), 1e-9))
+                    is_selected = node_i == selected
+                    circle = plt.Circle(
+                        (x_node, y),
+                        radius=0.07 if n_nodes <= 32 else 0.04,
+                        color=colour,
+                        ec="#e63946" if is_selected else "#888899",
+                        lw=2.0 if is_selected else 0.5,
+                        zorder=2,
+                    )
+                    ax.add_patch(circle)
+
+            sm = plt.cm.ScalarMappable(
+                cmap=cmap,
+                norm=plt.Normalize(vmin=0, vmax=float(depths[-1]["probs"].max())),
+            )
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, orientation="vertical")
+            cbar.ax.yaxis.set_tick_params(color="white")
+            cbar.outline.set_edgecolor("white")
+            plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="white", fontsize=6)
+            cbar.set_label("joint prob", color="white", fontsize=7)
+
+        sel_patch = mpatches.Patch(color="#e63946", label="selected path")
+        fig.legend(
+            handles=[sel_patch],
+            loc="lower center",
+            ncol=1,
+            facecolor="#1a1a2e",
+            edgecolor="white",
+            labelcolor="white",
+            fontsize=8,
+        )
+
+        plt.suptitle(
+            f"Taxonomy Parse Tree - Sample {sample_idx}",
+            color="white",
+            fontsize=12,
+            fontweight="bold",
+            y=1.01,
+        )
+        plt.tight_layout()
+        out_path = os.path.join(save_dir, f"parse_tree_sample_{sample_idx:03d}.png")
+        plt.savefig(
+            out_path,
+            dpi=150,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
+        plt.close()
+        print(f"  parse tree figure saved: {out_path}")
+
+
+def analyze_parse_tree(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 4,
+) -> None:
+    """Run parse-tree analysis and save outputs to ``save_dir/parse_tree_viz``."""
+    parse_dir = os.path.join(save_dir, "parse_tree_viz")
+    os.makedirs(parse_dir, exist_ok=True)
+
+    model.eval()
+    images, _ = next(iter(data_loader))
+    images = images[:num_images]
+
+    trees = extract_parse_tree(model, images, device)
+    print_parse_tree(trees, max_samples=num_images)
+    save_parse_tree_json(trees, os.path.join(parse_dir, "parse_tree_summary.json"))
+    visualize_parse_tree(trees, images, save_dir=parse_dir, max_samples=num_images)
+    print(f"Parse tree analysis saved to {parse_dir}")
+
+
+# ── 2e. Hierarchical activation maps ─────────────────────────────────────────
+
+def extract_hierarchical_activations(
+    model: TaxonAutoencoder,
+    images: torch.Tensor,
+    device: torch.device,
+) -> List[dict]:
+    """Run the encoder and return per-depth gated activations for every stage.
+
+    For each encoder stage and each taxonomy depth we capture::
+
+        gated_acts  (B, 2^d, H, W)  – logits * joint path probability
+        raw_logits  (B, 2^d, H, W)  – pre-gating logits from the residual blocks
+        probs       (B, 2^d, H, W)  – joint path probability (root-to-node)
+
+    Returns a list of dicts, one per stage::
+
+        {"stage": int, "n_depths": int, "depths": [{"depth", "n_nodes",
+          "gated_acts", "raw_logits", "probs"}, ...]}
+    """
+    enc = getattr(model, "encoder", None)
+    if enc is None:
+        raise ValueError("model has no .encoder attribute")
+
+    model.eval()
+    images = images.to(device)
+    all_stage_data = []
+
+    with torch.no_grad():
+        x = enc.stem(images)
+        for stage_idx, stage in enumerate(enc.taxon_stages):
+            logits_per_depth = stage._taxon_logits_per_depth(x)
+            depths = []
+            prev_logp = None
+            stage_outputs = []
+
+            for d_idx, logits in enumerate(logits_per_depth):
+                log_cond = stage._pairwise_log_softmax(logits)
+                logp = (
+                    log_cond
+                    if prev_logp is None
+                    else log_cond + prev_logp.repeat_interleave(2, dim=1)
+                )
+                prob = logp.exp()
+                out = logits * prob
+                stage_outputs.append(out)
+
+                depths.append({
+                    "depth": d_idx + 1,
+                    "n_nodes": logits.shape[1],
+                    "gated_acts": out.cpu().float(),
+                    "raw_logits": logits.cpu().float(),
+                    "probs": prob.cpu().float(),
+                })
+                prev_logp = logp
+
+            x = torch.cat(stage_outputs, dim=1)
+            all_stage_data.append({
+                "stage": stage_idx + 1,
+                "n_depths": stage.n_taxonomy_layers,
+                "depths": depths,
+            })
+
+    return all_stage_data
+
+
+def _render_hierarchical_activations(
+    s_idx: int,
+    stage_info: dict,
+    max_depth: int,
+    max_cols: int,
+    use_nms: bool,
+    nms_threshold: float,
+    save_dir: str,
+) -> None:
+    """Render one (sample, stage) PNG for gated hierarchical activations."""
+    import matplotlib
+    matplotlib.use("Agg")
+
+    stage_num = stage_info["stage"]
+    depths = stage_info["depths"][:max_depth]
+    n_rows = len(depths)
+    max_cols_here = min(depths[-1]["n_nodes"], max_cols)
+
+    cell = 1.6
+    fig_w = max(6.0, cell * max_cols_here)
+    fig_h = cell * n_rows + 0.6
+
+    fig, axes = plt.subplots(n_rows, max_cols_here, figsize=(fig_w, fig_h),
+                             squeeze=False, facecolor="#0f0f1c")
+    fig.subplots_adjust(hspace=0.55, wspace=0.12,
+                        left=0.06, right=0.98, top=0.90, bottom=0.04)
+
+    for ax in axes.flat:
+        ax.set_visible(False)
+
+    if use_nms:
+        _winner_maps, _winner_probs, _conf_masks = [], [], []
+        for d_info in depths:
+            pm = d_info["probs"][s_idx]             # (n_nodes, H, W)
+            w = pm.argmax(dim=0).numpy()
+            wp = pm.max(dim=0).values.numpy()
+            cm_ = wp > nms_threshold
+            _winner_maps.append(w)
+            _winner_probs.append(wp)
+            _conf_masks.append(cm_)
+
+    for row, d_info in enumerate(depths):
+        d = d_info["depth"]
+        n_nodes = d_info["n_nodes"]
+        gated = d_info["gated_acts"][s_idx]         # (n_nodes, H, W)
+        prob_maps = d_info["probs"][s_idx]           # (n_nodes, H, W)
+        prob_vals = prob_maps.mean(dim=(-1, -2)).numpy()
+        selected = int(prob_vals.argmax())
+
+        if use_nms:
+            _wmap = _winner_maps[row]
+            _cmask = _conf_masks[row]
+
+        if n_nodes <= max_cols_here:
+            show_nodes = list(range(n_nodes))
+            col_offset = (max_cols_here - n_nodes) // 2
+        else:
+            half = max_cols_here // 2
+            start = max(0, min(selected - half, n_nodes - max_cols_here))
+            show_nodes = list(range(start, start + max_cols_here))
+            col_offset = 0
+
+        for col_idx, node_i in enumerate(show_nodes):
+            col = col_offset + col_idx
+            if col >= max_cols_here:
+                break
+            ax = axes[row, col]
+            ax.set_visible(True)
+            ax.set_facecolor("#0f0f1c")
+
+            act = gated[node_i].numpy()
+            if use_nms:
+                nms_mask = (_wmap == node_i) & _cmask
+                act = act * nms_mask.astype(act.dtype)
+
+            vmax = float(abs(act).max()) or 1e-6
+            ax.imshow(act, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                      aspect="auto", interpolation="nearest")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            is_sel = node_i == selected
+            ec = "#e63946" if is_sel else "#2a2a4a"
+            lw = 2.2 if is_sel else 0.5
+            for spine in ax.spines.values():
+                spine.set_edgecolor(ec)
+                spine.set_linewidth(lw)
+
+            p = float(prob_vals[node_i])
+            label = (f"*{node_i}" if is_sel else f"{node_i}") + f"\n{p:.3f}"
+            ax.set_title(label, fontsize=5.5,
+                         color="#e63946" if is_sel else "#7070a0",
+                         pad=1.5)
+
+        left_col = col_offset if n_nodes <= max_cols_here else 0
+        axes[row, left_col].set_ylabel(
+            f"depth {d}", color="#aaaacc", fontsize=6.5, rotation=90, labelpad=3,
+        )
+
+    nms_tag = " [NMS]" if use_nms else ""
+    fig.suptitle(
+        f"Hierarchical Activations{nms_tag}  *  Sample {s_idx}  *  Stage {stage_num}",
+        color="white", fontsize=10, fontweight="bold",
+    )
+
+    suffix = "_nms" if use_nms else ""
+    out_path = os.path.join(save_dir, f"hier_acts_s{s_idx:03d}_stage{stage_num}{suffix}.png")
+    plt.savefig(out_path, dpi=140, facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  saved {out_path}")
+
+    # winner-map overview (NMS only)
+    if use_nms:
+        import matplotlib.cm as _cm
+        from matplotlib.colors import BoundaryNorm, ListedColormap
+
+        wfig, waxes = plt.subplots(
+            1, len(depths),
+            figsize=(3.5 * len(depths), 3.5),
+            facecolor="#0f0f1c",
+            squeeze=False,
+        )
+        wfig.subplots_adjust(wspace=0.15, left=0.04, right=0.96, top=0.82, bottom=0.06)
+
+        for col, (d_info, wmap, wprob, cmask) in enumerate(
+            zip(depths, _winner_maps, _winner_probs, _conf_masks)
+        ):
+            ax = waxes[0, col]
+            ax.set_facecolor("#0f0f1c")
+            n_nodes = d_info["n_nodes"]
+
+            disp = np.where(cmask, wmap, -1).astype(float)
+            cmap_nodes = _cm.get_cmap("tab20", n_nodes)
+            colors = ["#0f0f1c"] + [cmap_nodes(i / max(n_nodes - 1, 1)) for i in range(n_nodes)]
+            lmap = ListedColormap(colors)
+            lnorm = BoundaryNorm([-1.5] + [i - 0.5 for i in range(n_nodes + 1)], len(colors))
+
+            ax.imshow(disp, cmap=lmap, norm=lnorm, aspect="auto", interpolation="nearest")
+            alpha_map = np.clip(wprob * cmask.astype(float), 0, 1)
+            ax.imshow(alpha_map, cmap="gray", alpha=0.25, aspect="auto", interpolation="nearest")
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"depth {d_info['depth']}  ({n_nodes} nodes)",
+                         color="#aaaacc", fontsize=8, pad=3)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#333355")
+
+        thresh_str = f"  (thr={nms_threshold:.2f})" if nms_threshold > 0 else ""
+        wfig.suptitle(
+            f"Winner Map{thresh_str}  *  Sample {s_idx}  *  Stage {stage_num}",
+            color="white", fontsize=10, fontweight="bold",
+        )
+        wout = os.path.join(save_dir, f"winner_map_s{s_idx:03d}_stage{stage_num}.png")
+        wfig.savefig(wout, dpi=140, facecolor=wfig.get_facecolor())
+        plt.close(wfig)
+        print(f"  saved {wout}")
+
+
+def analyze_hierarchical_activations(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 4,
+    max_depth: int = 4,
+    max_cols: int = 16,
+    use_nms: bool = False,
+    nms_threshold: float = 0.0,
+) -> None:
+    """Extract and visualise hierarchical gated activations, saving to
+    ``save_dir/hierarchical_activations``."""
+    hier_dir = os.path.join(save_dir, "hierarchical_activations")
+    os.makedirs(hier_dir, exist_ok=True)
+
+    model.eval()
+    images, _ = next(iter(data_loader))
+    images = images[:num_images]
+
+    print("  extracting hierarchical activations...")
+    stage_data = extract_hierarchical_activations(model, images, device)
+
+    for s_idx in range(len(images)):
+        for stage_info in stage_data:
+            _render_hierarchical_activations(
+                s_idx, stage_info,
+                max_depth=max_depth,
+                max_cols=max_cols,
+                use_nms=use_nms,
+                nms_threshold=nms_threshold,
+                save_dir=hier_dir,
+            )
+
+    print(f"Hierarchical activation maps saved to {hier_dir}")
+
+
+# ── 2f. Binary split maps ─────────────────────────────────────────────────────
+
+def analyze_binary_split_maps(
+    model: TaxonAutoencoder,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 4,
+    max_depth: int = 4,
+    max_pairs: int = 8,
+) -> None:
+    """Visualise per–sibling-pair conditional split maps, saving to
+    ``save_dir/binary_split_maps``.
+
+    At each depth and for each sibling pair ``(2k, 2k+1)`` a spatial map is
+    computed::
+
+        cond_left(h, w) = P_joint(2k, h, w) / (P_joint(2k, h, w) + P_joint(2k+1, h, w))
+
+    Colour (RdBu_r): blue = right wins, red = left wins, white = uncertain.
+    Alpha is proportional to the parent joint probability so only unambiguous
+    routing regions are opaque.
+    """
+    import matplotlib.cm as cm
+
+    split_dir = os.path.join(save_dir, "binary_split_maps")
+    os.makedirs(split_dir, exist_ok=True)
+
+    model.eval()
+    images, _ = next(iter(data_loader))
+    images = images[:num_images]
+
+    print("  extracting activations for binary split maps...")
+    stage_data = extract_hierarchical_activations(model, images, device)
+
+    rdbu = cm.get_cmap("RdBu_r")
+    bg_colour = np.array([0.06, 0.06, 0.11, 1.0])
+
+    for s_idx in range(len(images)):
+        for stage_info in stage_data:
+            stage_num = stage_info["stage"]
+            depths = stage_info["depths"][:max_depth]
+            n_rows = len(depths)
+
+            max_pairs_here = min(depths[-1]["n_nodes"] // 2, max_pairs)
+            max_pairs_here = max(max_pairs_here, 1)
+
+            cell_w, cell_h = 2.0, 2.0
+            fig_w = max(5.0, cell_w * max_pairs_here + 1.0)
+            fig_h = cell_h * n_rows + 0.9
+
+            fig, axes = plt.subplots(n_rows, max_pairs_here, figsize=(fig_w, fig_h),
+                                     squeeze=False, facecolor="#0f0f1c")
+            fig.subplots_adjust(hspace=0.65, wspace=0.08,
+                                left=0.07, right=0.97, top=0.88, bottom=0.05)
+
+            for ax in axes.flat:
+                ax.set_visible(False)
+
+            for row, d_info in enumerate(depths):
+                d = d_info["depth"]
+                n_nodes = d_info["n_nodes"]
+                n_pairs = n_nodes // 2
+
+                probs = d_info["probs"][s_idx]           # (n_nodes, H, W) tensor
+                prob_vals = probs.mean(dim=(-1, -2)).numpy()
+                selected_node = int(prob_vals.argmax())
+                selected_pair = selected_node // 2
+
+                if n_pairs <= max_pairs_here:
+                    show_pairs = list(range(n_pairs))
+                    col_offset = (max_pairs_here - n_pairs) // 2
+                else:
+                    half = max_pairs_here // 2
+                    start = max(0, min(selected_pair - half,
+                                      n_pairs - max_pairs_here))
+                    show_pairs = list(range(start, start + max_pairs_here))
+                    col_offset = 0
+
+                p_parent_all = float((probs[0::2] + probs[1::2]).max())
+                p_parent_all = max(p_parent_all, 1e-9)
+
+                for col_idx, pair_k in enumerate(show_pairs):
+                    col = col_offset + col_idx
+                    if col >= max_pairs_here:
+                        break
+                    ax = axes[row, col]
+                    ax.set_visible(True)
+                    ax.set_facecolor("#0f0f1c")
+
+                    p_l = probs[2 * pair_k].numpy()
+                    p_r = probs[2 * pair_k + 1].numpy()
+                    p_parent = p_l + p_r
+                    cond_left = p_l / np.maximum(p_parent, 1e-9)
+                    alpha = np.clip(p_parent / p_parent_all * 4.0, 0.0, 1.0)
+
+                    rgba = rdbu(cond_left).astype(np.float64)
+                    rgba[..., 3] = alpha
+                    H_img, W_img = cond_left.shape
+                    bg = np.ones((H_img, W_img, 4)) * bg_colour
+                    ax.imshow(bg, aspect="auto", interpolation="nearest")
+                    ax.imshow(rgba, aspect="auto", interpolation="nearest")
+
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+
+                    is_sel = pair_k == selected_pair
+                    ec = "#e63946" if is_sel else "#1e1e3a"
+                    lw = 2.5 if is_sel else 0.6
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor(ec)
+                        spine.set_linewidth(lw)
+
+                    mean_cond = float(cond_left.mean())
+                    arrow = "<- L" if mean_cond > 0.5 else "R ->"
+                    conf = abs(mean_cond - 0.5) * 2.0
+                    title_col = "#e63946" if is_sel else "#8888aa"
+                    ax.set_title(
+                        f"{'* ' if is_sel else ''}L{2*pair_k}|R{2*pair_k+1}\n"
+                        f"{arrow}  {conf:.2f}",
+                        fontsize=5.5, color=title_col, pad=1.5,
+                    )
+
+                left_col = col_offset if n_pairs <= max_pairs_here else 0
+                axes[row, left_col].set_ylabel(
+                    f"depth {d}", color="#aaaacc", fontsize=7, rotation=90, labelpad=3,
+                )
+
+            sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(vmin=0, vmax=1))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=axes[:, -1], fraction=0.05, pad=0.02,
+                                orientation="vertical")
+            cbar.set_ticks([0.0, 0.5, 1.0])
+            cbar.set_ticklabels(["Right\n(P=1)", "Uncertain", "Left\n(P=1)"], fontsize=5.5)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            cbar.outline.set_edgecolor("white")
+            plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="white")
+            cbar.set_label("P(left | parent)", color="white", fontsize=7)
+
+            fig.suptitle(
+                f"Binary Split Maps  *  Sample {s_idx}  *  Stage {stage_num}\n"
+                f"(alpha proportional to parent probability)",
+                color="white", fontsize=9, fontweight="bold",
+            )
+            out_path = os.path.join(split_dir,
+                                    f"split_map_s{s_idx:03d}_stage{stage_num}.png")
+            plt.savefig(out_path, dpi=140, facecolor=fig.get_facecolor())
+            plt.close()
+            print(f"  saved {out_path}")
+
+    print(f"Binary split maps saved to {split_dir}")
 
 
 # ── 3. Latent space sparsity ──────────────────────────────────────────────────
@@ -988,7 +1696,7 @@ def visualize_stage_activations(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze ResNet Taxon Autoencoder")
-    parser.add_argument("--config", type=str, default="configs/celeba_hq.json",
+    parser.add_argument("--config", type=str, default="configs/taxon_ae_celeba_hq.json",
                         help="Path to JSON config; must set analysis.checkpoint_path")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Override checkpoint path from config")
@@ -1016,6 +1724,11 @@ def main() -> None:
     num_recon_sets      = analysis_cfg.get("num_reconstructions_per_image", 8)
     num_act_images      = analysis_cfg.get("num_activation_images", 3)
     num_taxon_batches   = analysis_cfg.get("num_taxonomy_batches", 10)
+    num_parse_images    = analysis_cfg.get("num_parse_tree_images", 4)
+    num_hier_images     = analysis_cfg.get("num_hier_act_images", 4)
+    max_hier_depth      = analysis_cfg.get("max_hier_act_depth", 4)
+    num_split_images    = analysis_cfg.get("num_split_map_images", 4)
+    max_split_pairs     = analysis_cfg.get("max_split_pairs", 8)
 
     dkl_weight  = config.get("training", {}).get("dkl_weight", None)
     temperature = config.get("model", {}).get("temperature", None)
@@ -1095,6 +1808,21 @@ def main() -> None:
     print("\n" + "=" * 80 + "\n2c. Taxonomy Tree Activations\n" + "=" * 80)
     visualize_taxonomy_tree(model, eval_loader, device, save_dir,
                             num_images=num_act_images)
+
+    print("\n" + "=" * 80 + "\n2d. Parse Tree Analysis\n" + "=" * 80)
+    analyze_parse_tree(model, eval_loader, device, save_dir,
+                       num_images=num_parse_images)
+
+    print("\n" + "=" * 80 + "\n2e. Hierarchical Activation Maps\n" + "=" * 80)
+    analyze_hierarchical_activations(model, eval_loader, device, save_dir,
+                                     num_images=num_hier_images,
+                                     max_depth=max_hier_depth)
+
+    print("\n" + "=" * 80 + "\n2f. Binary Split Maps\n" + "=" * 80)
+    analyze_binary_split_maps(model, eval_loader, device, save_dir,
+                              num_images=num_split_images,
+                              max_depth=max_hier_depth,
+                              max_pairs=max_split_pairs)
 
     print("\n" + "=" * 80 + "\n3. Latent Space Analysis\n" + "=" * 80)
     analyze_latent_sparsity(model, eval_loader, device, save_dir,

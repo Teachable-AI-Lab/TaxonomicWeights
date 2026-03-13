@@ -17,7 +17,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
-python tests/compare_celeba_hq.py \
+python src/compare/compare_celeba_hq.py \
     --outputs-dir    ./outputs \
     --save-dir       ./outputs/comparison_celeba_hq \
     --data-root      ./data/celeba_hq \

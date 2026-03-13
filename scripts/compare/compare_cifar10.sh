@@ -17,7 +17,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
-python tests/compare_cifar10.py \
+python src/compare/compare_cifar10.py \
     --outputs-dir       ./outputs \
     --save-dir          ./outputs/comparison_cifar10 \
     --data-root         ./data \

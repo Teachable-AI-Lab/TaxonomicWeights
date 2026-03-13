@@ -21,6 +21,6 @@ conda activate taxon-weights
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_sae config=$CONFIG (job $SLURM_JOB_ID)"
 
-python tests/analyze_sae.py --config "$CONFIG"
+python src/analyze/analyze_sae.py --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_sae config=$CONFIG (job $SLURM_JOB_ID)"

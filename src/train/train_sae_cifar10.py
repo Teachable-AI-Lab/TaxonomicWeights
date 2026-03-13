@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train SparseConvAutoencoder on CIFAR-10.
 
-Same structure as tests/train_sae_celeba_hq.py but uses CIFAR10Loader and
+Same structure as src/train/train_sae_celeba_hq.py but uses CIFAR10Loader and
 defaults suited to 32×32 images (stem_stride=1, no max-pool, larger batches).
 
 Loss:
@@ -31,7 +31,7 @@ from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Run test ───────────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting test_taxon_ae (job $SLURM_JOB_ID)"
 
-python tests/test_taxon_ae.py \
+python src/test/test_taxon_ae.py \
     --image-size 256 \
     --batch-size 2 \
     --resnet-variant 18 \

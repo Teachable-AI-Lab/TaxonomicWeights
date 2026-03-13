@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Architecture test (CelebA-HQ config: 256×256, stem maxpool on) ─────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Testing SAE — CelebA-HQ config (job $SLURM_JOB_ID)"
 
-python tests/test_sae.py \
+python src/test/test_sae.py \
     --image-size 256 \
     --batch-size 2 \
     --resnet-variant 18 \
@@ -34,7 +34,7 @@ python tests/test_sae.py \
 # ── Architecture test (CIFAR-10 config: 32×32, no stem maxpool) ────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Testing SAE — CIFAR-10 config"
 
-python tests/test_sae.py \
+python src/test/test_sae.py \
     --image-size 32 \
     --batch-size 4 \
     --resnet-variant 18 \
