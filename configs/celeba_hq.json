@@ -14,7 +14,7 @@
     "stage_strides": [1, 2, 2, 2],
     "stage_blocks": null,
     "temperature": 0.2,
-    "hard": true,
+    "hard": false,
     "kernel_size": 3,
     "use_stem": true,
     "stem_channels": 64,
