@@ -53,18 +53,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.taxon_ae import TaxonAutoencoder
+from src.model.multi_taxon_ae import MultiTaxonAutoencoder
 from src.model.sae import SparseConvAutoencoder
+from src.model.topk_sae import TopKSparseConvAutoencoder
+from src.model.gated_sae import GatedSparseConvAutoencoder
 from src.model.baseline_ae import BaselineConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 from torchvision import transforms  # noqa: F401 (used in transform construction)
 
 
 # ─── colour palette ────────────────────────────────────────────────────────────
-# taxon = blue family, sae = orange family, baseline = green family.
+# taxon = blue family, multi_taxon = purple family, sae = orange family, baseline = green family.
 _TAXON_PALETTE = [
     "#1f77b4", "#4e9fc7", "#1a5a8a", "#6baed6",
     "#08519c", "#2171b5", "#4292c6", "#74add1",
     "#9ecae1",
+]
+_MULTI_TAXON_PALETTE = [
+    "#9467bd", "#7b4f9e", "#c5a0d8", "#6a3d9a",
+    "#8c6abf", "#b48fd4", "#5c2d91",
 ]
 _SAE_PALETTE = [
     "#ff7f0e", "#e55e00", "#ffa64d", "#cc4a00",
@@ -73,13 +80,27 @@ _SAE_PALETTE = [
 _BASELINE_PALETTE = [
     "#2ca02c", "#1a7a1a", "#5fd35f", "#3d8c3d",
 ]
+_TOPK_SAE_PALETTE = [
+    "#d62728", "#c03030", "#e85555", "#a82020",
+    "#ff4444", "#cc2222",
+]
+_GATED_SAE_PALETTE = [
+    "#17becf", "#0fa8b8", "#2dcfe0", "#0d8a98",
+    "#1ac5d6", "#14a8b8",
+]
 
 
 def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
     if model_type == "taxon":
         return _TAXON_PALETTE[idx_within_type % len(_TAXON_PALETTE)]
+    if model_type == "multi_taxon":
+        return _MULTI_TAXON_PALETTE[idx_within_type % len(_MULTI_TAXON_PALETTE)]
     if model_type == "sae":
         return _SAE_PALETTE[idx_within_type % len(_SAE_PALETTE)]
+    if model_type == "topk_sae":
+        return _TOPK_SAE_PALETTE[idx_within_type % len(_TOPK_SAE_PALETTE)]
+    if model_type == "gated_sae":
+        return _GATED_SAE_PALETTE[idx_within_type % len(_GATED_SAE_PALETTE)]
     return _BASELINE_PALETTE[idx_within_type % len(_BASELINE_PALETTE)]
 
 
@@ -88,14 +109,22 @@ def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
 def _short_name(run_dir: str) -> str:
     """Make a readable short name for plot labels."""
     n = run_dir
-    for prefix in ("taxon_ae_celeba_hq_r18_", "sae_celeba_hq_r18_",
-                   "baseline_ae_celeba_hq_r18", "baseline_ae_celeba_hq"):
+    for prefix in ("multi_taxon_ae_celeba_hq_r18_", "taxon_ae_celeba_hq_r18_",
+                   "sae_topk_celeba_hq_r18_", "sae_gated_celeba_hq_r18_",
+                   "sae_celeba_hq_r18_", "baseline_ae_celeba_hq_r18",
+                   "baseline_ae_celeba_hq"):
         n = n.replace(prefix, "").strip("_")
     n = n.replace("_", " ").strip()
     return n or "baseline"
 
 
 def _model_type(run_dir: str) -> str:
+    if run_dir.startswith("multi_taxon_"):
+        return "multi_taxon"
+    if run_dir.startswith("sae_topk_"):
+        return "topk_sae"
+    if run_dir.startswith("sae_gated_"):
+        return "gated_sae"
     if run_dir.startswith("sae_"):
         return "sae"
     if run_dir.startswith("baseline_"):
@@ -133,17 +162,23 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
             "history":    run_path / "training_history.json",
             "analysis":   run_path / "analysis",
         })
-    # sort: taxon first, then sae, then baseline
-    _order = {"taxon": 0, "sae": 1, "baseline": 2}
+    # sort: taxon first, then multi_taxon, then sae variants, then baseline
+    _order = {"taxon": 0, "multi_taxon": 1, "sae": 2, "topk_sae": 3, "gated_sae": 4, "baseline": 5}
     runs.sort(key=lambda r: (_order.get(r["type"], 9), r["name"]))
-    taxon_i = sae_i = baseline_i = 0
+    taxon_i = multi_taxon_i = sae_i = topk_sae_i = gated_sae_i = baseline_i = 0
     for r in runs:
         if r["type"] == "taxon":
-            r["colour"] = model_colour(r["name"], "taxon",    taxon_i);    taxon_i    += 1
+            r["colour"] = model_colour(r["name"], "taxon",       taxon_i);       taxon_i       += 1
+        elif r["type"] == "multi_taxon":
+            r["colour"] = model_colour(r["name"], "multi_taxon", multi_taxon_i); multi_taxon_i += 1
         elif r["type"] == "sae":
-            r["colour"] = model_colour(r["name"], "sae",      sae_i);      sae_i      += 1
+            r["colour"] = model_colour(r["name"], "sae",         sae_i);         sae_i         += 1
+        elif r["type"] == "topk_sae":
+            r["colour"] = model_colour(r["name"], "topk_sae",    topk_sae_i);    topk_sae_i    += 1
+        elif r["type"] == "gated_sae":
+            r["colour"] = model_colour(r["name"], "gated_sae",   gated_sae_i);   gated_sae_i   += 1
         else:
-            r["colour"] = model_colour(r["name"], "baseline", baseline_i); baseline_i += 1
+            r["colour"] = model_colour(r["name"], "baseline",    baseline_i);    baseline_i    += 1
     return runs
 
 
@@ -173,18 +208,42 @@ def load_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TaxonAutoen
     return model, ckpt
 
 
-def load_sae_model(ckpt_path: Path, device: torch.device) -> Tuple[SparseConvAutoencoder, dict]:
+def load_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[MultiTaxonAutoencoder, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
-    model = SparseConvAutoencoder(
+    model = MultiTaxonAutoencoder(
+        in_channels=a.get("in_channels", 3),
+        resnet_variant=a.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [5, 6, 7, 8])),
+        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=a.get("stage_blocks", None),
+        n_hierarchies=a.get("n_hierarchies", 3),
+        temperature=a.get("temperature", 1.0),
+        hard=a.get("hard", False),
+        kernel_size=a.get("kernel_size", 3),
+        use_stem=a.get("use_stem", True),
+        stem_channels=a.get("stem_channels", 64),
+        stem_stride=a.get("stem_stride", 2),
+        use_stem_maxpool=a.get("use_stem_maxpool", True),
+        output_activation=a.get("output_activation", "none"),
+        depth_decay=a.get("depth_decay", 0.5),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_sae_model(ckpt_path: Path, device: torch.device):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    variant = a.get("model_variant", "l1")
+
+    common = dict(
         in_channels=a.get("in_channels", 3),
         resnet_variant=a.get("resnet_variant", "18"),
         stage_channels=tuple(a.get("stage_channels", [64, 128, 256, 512])),
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
-        sparsity_type=a.get("sparsity_type", "l1"),
-        sparsity_target=a.get("sparsity_target", 0.05),
-        latent_activation=a.get("latent_activation", "relu"),
         kernel_size=a.get("kernel_size", 3),
         use_stem=a.get("use_stem", True),
         stem_channels=a.get("stem_channels", 64),
@@ -192,6 +251,27 @@ def load_sae_model(ckpt_path: Path, device: torch.device) -> Tuple[SparseConvAut
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
     )
+
+    if variant == "topk":
+        model = TopKSparseConvAutoencoder(
+            **common,
+            topk_k=a.get("topk_k", 64),
+            k_aux=a.get("k_aux", 64),
+            use_aux_loss=False,
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+    elif variant == "gated":
+        model = GatedSparseConvAutoencoder(
+            **common,
+            use_gate_ste=a.get("use_gate_ste", False),
+        )
+    else:
+        model = SparseConvAutoencoder(
+            **common,
+            sparsity_type=a.get("sparsity_type", "l1"),
+            sparsity_target=a.get("sparsity_target", 0.05),
+            latent_activation=a.get("latent_activation", "relu"),
+        )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
     return model, ckpt
@@ -221,7 +301,9 @@ def load_baseline_model(ckpt_path: Path, device: torch.device) -> Tuple[Baseline
 def load_model(run: Dict, device: torch.device):
     if run["type"] == "taxon":
         return load_taxon_model(run["best_ckpt"], device)
-    if run["type"] == "sae":
+    if run["type"] == "multi_taxon":
+        return load_multi_taxon_model(run["best_ckpt"], device)
+    if run["type"] in {"sae", "topk_sae", "gated_sae"}:
         return load_sae_model(run["best_ckpt"], device)
     return load_baseline_model(run["best_ckpt"], device)
 
@@ -248,6 +330,8 @@ def compute_live_metrics(
         imgs = imgs.to(device)
         if run["type"] == "taxon":
             recon, _, _ = model(imgs)
+        elif run["type"] == "multi_taxon":
+            recon, _, _, _, _ = model(imgs)
         else:
             recon, _    = model(imgs)
         z, _ = model.encode(imgs)
@@ -379,6 +463,8 @@ def collect_reconstructions(
     with torch.no_grad():
         if run["type"] == "taxon":
             recon, _, _ = model(imgs)
+        elif run["type"] == "multi_taxon":
+            recon, _, _, _, _ = model(imgs)
         else:
             recon, _ = model(imgs)
 
@@ -706,8 +792,14 @@ def make_page3_feature_quality(
         if mse is not None and sp is not None:
             if r["type"] == "taxon":
                 marker = "o"
+            elif r["type"] == "multi_taxon":
+                marker = "D"
             elif r["type"] == "sae":
                 marker = "s"
+            elif r["type"] == "topk_sae":
+                marker = "P"
+            elif r["type"] == "gated_sae":
+                marker = "h"
             else:
                 marker = "^"
             ax_sc.scatter(sp, mse, color=r["colour"], s=80,
@@ -717,7 +809,7 @@ def make_page3_feature_quality(
                            xytext=(4, 4), fontsize=5.5)
     ax_sc.set_xlabel("Mean Latent Sparsity (fraction zero)")
     ax_sc.set_ylabel("Val MSE (lower is better)")
-    ax_sc.set_title("Sparsity vs Reconstruction Trade-off\n○=Taxon  □=SAE  △=Baseline", fontsize=9)
+    ax_sc.set_title("Sparsity vs Reconstruction Trade-off\n○=Taxon  ◇=MultiTaxon  □=L1-SAE  ✛=TopK-SAE  ⬡=Gated-SAE  △=Baseline", fontsize=9)
     ax_sc.grid(alpha=0.3)
 
     plt.suptitle("Feature Quality & Sparsity–Reconstruction Trade-off — CelebA-HQ",

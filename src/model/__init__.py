@@ -1,6 +1,14 @@
-from .encoder import TaxonResNetEncoder, TaxonResNetStage, ResidualConvBlock, resolve_resnet_stage_blocks
+from .encoder import (
+    TaxonResNetEncoder,
+    TaxonResNetStage,
+    ResidualConvBlock,
+    resolve_resnet_stage_blocks,
+    MultiTaxonResNetStage,
+    MultiTaxonResNetEncoder,
+)
 from .decoder import TaxonResNetDecoder, TaxonDecodeStage, ResidualDeconvBlock
 from .taxon_ae import TaxonAutoencoder
+from .multi_taxon_ae import MultiTaxonAutoencoder
 from .sae_encoder import ConvSAEStage, ConvSAEEncoder
 from .sae import SparseConvAutoencoder
 from .baseline_ae import BaselineConvAutoencoder
@@ -14,6 +22,9 @@ __all__ = [
     "ResidualConvBlock",
     "ResidualDeconvBlock",
     "resolve_resnet_stage_blocks",
+    "MultiTaxonResNetStage",
+    "MultiTaxonResNetEncoder",
+    "MultiTaxonAutoencoder",
     "SparseConvAutoencoder",
     "ConvSAEEncoder",
     "ConvSAEStage",

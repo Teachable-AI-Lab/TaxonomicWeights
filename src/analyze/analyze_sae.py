@@ -55,25 +55,76 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.sae import SparseConvAutoencoder
+from src.model.topk_sae import TopKSparseConvAutoencoder
+from src.model.gated_sae import GatedSparseConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+
+
+# ---------------------------------------------------------------------------
+# Output-dir helpers
+# ---------------------------------------------------------------------------
+
+def _training_output_dir_suffix(cfg: dict) -> str:
+    """Reconstruct the hyperparameter suffix the training script appended.
+
+    Training scripts never write to the bare ``output_dir`` from the config;
+    they always append a suffix that encodes the key hyperparameters so that
+    multiple runs co-exist.  This function replicates that logic so the
+    analyze script can find the correct checkpoint directory.
+
+    Suffix patterns:
+      * TopK:  ``_k{topk_k}_sw{sparsity_weight:.0e}``
+      * Gated: ``_sw{sparsity_weight:.0e}[_ste]``
+      * L1/KL: ``_spw_{sparsity_weight:.0e}_spt_{sparsity_type}``
+    """
+    mc  = cfg.get("model", {})
+    tc  = cfg.get("training", {})
+    variant = mc.get("model_variant", "l1")
+    sw  = tc.get("sparsity_weight", 1e-3)
+
+    if variant == "topk":
+        k = mc.get("topk_k", 64)
+        return f"_k{k}_sw{sw:.0e}"
+    elif variant == "gated":
+        ste_tag = "_ste" if mc.get("use_gate_ste", False) else ""
+        return f"_sw{sw:.0e}{ste_tag}"
+    else:  # l1 / kl
+        spt = mc.get("sparsity_type", "l1")
+        return f"_spw_{sw:.0e}_spt_{spt}"
+
+
+def _resolve_output_dir(cfg: dict) -> Path:
+    """Return the actual output directory including the training-script suffix.
+
+    Falls back to the bare config path if neither the suffixed nor the bare
+    directory exists (e.g. when the user provides an explicit ``--checkpoint``).
+    """
+    base   = Path(cfg["output"]["output_dir"])
+    suffix = _training_output_dir_suffix(cfg)
+    full   = Path(str(base) + suffix)
+    # Prefer the suffixed path; fall back gracefully if it doesn't exist yet
+    # (e.g. dry-run with --checkpoint override).
+    if full.exists() or not base.exists():
+        return full
+    return base
 
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(ckpt_path: Path, device: torch.device) -> SparseConvAutoencoder:
+def load_model(ckpt_path: Path, device: torch.device) -> nn.Module:
+    """Load any SAE-family checkpoint (L1/KL, TopK, or Gated) by inspecting args."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
-    model = SparseConvAutoencoder(
+    variant = a.get("model_variant", "l1")
+
+    common = dict(
         in_channels=a.get("in_channels", 3),
         resnet_variant=a.get("resnet_variant", "18"),
         stage_channels=tuple(a.get("stage_channels", [64, 128, 256, 512])),
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
-        sparsity_type=a.get("sparsity_type", "l1"),
-        sparsity_target=a.get("sparsity_target", 0.05),
-        latent_activation=a.get("latent_activation", "relu"),
         kernel_size=a.get("kernel_size", 3),
         use_stem=a.get("use_stem", True),
         stem_channels=a.get("stem_channels", 64),
@@ -81,14 +132,38 @@ def load_model(ckpt_path: Path, device: torch.device) -> SparseConvAutoencoder:
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
     )
+
+    if variant == "topk":
+        model = TopKSparseConvAutoencoder(
+            **common,
+            topk_k=a.get("topk_k", 64),
+            k_aux=a.get("k_aux", 64),
+            use_aux_loss=False,   # disable during analysis
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+        print(f"  variant=topk  topk_k={a.get('topk_k', 64)}")
+    elif variant == "gated":
+        model = GatedSparseConvAutoencoder(
+            **common,
+            use_gate_ste=a.get("use_gate_ste", False),
+        )
+        print(f"  variant=gated  use_gate_ste={a.get('use_gate_ste', False)}")
+    else:
+        model = SparseConvAutoencoder(
+            **common,
+            sparsity_type=a.get("sparsity_type", "l1"),
+            sparsity_target=a.get("sparsity_target", 0.05),
+            latent_activation=a.get("latent_activation", "relu"),
+        )
+        print(f"  variant=l1/kl  sparsity_type={a.get('sparsity_type','l1')}  "
+              f"sparsity_target={a.get('sparsity_target', 0.05)}  "
+              f"latent_activation={a.get('latent_activation','relu')}")
+
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
     epoch = ckpt.get("epoch", "?")
     best  = ckpt.get("best_val", float("nan"))
     print(f"Loaded checkpoint: epoch={epoch}  best_val={best:.6f}")
-    print(f"  sparsity_type={a.get('sparsity_type','l1')}  "
-          f"sparsity_target={a.get('sparsity_target', 0.05)}  "
-          f"latent_activation={a.get('latent_activation','relu')}")
     return model
 
 
@@ -610,13 +685,17 @@ def analyze_sparsity_suite(
     ax.legend(fontsize=8)
 
     ax = axes[2]
-    ax.hist(dim_kurt, bins=50, color="darkorange", edgecolor="none", alpha=0.85)
-    ax.axvline(dim_kurt.mean(), color="red", linestyle="--",
-               label=f"mean={dim_kurt.mean():.2f}")
+    dim_kurt_finite = dim_kurt[np.isfinite(dim_kurt)]
+    kurt_data = dim_kurt_finite if len(dim_kurt_finite) > 0 else np.array([0.0])
+    ax.hist(kurt_data, bins=50, color="darkorange", edgecolor="none", alpha=0.85)
+    kurt_mean = float(dim_kurt_finite.mean()) if len(dim_kurt_finite) > 0 else float("nan")
+    if np.isfinite(kurt_mean):
+        ax.axvline(kurt_mean, color="red", linestyle="--",
+                   label=f"mean={kurt_mean:.2f}")
+        ax.legend(fontsize=8)
     ax.set_title("Per-Dim Activation Kurtosis")
     ax.set_xlabel("Kurtosis")
     ax.set_ylabel("# Dims")
-    ax.legend(fontsize=8)
 
     fig.suptitle("Feature Selectivity Analysis", fontsize=11)
     plt.tight_layout()
@@ -630,7 +709,7 @@ def analyze_sparsity_suite(
     D = Zf.shape[1]
     ablation_fracs = [0.0, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
     # Sort dims by mean abs activation (most → least important)
-    sorted_dims = np.argsort(mean_act_per_dim)[::-1]
+    sorted_dims = np.argsort(mean_act_per_dim)[::-1].copy()
 
     abl_mse_mean, abl_mse_std = [], []
     n_abl_samples = min(256, len(imgs_all))
@@ -975,9 +1054,14 @@ def main() -> None:
     with open(args.config) as f:
         cfg = json.load(f)
 
-    output_dir = Path(cfg["output"]["output_dir"])
+    output_dir = _resolve_output_dir(cfg)
     ckpt_path  = Path(args.checkpoint) if args.checkpoint else output_dir / "checkpoints" / "best.pt"
-    save_dir   = Path(args.save_dir)   if args.save_dir   else Path(cfg["output"]["analysis_save_dir"])
+    # Derive analysis save dir from the resolved (suffixed) output_dir so results
+    # land alongside the checkpoint rather than in the bare base directory.
+    if args.save_dir:
+        save_dir = Path(args.save_dir)
+    else:
+        save_dir = output_dir / "analysis"
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Config:     {args.config}")

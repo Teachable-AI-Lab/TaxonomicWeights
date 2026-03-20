@@ -146,6 +146,163 @@ def visualize_stage_filters(model: TaxonAutoencoder, save_dir: str, n_cols: int 
         print(f"  Stage {s_idx}: {n_show}/{out_ch} filters -> {out_path}")
 
 
+# ── 1b. Filter similarity analysis ──────────────────────────────────────────
+
+def _normalized_filter_matrix(conv: nn.Conv2d) -> np.ndarray:
+    """Return L2-normalised filter matrix (n_out, in_ch*kH*kW)."""
+    w = conv.weight.detach().cpu().float()
+    W = w.view(w.shape[0], -1).numpy()
+    norms = np.linalg.norm(W, axis=1, keepdims=True)
+    return W / (norms + 1e-8)
+
+
+def _save_simmat(
+    sim: np.ndarray,
+    title: str,
+    path: str,
+    leaf_start: int = -1,
+) -> None:
+    """Save a cosine-similarity heatmap, optionally marking the leaf boundary."""
+    n = len(sim)
+    sz = max(3.5, min(n * 0.08 + 1.0, 14.0))
+    fig, ax = plt.subplots(figsize=(sz, sz))
+    im = ax.imshow(sim, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if 0 < leaf_start < n:
+        ax.axhline(leaf_start - 0.5, color="lime", linewidth=1.5, label="leaf start")
+        ax.axvline(leaf_start - 0.5, color="lime", linewidth=1.5)
+        ax.legend(fontsize=7, loc="upper right")
+    ax.set_title(title, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def analyze_filter_similarity(model: TaxonAutoencoder, save_dir: str) -> None:
+    """Pairwise cosine-similarity analysis of all and leaf filters at each stage.
+
+    For every encoder stage this produces:
+      filter_similarity/stage{S}/block{B}_{conv}_simmat.png  – per-Conv2d sim matrix
+      filter_similarity/stage{S}/leaf_simmat.png             – leaf channels only
+      filter_similarity/stage{S}/cross_block_simmat.png      – cross-block output convs
+      filter_similarity/stage{S}/output_vs_leaf_hist.png     – histogram comparison
+    Plus a cross-stage summary bar chart and a stats npz.
+    """
+    base_dir = os.path.join(save_dir, "filter_similarity")
+    os.makedirs(base_dir, exist_ok=True)
+
+    n_stages = len(model.encoder.taxon_stages)
+    stage_stats: Dict[int, dict] = {}
+
+    for s_idx, stage in enumerate(model.encoder.taxon_stages, start=1):
+        stage_dir = os.path.join(base_dir, f"stage{s_idx}")
+        os.makedirs(stage_dir, exist_ok=True)
+
+        n_leaf = stage.layer_channels[-1]   # 2^L — deepest taxonomy depth
+        total  = stage.total_out_channels   # (2^(L+1)) - 2
+
+        # ── per-block, per-Conv2d sim matrices ─────────────────────────────
+        output_convs: List[np.ndarray] = []  # last Conv2d of each block
+        for b_idx, block in enumerate(stage.blocks):
+            convs_in_block = [(name, m) for name, m in block.main.named_modules()
+                              if isinstance(m, nn.Conv2d)]
+            for c_name, conv in convs_in_block:
+                W = _normalized_filter_matrix(conv)
+                sim = W @ W.T
+                leaf_start = total - n_leaf if W.shape[0] == total else -1
+                _save_simmat(
+                    sim,
+                    title=(f"Stage {s_idx} block{b_idx} conv{c_name}\n"
+                           f"({W.shape[0]} filters, {W.shape[1]} dims)"),
+                    path=os.path.join(stage_dir, f"block{b_idx}_conv{c_name}_simmat.png"),
+                    leaf_start=leaf_start,
+                )
+            if convs_in_block:
+                output_convs.append(_normalized_filter_matrix(convs_in_block[-1][1]))
+
+        # ── cross-block: last Conv2d of each block vs every other block ────
+        if len(output_convs) >= 2 and all(W.shape == output_convs[0].shape for W in output_convs):
+            n_blk = len(output_convs)
+            fig, axes = plt.subplots(n_blk, n_blk,
+                                     figsize=(4 * n_blk, 4 * n_blk),
+                                     squeeze=False)
+            for bi in range(n_blk):
+                for bj in range(n_blk):
+                    cross = output_convs[bi] @ output_convs[bj].T
+                    axes[bi, bj].imshow(cross, cmap="RdBu_r", vmin=-1, vmax=1,
+                                        interpolation="nearest")
+                    axes[bi, bj].set_title(f"b{bi} vs b{bj}", fontsize=8)
+                    axes[bi, bj].set_xticks([]); axes[bi, bj].set_yticks([])
+            plt.suptitle(f"Stage {s_idx}: cross-block output-conv cosine sim",
+                         fontsize=10, fontweight="bold")
+            plt.tight_layout()
+            plt.savefig(os.path.join(stage_dir, "cross_block_simmat.png"),
+                        dpi=150, bbox_inches="tight")
+            plt.close()
+
+        # ── leaf filters from last block's last Conv2d ─────────────────────
+        last_W   = output_convs[-1]           # (total, dim)
+        leaf_W   = last_W[total - n_leaf:]    # (n_leaf, dim)
+        sim_leaf = leaf_W @ leaf_W.T
+        _save_simmat(
+            sim_leaf,
+            title=(f"Stage {s_idx}: leaf filter cosine sim\n"
+                   f"({n_leaf} leaf channels, L={stage.n_taxonomy_layers})"),
+            path=os.path.join(stage_dir, "leaf_simmat.png"),
+        )
+
+        # ── histogram: all output filters vs leaf filters ──────────────────
+        sim_all   = last_W @ last_W.T
+        mask_all  = ~np.eye(total,  dtype=bool)
+        mask_leaf = ~np.eye(n_leaf, dtype=bool)
+        vals_all  = sim_all[mask_all]
+        vals_leaf = sim_leaf[mask_leaf]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(vals_all,  bins=60,             alpha=0.6, density=True, color="steelblue",
+                label=f"All output filters ({total}ch)  mean={vals_all.mean():.3f}")
+        ax.hist(vals_leaf, bins=max(10, n_leaf), alpha=0.6, density=True, color="tomato",
+                label=f"Leaf filters ({n_leaf}ch)  mean={vals_leaf.mean():.3f}")
+        ax.axvline(vals_all.mean(),  color="steelblue", linestyle="--", linewidth=1.5)
+        ax.axvline(vals_leaf.mean(), color="tomato",    linestyle="--", linewidth=1.5)
+        ax.set_xlabel("Cosine similarity"); ax.set_ylabel("Density")
+        ax.set_title(f"Stage {s_idx}: pairwise filter cosine similarity distribution")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(stage_dir, "output_vs_leaf_hist.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+
+        stage_stats[s_idx] = dict(
+            mean_sim_all=float(vals_all.mean()),   std_sim_all=float(vals_all.std()),
+            mean_sim_leaf=float(vals_leaf.mean()), std_sim_leaf=float(vals_leaf.std()),
+            n_filters=int(total), n_leaf=int(n_leaf),
+        )
+        print(f"  Stage {s_idx}: all={total} filters (mean_sim={vals_all.mean():.3f}), "
+              f"leaf={n_leaf} (mean_sim={vals_leaf.mean():.3f})")
+
+    # ── cross-stage summary ────────────────────────────────────────────────
+    labels = [f"S{i+1}" for i in range(n_stages)]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].bar(labels, [stage_stats[i+1]["mean_sim_all"]  for i in range(n_stages)],
+                color="steelblue", edgecolor="black", linewidth=0.5)
+    axes[0].set_title("Mean pairwise sim — all output filters")
+    axes[0].set_ylabel("Mean cosine similarity"); axes[0].grid(axis="y", alpha=0.3)
+    axes[1].bar(labels, [stage_stats[i+1]["mean_sim_leaf"] for i in range(n_stages)],
+                color="tomato", edgecolor="black", linewidth=0.5)
+    axes[1].set_title("Mean pairwise sim — leaf filters only")
+    axes[1].set_ylabel("Mean cosine similarity"); axes[1].grid(axis="y", alpha=0.3)
+    plt.suptitle("Filter Similarity Summary — All Stages", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_dir, "summary_mean_sim.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    np.savez(
+        os.path.join(base_dir, "filter_similarity_stats.npz"),
+        **{f"stage{s}_{k}": np.array(v) for s, d in stage_stats.items() for k, v in d.items()},
+    )
+    print(f"Filter similarity analysis saved to {base_dir}")
+
+
 # ── 2. Taxonomy probability distributions ────────────────────────────────────
 
 def visualize_taxonomy_distributions(
@@ -1799,6 +1956,9 @@ def main() -> None:
 
     print("\n" + "=" * 80 + "\n1. Stage Filter Visualization\n" + "=" * 80)
     visualize_stage_filters(model, save_dir)
+
+    print("\n" + "=" * 80 + "\n1b. Filter Similarity Analysis\n" + "=" * 80)
+    analyze_filter_similarity(model, save_dir)
 
     print("\n" + "=" * 80 + "\n2. Taxonomy Probability Distributions\n" + "=" * 80)
     visualize_taxonomy_distributions(model, eval_loader, device, save_dir,

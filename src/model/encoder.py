@@ -433,9 +433,346 @@ class TaxonResNetEncoder(nn.Module):
         return x, details
 
 
+class MultiTaxonResNetStage(nn.Module):
+    """One ResNet stage with K independent taxonomy hierarchies and an inter-hierarchy gate.
+
+    Each hierarchy independently routes input features through a binary-tree taxonomy
+    of depth ``n_taxonomy_layers`` (exactly like :class:`TaxonResNetStage`).  A
+    lightweight inter-hierarchy gate — a K-way per-spatial-location softmax — then
+    scales each hierarchy's output, encouraging only one hierarchy to dominate at any
+    given location::
+
+        gate  ∈ R^{B × K × H_out × W_out}   (K-way softmax over dim=1)
+        out_k ∈ R^{B × C_taxon × H_out × W_out}
+        output = concat(gate_k * out_k  for k = 1..K)
+               ∈ R^{B × (K · C_taxon) × H_out × W_out}
+
+    Sparse routing is enforced at two levels:
+
+    * **Within-hierarchy**: one active path per spatial location via the pairwise
+      softmax tree (identical to :class:`TaxonResNetStage`).
+    * **Across-hierarchies**: the inter-hierarchy gate pushes one hierarchy to
+      dominate per spatial location.
+
+    Regularization terms returned by :meth:`forward`:
+
+    * ``entropy``     — mean per-spatial path entropy, summed over K hierarchies.
+    * ``dkl``         — path-marginal KL, summed over K hierarchies.
+    * ``gate_entropy``— per-spatial entropy of the inter-hierarchy gate (lower → spikier).
+    * ``gate_dkl``    — KL(gate-marginal || uniform over K).
+    * ``gate_probs``  — the raw gate tensor ``[B, K, H, W]`` for analysis.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_taxonomy_layers: int,
+        n_blocks: int,
+        n_hierarchies: int = 3,
+        stride: int = 1,
+        kernel_size: int = 3,
+        temperature: float = 1.0,
+        hard: bool = False,
+        depth_decay: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if n_hierarchies < 1:
+            raise ValueError(f"n_hierarchies must be >= 1, got {n_hierarchies}")
+        if n_taxonomy_layers < 1:
+            raise ValueError(f"n_taxonomy_layers must be >= 1, got {n_taxonomy_layers}")
+
+        self.in_channels = in_channels
+        self.n_taxonomy_layers = n_taxonomy_layers
+        self.n_hierarchies = n_hierarchies
+        self.n_blocks = n_blocks
+        self.stride = stride
+        self.temperature = float(temperature)
+        self.default_hard = bool(hard)
+        self.depth_decay = float(depth_decay)
+
+        # K independent taxonomy stages — each has its own residual blocks and routing.
+        self.hierarchies = nn.ModuleList([
+            TaxonResNetStage(
+                in_channels=in_channels,
+                n_taxonomy_layers=n_taxonomy_layers,
+                n_blocks=n_blocks,
+                stride=stride,
+                kernel_size=kernel_size,
+                temperature=temperature,
+                hard=hard,
+                depth_decay=depth_decay,
+            )
+            for _ in range(n_hierarchies)
+        ])
+
+        # Inter-hierarchy gate: lightweight strided 1×1 conv → BN → K-way softmax.
+        # stride matches the encoder-stage downsampling so gate and hierarchy outputs
+        # share the same spatial resolution H_out × W_out.
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(in_channels, n_hierarchies, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(n_hierarchies),
+        )
+
+        self.hierarchy_out_channels: int = TaxonResNetStage.output_channels(n_taxonomy_layers)
+        self.layer_channels: List[int] = self.hierarchies[0].layer_channels  # alias for compat
+        self.total_out_channels: int = n_hierarchies * self.hierarchy_out_channels
+
+    def _compute_gate(
+        self,
+        x: torch.Tensor,
+        hard: bool,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Return inter-hierarchy gate probabilities ``[B, K, H_out, W_out]``."""
+        logits = self.gate_conv(x)                                        # [B, K, H, W]
+        gate_soft = torch.softmax(logits / self.temperature, dim=1)       # [B, K, H, W]
+        if hard:
+            argmax = gate_soft.argmax(dim=1, keepdim=True)
+            gate_hard = torch.zeros_like(logits).scatter_(1, argmax, 1.0)
+            gate = gate_hard - gate_soft.detach() + gate_soft
+        else:
+            gate = gate_soft
+        return gate.clamp_min(eps)
+
+    def _gate_regularization(
+        self,
+        gate: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute gate entropy and coverage KL from ``gate [B, K, H, W]``.
+
+        Returns ``(gate_entropy, gate_dkl)`` — lower gate_entropy means one
+        hierarchy dominates (spiky); positive gate_dkl means the marginal
+        deviates from uniform.
+        """
+        log_gate = gate.log()
+        gate_entropy = -(gate * log_gate).sum(dim=1).mean()
+
+        marginal = gate.mean(dim=(0, 2, 3))                               # [K]
+        marginal = marginal / marginal.sum().clamp_min(eps)
+        uniform_logp = -math.log(self.n_hierarchies)
+        gate_dkl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
+
+        return gate_entropy, gate_dkl
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Run multi-hierarchy stage forward pass.
+
+        Returns:
+            - Concatenated gate-scaled outputs ``[B, K·C_taxon, H, W]``.
+            - Concatenated log path probabilities ``[B, K·C_logp, H, W]``.
+            - Regs dict: ``entropy``, ``dkl``, ``gate_entropy``, ``gate_dkl``,
+              ``gate_probs``.
+        """
+        if hard is None:
+            hard = self.default_hard
+
+        gate = self._compute_gate(x, hard=hard)          # [B, K, H_out, W_out]
+        gate_entropy, gate_dkl = self._gate_regularization(gate)
+
+        total_entropy = x.new_zeros(())
+        total_dkl     = x.new_zeros(())
+        all_outputs:   List[torch.Tensor] = []
+        all_logps:     List[torch.Tensor] = []
+
+        for k, hierarchy in enumerate(self.hierarchies):
+            out_k, logp_k, regs_k = hierarchy(x, hard=hard)     # [B, C, H, W]
+            gate_k = gate[:, k : k + 1, :, :]                   # [B, 1, H, W]
+            all_outputs.append(out_k * gate_k)
+            all_logps.append(logp_k)
+            total_entropy = total_entropy + regs_k["entropy"]
+            total_dkl     = total_dkl     + regs_k["dkl"]
+
+        return (
+            torch.cat(all_outputs, dim=1),
+            torch.cat(all_logps,   dim=1),
+            {
+                "entropy":      total_entropy,
+                "dkl":          total_dkl,
+                "gate_entropy": gate_entropy,
+                "gate_dkl":     gate_dkl,
+                "gate_probs":   gate,   # [B, K, H, W] — kept for analysis
+            },
+        )
+
+
+class MultiTaxonResNetEncoder(nn.Module):
+    """ResNet-like encoder with K independent taxonomy hierarchies per stage.
+
+    Each stage uses :class:`MultiTaxonResNetStage`.  Because each stage outputs
+    ``n_hierarchies × C_taxon`` channels, intermediate feature sizes grow by that
+    factor::
+
+        stem(stem_ch) → stage1(K·C1) → stage2(K·C2) → stage3(K·C3) → stage4(K·C4)
+
+    The decoder receives ``stage_input_channels`` that already account for this
+    inflation, so :class:`~.decoder.TaxonResNetDecoder` can be used unchanged.
+
+    Parameters
+    ----------
+    n_hierarchies:
+        Number of independent taxonomy trees per stage.
+    stage_taxonomy_layers:
+        Depth of the binary-tree taxonomy per stage (shared across all hierarchies
+        within that stage).
+    All other parameters mirror :class:`TaxonResNetEncoder`.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        resnet_variant: str | int = "18",
+        stage_taxonomy_layers: Sequence[int] = (5, 6, 7, 8),
+        stage_strides: Sequence[int] = (1, 2, 2, 2),
+        stage_blocks: Optional[Sequence[int]] = None,
+        n_hierarchies: int = 3,
+        temperature: float = 1.0,
+        hard: bool = False,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        depth_decay: float = 0.5,
+    ) -> None:
+        super().__init__()
+
+        resolved_stage_blocks = resolve_resnet_stage_blocks(
+            resnet_variant=resnet_variant,
+            stage_blocks=stage_blocks,
+        )
+
+        if not (len(resolved_stage_blocks) == len(stage_taxonomy_layers) == len(stage_strides)):
+            raise ValueError(
+                "stage_blocks, stage_taxonomy_layers, and stage_strides must have equal length. "
+                f"Got {len(resolved_stage_blocks)}, {len(stage_taxonomy_layers)}, {len(stage_strides)}"
+            )
+
+        self.in_channels = in_channels
+        self.resnet_variant = str(resnet_variant)
+        self.stage_blocks = tuple(int(v) for v in resolved_stage_blocks)
+        self.stage_taxonomy_layers = tuple(int(v) for v in stage_taxonomy_layers)
+        self.stage_strides = tuple(int(v) for v in stage_strides)
+        self.n_hierarchies = int(n_hierarchies)
+        self.temperature = float(temperature)
+        self.default_hard = bool(hard)
+        self.use_stem = bool(use_stem)
+        self.stem_stride = int(stem_stride)
+        self.use_stem_maxpool = bool(use_stem_maxpool)
+
+        # ── stem ──────────────────────────────────────────────────────────────
+        if self.use_stem:
+            stem_ops: List[nn.Module] = [
+                nn.Conv2d(in_channels, stem_channels, kernel_size=7,
+                          stride=self.stem_stride, padding=3, bias=False),
+                nn.BatchNorm2d(stem_channels),
+                nn.ReLU(inplace=True),
+            ]
+            if self.use_stem_maxpool:
+                stem_ops.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+            self.stem = nn.Sequential(*stem_ops)
+            current_channels = stem_channels
+            self.stem_total_stride = self.stem_stride * (2 if self.use_stem_maxpool else 1)
+        else:
+            self.stem = nn.Identity()
+            current_channels = in_channels
+            self.stem_total_stride = 1
+
+        # ── multi-hierarchy stages ─────────────────────────────────────────────
+        self.stage_input_channels: List[int] = []
+        self.multi_taxon_stages = nn.ModuleList()
+
+        for blocks, n_layers, stride in zip(
+            self.stage_blocks, self.stage_taxonomy_layers, self.stage_strides
+        ):
+            self.stage_input_channels.append(current_channels)
+            stage = MultiTaxonResNetStage(
+                in_channels=current_channels,
+                n_taxonomy_layers=n_layers,
+                n_blocks=blocks,
+                n_hierarchies=self.n_hierarchies,
+                stride=stride,
+                kernel_size=kernel_size,
+                temperature=self.temperature,
+                hard=self.default_hard,
+                depth_decay=depth_decay,
+            )
+            self.multi_taxon_stages.append(stage)
+            current_channels = stage.total_out_channels   # K * hierarchy_out_ch
+
+        self.final_channels = current_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+        return_details: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        """Encode input image into multi-hierarchy taxonomy-aware latent features."""
+        if hard is None:
+            hard = self.default_hard
+
+        details: Dict[str, object] = {
+            "input_shape": tuple(x.shape),
+            "shape_trace": [],
+            "stages": [],
+            "resnet_variant": self.resnet_variant,
+            "stage_blocks": self.stage_blocks,
+            "stage_taxonomy_layers": self.stage_taxonomy_layers,
+            "stage_strides": self.stage_strides,
+            "n_hierarchies": self.n_hierarchies,
+        }
+
+        x = self.stem(x)
+        if return_details:
+            details["shape_trace"].append(("stem", tuple(x.shape)))
+
+        total_dkl          = x.new_zeros(())
+        total_entropy      = x.new_zeros(())
+        total_gate_dkl     = x.new_zeros(())
+        total_gate_entropy = x.new_zeros(())
+
+        for stage_idx, stage in enumerate(self.multi_taxon_stages, start=1):
+            x, stage_logp, regs = stage(x, hard=hard)
+            total_dkl          = total_dkl          + regs["dkl"]
+            total_entropy      = total_entropy      + regs["entropy"]
+            total_gate_dkl     = total_gate_dkl     + regs["gate_dkl"]
+            total_gate_entropy = total_gate_entropy + regs["gate_entropy"]
+
+            if return_details:
+                details["shape_trace"].append((f"stage{stage_idx}", tuple(x.shape)))
+                details["stages"].append({
+                    "name": f"stage{stage_idx}",
+                    "output": x,
+                    "logp": stage_logp,
+                    "output_shape": tuple(x.shape),
+                    "n_hierarchies": self.n_hierarchies,
+                    "hierarchy_out_channels": stage.hierarchy_out_channels,
+                    "gate_probs": regs["gate_probs"],   # [B, K, H, W]
+                    "dkl":          regs["dkl"],
+                    "entropy":      regs["entropy"],
+                    "gate_dkl":     regs["gate_dkl"],
+                    "gate_entropy": regs["gate_entropy"],
+                })
+
+        details["latent_shape"]   = tuple(x.shape)
+        details["dkl"]            = total_dkl
+        details["entropy"]        = total_entropy
+        details["gate_dkl"]       = total_gate_dkl
+        details["gate_entropy"]   = total_gate_entropy
+
+        return x, details
+
+
 __all__ = [
     "resolve_resnet_stage_blocks",
     "ResidualConvBlock",
     "TaxonResNetStage",
     "TaxonResNetEncoder",
+    "MultiTaxonResNetStage",
+    "MultiTaxonResNetEncoder",
 ]
