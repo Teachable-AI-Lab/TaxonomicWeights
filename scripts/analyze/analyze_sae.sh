@@ -3,7 +3,7 @@
 #SBATCH --output=slurm/slurm_outputs/analyze_sae_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_sae_%j.err
 #SBATCH --partition=overcap
-#SBATCH --account=tail-lab
+#SBATCH --account=overcap
 #SBATCH --qos=short
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8

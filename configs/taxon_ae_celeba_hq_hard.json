@@ -14,7 +14,7 @@
     "stage_strides": [1, 2, 2, 2],
     "stage_blocks": null,
     "temperature": 0.5,
-    "hard": false,
+    "hard": true,
     "kernel_size": 3,
     "use_stem": true,
     "stem_channels": 64,
@@ -29,7 +29,7 @@
     "weight_decay": 1e-4,
     "warmup_epochs": 3,
     "dkl_weight": 1e-2,
-    "entropy_weight": 1e-3,
+    "entropy_weight": 0.0,
     "save_every": 5,
     "seed": 42,
     "max_train_steps": 0

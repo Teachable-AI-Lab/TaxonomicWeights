@@ -1730,14 +1730,16 @@ def main() -> None:
     num_split_images    = analysis_cfg.get("num_split_map_images", 4)
     max_split_pairs     = analysis_cfg.get("max_split_pairs", 8)
 
-    dkl_weight  = config.get("training", {}).get("dkl_weight", None)
-    temperature = config.get("model", {}).get("temperature", None)
-    hard        = config.get("model", {}).get("hard", False)
-    dkl_suffix  = f"_dkl_{dkl_weight:.0e}" if dkl_weight is not None else ""
-    temp_str    = f"{temperature:g}".replace(".", "p") if temperature is not None else ""
-    temp_suffix = f"_temp_{temp_str}" if temp_str else ""
-    hard_suffix = "_hard" if hard else ""
-    run_suffix  = dkl_suffix + temp_suffix + hard_suffix
+    dkl_weight     = config.get("training", {}).get("dkl_weight", None)
+    entropy_weight = config.get("training", {}).get("entropy_weight", 0.0)
+    temperature    = config.get("model", {}).get("temperature", None)
+    hard           = config.get("model", {}).get("hard", False)
+    dkl_suffix     = f"_dkl_{dkl_weight:.0e}" if dkl_weight is not None else ""
+    temp_str       = f"{temperature:g}".replace(".", "p") if temperature is not None else ""
+    temp_suffix    = f"_temp_{temp_str}" if temp_str else ""
+    hard_suffix    = "_hard" if hard else ""
+    entropy_suffix = f"_ew_{entropy_weight:.0e}" if entropy_weight else ""
+    run_suffix     = dkl_suffix + temp_suffix + hard_suffix + entropy_suffix
 
     save_dir_base = config.get("output", {}).get("analysis_save_dir", "outputs/analysis")
     out_base = config.get("output", {}).get("output_dir", "")

@@ -3,7 +3,7 @@
 #SBATCH --output=slurm/slurm_outputs/train_taxon_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_taxon_ae_celeba_hq_%j.err
 #SBATCH --partition=overcap
-#SBATCH --account=tail-lab
+#SBATCH --account=overcap
 #SBATCH --qos=long
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -17,10 +17,13 @@ conda activate taxon-weights
 # ── Working directory ──────────────────────────────────────────────────────────
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG="${1:-configs/taxon_ae_celeba_hq.json}"
+
 # ── Run training ───────────────────────────────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_taxon_ae_celeba_hq (job $SLURM_JOB_ID)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_taxon_ae_celeba_hq (job $SLURM_JOB_ID) config=$CONFIG"
 
 python src/train/train_taxon_ae_celeba_hq.py \
-    --config configs/taxon_ae_celeba_hq.json
+    --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_taxon_ae_celeba_hq (job $SLURM_JOB_ID)"

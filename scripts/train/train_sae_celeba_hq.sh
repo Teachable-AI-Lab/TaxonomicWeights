@@ -3,7 +3,7 @@
 #SBATCH --output=slurm/slurm_outputs/train_sae_celeba_%j.out
 #SBATCH --error=slurm/slurm_errors/train_sae_celeba_%j.err
 #SBATCH --partition=overcap
-#SBATCH --account=tail-lab
+#SBATCH --account=overcap
 #SBATCH --qos=long
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8

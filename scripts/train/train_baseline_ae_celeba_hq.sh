@@ -3,7 +3,7 @@
 #SBATCH --output=slurm/slurm_outputs/train_baseline_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_baseline_ae_celeba_hq_%j.err
 #SBATCH --partition=overcap
-#SBATCH --account=tail-lab
+#SBATCH --account=overcap
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

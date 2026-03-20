@@ -3,7 +3,7 @@
 #SBATCH --output=slurm/slurm_outputs/compare_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/compare_cifar10_%j.err
 #SBATCH --partition=overcap
-#SBATCH --account=tail-lab
+#SBATCH --account=overcap
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
