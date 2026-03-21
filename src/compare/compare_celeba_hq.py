@@ -438,7 +438,10 @@ def load_precomputed_metrics(run: Dict) -> Optional[Dict]:
     if sel_f.exists():
         sd = np.load(sel_f, allow_pickle=True)
         result["selectivity_idx"] = float(sd["selectivity_idx"].mean())
-        result["mean_kurtosis"]   = float(sd["per_dim_kurtosis"].mean())
+        if "per_dim_kurtosis" in sd:
+            kurt = sd["per_dim_kurtosis"]
+            finite = kurt[np.isfinite(kurt)]
+            result["mean_kurtosis"] = float(finite.mean()) if len(finite) > 0 else None
     if abl_f.exists():
         ad = np.load(abl_f, allow_pickle=True)
         result["p50_units"] = int(ad["p50_units"])
