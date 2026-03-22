@@ -12,6 +12,8 @@ from .multi_taxon_ae import MultiTaxonAutoencoder
 from .sae_encoder import ConvSAEStage, ConvSAEEncoder
 from .sae import SparseConvAutoencoder
 from .baseline_ae import BaselineConvAutoencoder
+from .jumprelu_sae_encoder import JumpReLUSAEEncoder
+from .jumprelu_sae import JumpReLUSparseConvAutoencoder
 
 __all__ = [
     "TaxonAutoencoder",
@@ -29,4 +31,6 @@ __all__ = [
     "ConvSAEEncoder",
     "ConvSAEStage",
     "BaselineConvAutoencoder",
+    "JumpReLUSAEEncoder",
+    "JumpReLUSparseConvAutoencoder",
 ]

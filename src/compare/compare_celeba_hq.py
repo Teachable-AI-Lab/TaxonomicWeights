@@ -57,6 +57,7 @@ from src.model.multi_taxon_ae import MultiTaxonAutoencoder
 from src.model.sae import SparseConvAutoencoder
 from src.model.topk_sae import TopKSparseConvAutoencoder
 from src.model.gated_sae import GatedSparseConvAutoencoder
+from src.model.jumprelu_sae import JumpReLUSparseConvAutoencoder
 from src.model.baseline_ae import BaselineConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 from torchvision import transforms  # noqa: F401 (used in transform construction)
@@ -88,6 +89,10 @@ _GATED_SAE_PALETTE = [
     "#17becf", "#0fa8b8", "#2dcfe0", "#0d8a98",
     "#1ac5d6", "#14a8b8",
 ]
+_JUMPRELU_SAE_PALETTE = [
+    "#8c564b", "#a0522d", "#6b3a2a", "#c68642",
+    "#7b3f00", "#a0674b",
+]
 
 
 def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
@@ -101,6 +106,8 @@ def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
         return _TOPK_SAE_PALETTE[idx_within_type % len(_TOPK_SAE_PALETTE)]
     if model_type == "gated_sae":
         return _GATED_SAE_PALETTE[idx_within_type % len(_GATED_SAE_PALETTE)]
+    if model_type == "jumprelu_sae":
+        return _JUMPRELU_SAE_PALETTE[idx_within_type % len(_JUMPRELU_SAE_PALETTE)]
     return _BASELINE_PALETTE[idx_within_type % len(_BASELINE_PALETTE)]
 
 
@@ -108,19 +115,24 @@ def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
 
 def _short_name(run_dir: str) -> str:
     """Make a readable short name for plot labels."""
+    mtype = _model_type(run_dir)
     n = run_dir
     for prefix in ("multi_taxon_ae_celeba_hq_r18_", "taxon_ae_celeba_hq_r18_",
+                   "sae_jumprelu_celeba_hq_r18_",
                    "sae_topk_celeba_hq_r18_", "sae_gated_celeba_hq_r18_",
                    "sae_celeba_hq_r18_", "baseline_ae_celeba_hq_r18",
                    "baseline_ae_celeba_hq"):
         n = n.replace(prefix, "").strip("_")
     n = n.replace("_", " ").strip()
-    return n or "baseline"
+    suffix = f" ({n})" if n else ""
+    return f"{mtype}{suffix}"
 
 
 def _model_type(run_dir: str) -> str:
     if run_dir.startswith("multi_taxon_"):
         return "multi_taxon"
+    if run_dir.startswith("sae_jumprelu_"):
+        return "jumprelu_sae"
     if run_dir.startswith("sae_topk_"):
         return "topk_sae"
     if run_dir.startswith("sae_gated_"):
@@ -265,6 +277,13 @@ def load_sae_model(ckpt_path: Path, device: torch.device):
             **common,
             use_gate_ste=a.get("use_gate_ste", False),
         )
+    elif variant == "jumprelu":
+        model = JumpReLUSparseConvAutoencoder(
+            **common,
+            target_l0=a.get("target_l0", 64.0),
+            bandwidth=a.get("bandwidth", 0.001),
+            theta_init=a.get("theta_init", 0.1),
+        )
     else:
         model = SparseConvAutoencoder(
             **common,
@@ -303,7 +322,7 @@ def load_model(run: Dict, device: torch.device):
         return load_taxon_model(run["best_ckpt"], device)
     if run["type"] == "multi_taxon":
         return load_multi_taxon_model(run["best_ckpt"], device)
-    if run["type"] in {"sae", "topk_sae", "gated_sae"}:
+    if run["type"] in {"sae", "topk_sae", "gated_sae", "jumprelu_sae"}:
         return load_sae_model(run["best_ckpt"], device)
     return load_baseline_model(run["best_ckpt"], device)
 

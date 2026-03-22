@@ -57,6 +57,7 @@ if str(ROOT) not in sys.path:
 from src.model.sae import SparseConvAutoencoder
 from src.model.topk_sae import TopKSparseConvAutoencoder
 from src.model.gated_sae import GatedSparseConvAutoencoder
+from src.model.jumprelu_sae import JumpReLUSparseConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
 
 
@@ -88,6 +89,9 @@ def _training_output_dir_suffix(cfg: dict) -> str:
     elif variant == "gated":
         ste_tag = "_ste" if mc.get("use_gate_ste", False) else ""
         return f"_sw{sw:.0e}{ste_tag}"
+    elif variant == "jumprelu":
+        l0 = int(mc.get("target_l0", 64))
+        return f"_l0{l0}_sw{sw:.0e}"
     else:  # l1 / kl
         spt = mc.get("sparsity_type", "l1")
         return f"_spw_{sw:.0e}_spt_{spt}"
@@ -148,6 +152,15 @@ def load_model(ckpt_path: Path, device: torch.device) -> nn.Module:
             use_gate_ste=a.get("use_gate_ste", False),
         )
         print(f"  variant=gated  use_gate_ste={a.get('use_gate_ste', False)}")
+    elif variant == "jumprelu":
+        model = JumpReLUSparseConvAutoencoder(
+            **common,
+            target_l0=a.get("target_l0", 64.0),
+            bandwidth=a.get("bandwidth", 0.001),
+            theta_init=a.get("theta_init", 0.1),
+        )
+        print(f"  variant=jumprelu  target_l0={a.get('target_l0', 64.0)}  "
+              f"bandwidth={a.get('bandwidth', 0.001)}")
     else:
         model = SparseConvAutoencoder(
             **common,

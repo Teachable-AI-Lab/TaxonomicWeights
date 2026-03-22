@@ -13,7 +13,7 @@
     "stage_taxonomy_layers": [3, 4, 5, 6],
     "stage_strides": [1, 2, 2, 2],
     "stage_blocks": null,
-    "n_hierarchies": 3,
+    "n_hierarchies": 1,
     "temperature": 0.5,
     "hard": false,
     "kernel_size": 3,
