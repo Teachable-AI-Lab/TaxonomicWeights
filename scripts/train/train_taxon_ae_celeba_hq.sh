@@ -2,9 +2,9 @@
 #SBATCH --job-name=train_taxon_ae_celeba_hq
 #SBATCH --output=slurm/slurm_outputs/train_taxon_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_taxon_ae_celeba_hq_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
-#SBATCH --qos=long
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -18,7 +18,7 @@ conda activate taxon-weights
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG="${1:-configs/taxon_ae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/taxon_ae_celeba_hq.json}"
 
 # ── Run training ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_taxon_ae_celeba_hq (job $SLURM_JOB_ID) config=$CONFIG"

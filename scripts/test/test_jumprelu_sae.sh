@@ -2,8 +2,8 @@
 #SBATCH --job-name=test_jumprelu_sae
 #SBATCH --output=slurm/slurm_outputs/test_jumprelu_sae_%j.out
 #SBATCH --error=slurm/slurm_errors/test_jumprelu_sae_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4

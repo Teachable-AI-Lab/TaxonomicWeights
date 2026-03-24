@@ -60,8 +60,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.multi_taxon_ae import MultiTaxonAutoencoder
+from src.model.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
+from src.model.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
 from src.model.encoder import TaxonResNetStage
-from src.utils.dataloader import CelebAHQLoader
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+
+
+def _detect_multi_taxon_variant(state_dict: dict) -> str:
+    """Auto-detect multi-taxon model variant from state_dict keys."""
+    for k in state_dict:
+        if '_steps_since_active' in k:
+            return 'topk'
+        if '_bias' in k and 'multi_taxon_stages' in k:
+            return 'bias'
+    return 'vanilla'
+
+
+def _has_vanilla_taxonomy(model) -> bool:
+    """Return True if model hierarchies support vanilla taxonomy methods."""
+    hier = model.encoder.multi_taxon_stages[0].hierarchies[0]
+    return hasattr(hier, '_taxon_logits_per_depth')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,15 +114,16 @@ def load_model(
     if hier_keys:
         detected_n = max(int(k.split(".hierarchies.")[1].split(".")[0]) for k in hier_keys) + 1
         mc["n_hierarchies"] = detected_n
-    model = MultiTaxonAutoencoder(
+
+    variant = mc.get("model_variant", _detect_multi_taxon_variant(state))
+
+    common_kw = dict(
         in_channels=mc.get("in_channels", 3),
         resnet_variant=mc.get("resnet_variant", "18"),
         stage_taxonomy_layers=tuple(mc.get("stage_taxonomy_layers", [5, 6, 7, 8])),
         stage_strides=tuple(mc.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=mc.get("stage_blocks", None),
         n_hierarchies=mc.get("n_hierarchies", 3),
-        temperature=mc.get("temperature", 1.0),
-        hard=mc.get("hard", False),
         kernel_size=mc.get("kernel_size", 3),
         use_stem=mc.get("use_stem", True),
         stem_channels=mc.get("stem_channels", 64),
@@ -113,16 +132,43 @@ def load_model(
         output_activation=mc.get("output_activation", "none"),
         depth_decay=mc.get("depth_decay", 0.5),
     )
+
+    if variant == 'topk':
+        model = TopKMultiTaxonAutoencoder(
+            **common_kw,
+            k=mc.get("k", None),
+            k_aux=mc.get("k_aux", None),
+            dead_steps=mc.get("dead_steps", 2000),
+            gate_k=mc.get("gate_k", 1),
+        )
+    elif variant == 'bias':
+        model = BiasMultiTaxonAutoencoder(
+            **common_kw,
+            k=mc.get("k", None),
+            bias_update_rate=mc.get("bias_update_rate", 0.001),
+            bias_ema_decay=mc.get("bias_ema_decay", 0.99),
+            gate_k=mc.get("gate_k", 1),
+        )
+    else:
+        model = MultiTaxonAutoencoder(
+            **common_kw,
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
+        )
+
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
     print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
     if "val_stats" in checkpoint:
         vs = checkpoint["val_stats"]
-        print(
-            f"  val_loss={vs.get('loss','?'):.6f}  val_recon={vs.get('recon','?'):.6f}  "
-            f"val_gate_dkl={vs.get('gate_dkl','?'):.6f}"
-        )
+        parts = []
+        for label, key in [("val_loss", "loss"), ("val_recon", "recon"), ("val_gate_dkl", "gate_dkl")]:
+            v = vs.get(key)
+            if isinstance(v, (int, float)):
+                parts.append(f"{label}={v:.6f}")
+        if parts:
+            print("  " + "  ".join(parts))
     return model, checkpoint
 
 
@@ -1867,6 +1913,11 @@ def analyze_per_stage_regs(
 # arg parsing & main
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def _is_cifar(cfg: dict) -> bool:
+    """Infer dataset type from the config (image_size==32 -> CIFAR-10)."""
+    return cfg.get("data", {}).get("image_size", 256) == 32
+
 def parse_args() -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
@@ -1956,25 +2007,32 @@ def main() -> None:
     # Load model
     ckpt = args.checkpoint or str(output_dir / "checkpoints" / "best.pt")
     model, _ = load_model(ckpt, device, config)
+    vanilla = _has_vanilla_taxonomy(model)
+    if not vanilla:
+        print("  (Non-vanilla variant detected — taxonomy-specific analyses will be skipped)")
 
-    tf = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    celeba_loader = CelebAHQLoader(
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        image_size=args.image_size,
-        val_split=args.val_split,
-        seed=args.seed,
-        pin_memory=(device.type == "cuda"),
-        transform=tf,
-    )
-    _, val_loader = celeba_loader.get_loaders()
-    if val_loader is None:
-        raise RuntimeError("val_split must be > 0 to produce a validation loader")
+    if _is_cifar(config):
+        data_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
+        _, val_loader = data_loader.get_loaders()
+    else:
+        tf = transforms.Compose([
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        data_loader = CelebAHQLoader(
+            data_root=args.data_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            image_size=args.image_size,
+            val_split=args.val_split,
+            seed=args.seed,
+            pin_memory=(device.type == "cuda"),
+            transform=tf,
+        )
+        _, val_loader = data_loader.get_loaders()
+        if val_loader is None:
+            raise RuntimeError("val_split must be > 0 to produce a validation loader")
 
     save_dir = str(analysis_dir)
 
@@ -1984,31 +2042,34 @@ def main() -> None:
     print("\n[A1b] Filter similarity analysis")
     analyze_filter_similarity(model, save_dir)
 
-    print("\n[A2] Taxonomy regularisation distributions")
-    visualize_taxonomy_distributions(model, val_loader, device, save_dir,
-                                     num_batches=args.n_analysis_batches)
+    if vanilla:
+        print("\n[A2] Taxonomy regularisation distributions")
+        visualize_taxonomy_distributions(model, val_loader, device, save_dir,
+                                         num_batches=args.n_analysis_batches)
 
-    print("\n[A3] Path probability plots")
-    visualize_taxonomy_path_probs(model, val_loader, device, save_dir)
+        print("\n[A3] Path probability plots")
+        visualize_taxonomy_path_probs(model, val_loader, device, save_dir)
 
-    print("\n[A4] Taxonomy tree activations")
-    visualize_taxonomy_tree(model, val_loader, device, save_dir,
-                            num_images=args.n_act_images)
+        print("\n[A4] Taxonomy tree activations")
+        visualize_taxonomy_tree(model, val_loader, device, save_dir,
+                                num_images=args.n_act_images)
 
-    print("\n[A5] Parse-tree analysis")
-    analyze_parse_trees(model, val_loader, device, save_dir,
-                        num_images=args.n_parse_images)
+        print("\n[A5] Parse-tree analysis")
+        analyze_parse_trees(model, val_loader, device, save_dir,
+                            num_images=args.n_parse_images)
 
-    print("\n[A6] Hierarchical activation maps")
-    analyze_hierarchical_activations(model, val_loader, device, save_dir,
-                                     num_images=args.n_hier_images,
-                                     max_depth=args.max_hier_depth)
+        print("\n[A6] Hierarchical activation maps")
+        analyze_hierarchical_activations(model, val_loader, device, save_dir,
+                                         num_images=args.n_hier_images,
+                                         max_depth=args.max_hier_depth)
 
-    print("\n[A7] Binary split maps")
-    analyze_binary_split_maps(model, val_loader, device, save_dir,
-                              num_images=args.n_split_images,
-                              max_depth=args.max_hier_depth,
-                              max_pairs=args.max_split_pairs)
+        print("\n[A7] Binary split maps")
+        analyze_binary_split_maps(model, val_loader, device, save_dir,
+                                  num_images=args.n_split_images,
+                                  max_depth=args.max_hier_depth,
+                                  max_pairs=args.max_split_pairs)
+    else:
+        print("\n[A2-A7] Skipped (taxonomy-specific, not applicable to this variant)")
 
     print("\n[A8] Stage activation maps")
     visualize_stage_activations(model, val_loader, device, save_dir,
@@ -2030,17 +2091,23 @@ def main() -> None:
     print("\n[B5] Partonomy sparsity suite")
     analyze_partonomy_sparsity(model, val_loader, device, save_dir)
 
-    print("\n[C1] Gate distributions")
-    analyze_gate_distributions(model, val_loader, device, save_dir,
-                               n_batches=args.n_analysis_batches)
+    if vanilla:
+        print("\n[C1] Gate distributions")
+        analyze_gate_distributions(model, val_loader, device, save_dir,
+                                   n_batches=args.n_analysis_batches)
+    else:
+        print("\n[C1] Skipped (vanilla-only gate distributions)")
 
     print("\n[C2] Cross-hierarchy cosine similarity")
     analyze_cross_hierarchy_similarity(model, val_loader, device, save_dir,
                                        n_batches=args.n_analysis_batches)
 
-    print("\n[C3] Per-stage regularisation stats")
-    analyze_per_stage_regs(model, val_loader, device, save_dir,
-                           n_batches=args.n_analysis_batches)
+    if vanilla:
+        print("\n[C3] Per-stage regularisation stats")
+        analyze_per_stage_regs(model, val_loader, device, save_dir,
+                               n_batches=args.n_analysis_batches)
+    else:
+        print("\n[C3] Skipped (vanilla-only per-stage regularisation)")
 
     print("\n" + "=" * 80)
     print(f"Analysis complete! All outputs saved to: {analysis_dir}")

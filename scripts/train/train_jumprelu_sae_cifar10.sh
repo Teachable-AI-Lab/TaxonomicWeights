@@ -2,9 +2,9 @@
 #SBATCH --job-name=train_jumprelu_cifar10
 #SBATCH --output=slurm/slurm_outputs/train_jumprelu_sae_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/train_jumprelu_sae_cifar10_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
-#SBATCH --qos=long
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -21,6 +21,6 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_jumprelu_sae_cifar10 (job $SLURM_JOB_ID)"
 
 python src/train/train_jumprelu_sae_cifar10.py \
-    --config configs/jumprelu_sae_cifar10.json
+    --config configs/cifar10/jumprelu_sae_cifar10.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_jumprelu_sae_cifar10 (job $SLURM_JOB_ID)"

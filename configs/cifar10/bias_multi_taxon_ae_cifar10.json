@@ -1,5 +1,5 @@
 {
-  "experiment_name": "taxon_ae_cifar10_r18",
+  "experiment_name": "bias_multi_taxon_ae_cifar10_r18",
   "data": {
     "data_root": "./data",
     "image_size": 32,
@@ -10,17 +10,21 @@
   "model": {
     "in_channels": 3,
     "resnet_variant": "18",
-    "stage_taxonomy_layers": [5, 6, 7, 8],
+    "stage_taxonomy_layers": [3, 4, 5, 6],
     "stage_strides": [1, 2, 2, 2],
     "stage_blocks": null,
-    "temperature": 0.5,
-    "hard": false,
+    "n_hierarchies": 3,
+    "k": null,
+    "bias_update_rate": 0.1,
+    "bias_ema_decay": 0.99,
+    "gate_k": 1,
     "kernel_size": 3,
     "use_stem": true,
     "stem_channels": 64,
     "stem_stride": 1,
     "use_stem_maxpool": false,
     "output_activation": "none",
+    "temperature": 0.5,
     "depth_decay": 0.5
   },
   "training": {
@@ -28,14 +32,19 @@
     "learning_rate": 3e-4,
     "weight_decay": 1e-4,
     "warmup_epochs": 3,
-    "dkl_weight": 1e-2,
-    "entropy_weight": 0.0,
     "save_every": 5,
     "seed": 42,
     "max_train_steps": 0
   },
+  "analysis": {
+    "num_latent_batches": 50,
+    "num_reconstruction_batches": 20,
+    "num_multiple_recon_images": 8,
+    "num_reconstructions_per_image": 8,
+    "num_activation_images": 3,
+    "num_taxonomy_batches": 10
+  },
   "output": {
-    "output_dir": "./outputs/taxon_ae_cifar10_r18",
-    "analysis_save_dir": "./outputs/taxon_ae_cifar10_r18/analysis"
+    "output_dir": "./outputs/cifar10/bias_multi_taxon_ae_cifar10_r18"
   }
 }

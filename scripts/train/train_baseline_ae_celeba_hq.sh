@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_baseline_celeba_hq
 #SBATCH --output=slurm/slurm_outputs/train_baseline_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_baseline_ae_celeba_hq_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -18,7 +18,7 @@ source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
 python src/train/train_baseline_ae_celeba_hq.py \
-    --config          ./configs/baseline_ae_celeba_hq.json \
+    --config          ./configs/celeba_hq/baseline_ae_celeba_hq.json \
     --output-dir      ./outputs/baseline_ae_celeba_hq_r18 \
     --data-root       ./data/celeba_hq \
     --image-size      256 \

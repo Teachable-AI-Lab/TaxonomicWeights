@@ -54,6 +54,10 @@ if str(ROOT) not in sys.path:
 
 from src.model.taxon_ae import TaxonAutoencoder
 from src.model.multi_taxon_ae import MultiTaxonAutoencoder
+from src.model.topk_taxon_ae import TopKTaxonAutoencoder
+from src.model.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
+from src.model.bias_taxon_ae import BiasTaxonAutoencoder
+from src.model.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
 from src.model.sae import SparseConvAutoencoder
 from src.model.topk_sae import TopKSparseConvAutoencoder
 from src.model.gated_sae import GatedSparseConvAutoencoder
@@ -93,9 +97,33 @@ _JUMPRELU_SAE_PALETTE = [
     "#8c564b", "#a0522d", "#6b3a2a", "#c68642",
     "#7b3f00", "#a0674b",
 ]
+_TOPK_TAXON_PALETTE = [
+    "#0077b6", "#023e8a", "#0096c7", "#00b4d8",
+    "#48cae4", "#90e0ef",
+]
+_TOPK_MULTI_TAXON_PALETTE = [
+    "#7209b7", "#560bad", "#480ca8", "#3a0ca3",
+    "#3f37c9", "#4361ee",
+]
+_BIAS_TAXON_PALETTE = [
+    "#06d6a0", "#1b9aaa", "#059669", "#10b981",
+    "#34d399", "#6ee7b7",
+]
+_BIAS_MULTI_TAXON_PALETTE = [
+    "#e63946", "#a8201a", "#f07167", "#c1121f",
+    "#e5383b", "#ff6b6b",
+]
 
 
 def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
+    if model_type == "topk_taxon":
+        return _TOPK_TAXON_PALETTE[idx_within_type % len(_TOPK_TAXON_PALETTE)]
+    if model_type == "topk_multi_taxon":
+        return _TOPK_MULTI_TAXON_PALETTE[idx_within_type % len(_TOPK_MULTI_TAXON_PALETTE)]
+    if model_type == "bias_taxon":
+        return _BIAS_TAXON_PALETTE[idx_within_type % len(_BIAS_TAXON_PALETTE)]
+    if model_type == "bias_multi_taxon":
+        return _BIAS_MULTI_TAXON_PALETTE[idx_within_type % len(_BIAS_MULTI_TAXON_PALETTE)]
     if model_type == "taxon":
         return _TAXON_PALETTE[idx_within_type % len(_TAXON_PALETTE)]
     if model_type == "multi_taxon":
@@ -117,7 +145,9 @@ def _short_name(run_dir: str) -> str:
     """Make a readable short name for plot labels."""
     mtype = _model_type(run_dir)
     n = run_dir
-    for prefix in ("multi_taxon_ae_celeba_hq_r18_", "taxon_ae_celeba_hq_r18_",
+    for prefix in ("topk_multi_taxon_ae_celeba_hq_r18_", "topk_taxon_ae_celeba_hq_r18_",
+                   "bias_multi_taxon_ae_celeba_hq_r18_", "bias_taxon_ae_celeba_hq_r18_",
+                   "multi_taxon_ae_celeba_hq_r18_", "taxon_ae_celeba_hq_r18_",
                    "sae_jumprelu_celeba_hq_r18_",
                    "sae_topk_celeba_hq_r18_", "sae_gated_celeba_hq_r18_",
                    "sae_celeba_hq_r18_", "baseline_ae_celeba_hq_r18",
@@ -129,6 +159,14 @@ def _short_name(run_dir: str) -> str:
 
 
 def _model_type(run_dir: str) -> str:
+    if run_dir.startswith("topk_multi_taxon_"):
+        return "topk_multi_taxon"
+    if run_dir.startswith("topk_taxon_"):
+        return "topk_taxon"
+    if run_dir.startswith("bias_multi_taxon_"):
+        return "bias_multi_taxon"
+    if run_dir.startswith("bias_taxon_"):
+        return "bias_taxon"
     if run_dir.startswith("multi_taxon_"):
         return "multi_taxon"
     if run_dir.startswith("sae_jumprelu_"):
@@ -174,23 +212,19 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
             "history":    run_path / "training_history.json",
             "analysis":   run_path / "analysis",
         })
-    # sort: taxon first, then multi_taxon, then sae variants, then baseline
-    _order = {"taxon": 0, "multi_taxon": 1, "sae": 2, "topk_sae": 3, "gated_sae": 4, "baseline": 5}
-    runs.sort(key=lambda r: (_order.get(r["type"], 9), r["name"]))
-    taxon_i = multi_taxon_i = sae_i = topk_sae_i = gated_sae_i = baseline_i = 0
+    # sort: taxon variants first, then SAE variants, then baseline
+    _order = {
+        "taxon": 0, "topk_taxon": 1, "bias_taxon": 2,
+        "multi_taxon": 3, "topk_multi_taxon": 4, "bias_multi_taxon": 5,
+        "sae": 6, "topk_sae": 7, "gated_sae": 8, "jumprelu_sae": 9,
+        "baseline": 10,
+    }
+    runs.sort(key=lambda r: (_order.get(r["type"], 99), r["name"]))
+    type_counters: Dict[str, int] = {}
     for r in runs:
-        if r["type"] == "taxon":
-            r["colour"] = model_colour(r["name"], "taxon",       taxon_i);       taxon_i       += 1
-        elif r["type"] == "multi_taxon":
-            r["colour"] = model_colour(r["name"], "multi_taxon", multi_taxon_i); multi_taxon_i += 1
-        elif r["type"] == "sae":
-            r["colour"] = model_colour(r["name"], "sae",         sae_i);         sae_i         += 1
-        elif r["type"] == "topk_sae":
-            r["colour"] = model_colour(r["name"], "topk_sae",    topk_sae_i);    topk_sae_i    += 1
-        elif r["type"] == "gated_sae":
-            r["colour"] = model_colour(r["name"], "gated_sae",   gated_sae_i);   gated_sae_i   += 1
-        else:
-            r["colour"] = model_colour(r["name"], "baseline",    baseline_i);    baseline_i    += 1
+        idx = type_counters.get(r["type"], 0)
+        r["colour"] = model_colour(r["name"], r["type"], idx)
+        type_counters[r["type"]] = idx + 1
     return runs
 
 
@@ -232,6 +266,110 @@ def load_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[Multi
         n_hierarchies=a.get("n_hierarchies", 3),
         temperature=a.get("temperature", 1.0),
         hard=a.get("hard", False),
+        kernel_size=a.get("kernel_size", 3),
+        use_stem=a.get("use_stem", True),
+        stem_channels=a.get("stem_channels", 64),
+        stem_stride=a.get("stem_stride", 2),
+        use_stem_maxpool=a.get("use_stem_maxpool", True),
+        output_activation=a.get("output_activation", "none"),
+        depth_decay=a.get("depth_decay", 0.5),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    model = TopKTaxonAutoencoder(
+        in_channels=a.get("in_channels", 3),
+        resnet_variant=a.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [5, 6, 7, 8])),
+        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=a.get("stage_blocks", None),
+        k=a.get("k", None),
+        k_aux=a.get("k_aux", None),
+        dead_steps=a.get("dead_steps", 2000),
+        kernel_size=a.get("kernel_size", 3),
+        use_stem=a.get("use_stem", True),
+        stem_channels=a.get("stem_channels", 64),
+        stem_stride=a.get("stem_stride", 2),
+        use_stem_maxpool=a.get("use_stem_maxpool", True),
+        output_activation=a.get("output_activation", "none"),
+        depth_decay=a.get("depth_decay", 0.5),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKMultiTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    model = TopKMultiTaxonAutoencoder(
+        in_channels=a.get("in_channels", 3),
+        resnet_variant=a.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [3, 4, 5, 6])),
+        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=a.get("stage_blocks", None),
+        n_hierarchies=a.get("n_hierarchies", 3),
+        k=a.get("k", None),
+        k_aux=a.get("k_aux", None),
+        dead_steps=a.get("dead_steps", 2000),
+        gate_k=a.get("gate_k", 1),
+        kernel_size=a.get("kernel_size", 3),
+        use_stem=a.get("use_stem", True),
+        stem_channels=a.get("stem_channels", 64),
+        stem_stride=a.get("stem_stride", 2),
+        use_stem_maxpool=a.get("use_stem_maxpool", True),
+        output_activation=a.get("output_activation", "none"),
+        depth_decay=a.get("depth_decay", 0.5),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bias_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[BiasTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    model = BiasTaxonAutoencoder(
+        in_channels=a.get("in_channels", 3),
+        resnet_variant=a.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [5, 6, 7, 8])),
+        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=a.get("stage_blocks", None),
+        k=a.get("k", None),
+        bias_update_rate=a.get("bias_update_rate", 0.001),
+        bias_ema_decay=a.get("bias_ema_decay", 0.99),
+        kernel_size=a.get("kernel_size", 3),
+        use_stem=a.get("use_stem", True),
+        stem_channels=a.get("stem_channels", 64),
+        stem_stride=a.get("stem_stride", 2),
+        use_stem_maxpool=a.get("use_stem_maxpool", True),
+        output_activation=a.get("output_activation", "none"),
+        depth_decay=a.get("depth_decay", 0.5),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bias_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[BiasMultiTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    model = BiasMultiTaxonAutoencoder(
+        in_channels=a.get("in_channels", 3),
+        resnet_variant=a.get("resnet_variant", "18"),
+        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [3, 4, 5, 6])),
+        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
+        stage_blocks=a.get("stage_blocks", None),
+        n_hierarchies=a.get("n_hierarchies", 3),
+        k=a.get("k", None),
+        bias_update_rate=a.get("bias_update_rate", 0.001),
+        bias_ema_decay=a.get("bias_ema_decay", 0.99),
+        gate_k=a.get("gate_k", 1),
         kernel_size=a.get("kernel_size", 3),
         use_stem=a.get("use_stem", True),
         stem_channels=a.get("stem_channels", 64),
@@ -318,6 +456,14 @@ def load_baseline_model(ckpt_path: Path, device: torch.device) -> Tuple[Baseline
 
 
 def load_model(run: Dict, device: torch.device):
+    if run["type"] == "topk_taxon":
+        return load_topk_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "topk_multi_taxon":
+        return load_topk_multi_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bias_taxon":
+        return load_bias_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bias_multi_taxon":
+        return load_bias_multi_taxon_model(run["best_ckpt"], device)
     if run["type"] == "taxon":
         return load_taxon_model(run["best_ckpt"], device)
     if run["type"] == "multi_taxon":
@@ -351,6 +497,10 @@ def compute_live_metrics(
             recon, _, _ = model(imgs)
         elif run["type"] == "multi_taxon":
             recon, _, _, _, _ = model(imgs)
+        elif run["type"] in ("topk_taxon", "topk_multi_taxon"):
+            recon, _ = model(imgs)
+        elif run["type"] in ("bias_taxon", "bias_multi_taxon"):
+            (recon,) = model(imgs)
         else:
             recon, _    = model(imgs)
         z, _ = model.encode(imgs)
@@ -487,6 +637,10 @@ def collect_reconstructions(
             recon, _, _ = model(imgs)
         elif run["type"] == "multi_taxon":
             recon, _, _, _, _ = model(imgs)
+        elif run["type"] in ("topk_taxon", "topk_multi_taxon"):
+            recon, _ = model(imgs)
+        elif run["type"] in ("bias_taxon", "bias_multi_taxon"):
+            (recon,) = model(imgs)
         else:
             recon, _ = model(imgs)
 
@@ -816,12 +970,22 @@ def make_page3_feature_quality(
                 marker = "o"
             elif r["type"] == "multi_taxon":
                 marker = "D"
+            elif r["type"] == "topk_taxon":
+                marker = "v"
+            elif r["type"] == "topk_multi_taxon":
+                marker = "<"
+            elif r["type"] == "bias_taxon":
+                marker = ">"
+            elif r["type"] == "bias_multi_taxon":
+                marker = "X"
             elif r["type"] == "sae":
                 marker = "s"
             elif r["type"] == "topk_sae":
                 marker = "P"
             elif r["type"] == "gated_sae":
                 marker = "h"
+            elif r["type"] == "jumprelu_sae":
+                marker = "d"
             else:
                 marker = "^"
             ax_sc.scatter(sp, mse, color=r["colour"], s=80,
@@ -885,8 +1049,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Comparative analysis of all CelebA-HQ Taxon-AE and SAE runs"
     )
-    parser.add_argument("--outputs-dir",  type=str, default="./outputs")
-    parser.add_argument("--save-dir",     type=str, default="./outputs/comparison_celeba_hq")
+    parser.add_argument("--outputs-dir",  type=str, default="./outputs/celeba_hq")
+    parser.add_argument("--save-dir",     type=str, default="./outputs/celeba_hq/comparison")
     parser.add_argument("--data-root",    type=str, default="./data/celeba_hq",
                         help="CelebA-HQ data root (needed for live metric computation).")
     parser.add_argument("--image-size",   type=int, default=256)

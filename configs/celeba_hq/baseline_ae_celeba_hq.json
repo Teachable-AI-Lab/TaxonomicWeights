@@ -1,0 +1,36 @@
+{
+  "experiment_name": "baseline_ae_celeba_hq_r18",
+  "data": {
+    "data_root": "./data/celeba_hq",
+    "image_size": 256,
+    "batch_size": 32,
+    "num_workers": 8,
+    "val_split": 0.05
+  },
+  "model": {
+    "in_channels": 3,
+    "resnet_variant": "18",
+    "stage_channels": [64, 128, 256, 512],
+    "stage_strides": [1, 2, 2, 2],
+    "stage_blocks": null,
+    "kernel_size": 3,
+    "use_stem": true,
+    "stem_channels": 64,
+    "stem_stride": 2,
+    "use_stem_maxpool": true,
+    "output_activation": "none"
+  },
+  "training": {
+    "epochs": 90,
+    "learning_rate": 3e-4,
+    "weight_decay": 1e-4,
+    "warmup_epochs": 3,
+    "save_every": 5,
+    "seed": 42,
+    "max_train_steps": 0
+  },
+  "output": {
+    "output_dir": "./outputs/celeba_hq/baseline_ae_celeba_hq_r18",
+    "analysis_save_dir": "./outputs/celeba_hq/baseline_ae_celeba_hq_r18/analysis"
+  }
+}

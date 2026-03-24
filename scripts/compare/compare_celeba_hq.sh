@@ -2,8 +2,8 @@
 #SBATCH --job-name=compare_celeba_hq
 #SBATCH --output=slurm/slurm_outputs/compare_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/compare_celeba_hq_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -18,8 +18,8 @@ source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
 python src/compare/compare_celeba_hq.py \
-    --outputs-dir    ./outputs \
-    --save-dir       ./outputs/comparison_celeba_hq \
+    --outputs-dir    ./outputs/celeba_hq \
+    --save-dir       ./outputs/celeba_hq/comparison \
     --data-root      ./data/celeba_hq \
     --image-size     256 \
     --batch-size     16 \

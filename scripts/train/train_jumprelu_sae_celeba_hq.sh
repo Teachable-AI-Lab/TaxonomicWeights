@@ -2,9 +2,9 @@
 #SBATCH --job-name=train_jumprelu_celeba
 #SBATCH --output=slurm/slurm_outputs/train_jumprelu_sae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_jumprelu_sae_celeba_hq_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
-#SBATCH --qos=long
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -21,6 +21,6 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_jumprelu_sae_celeba_hq (job $SLURM_JOB_ID)"
 
 python src/train/train_jumprelu_sae_celeba_hq.py \
-    --config configs/jumprelu_sae_celeba_hq.json
+    --config configs/celeba_hq/jumprelu_sae_celeba_hq.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_jumprelu_sae_celeba_hq (job $SLURM_JOB_ID)"

@@ -34,7 +34,7 @@
     "max_train_steps": 0
   },
   "output": {
-    "output_dir": "./outputs/sae_cifar10_r18",
-    "analysis_save_dir": "./outputs/sae_cifar10_r18/analysis"
+    "output_dir": "./outputs/cifar10/sae_cifar10_r18",
+    "analysis_save_dir": "./outputs/cifar10/sae_cifar10_r18/analysis"
   }
 }

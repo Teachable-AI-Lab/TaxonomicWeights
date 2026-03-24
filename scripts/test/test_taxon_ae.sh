@@ -2,8 +2,8 @@
 #SBATCH --job-name=test_taxon_ae
 #SBATCH --output=slurm/slurm_outputs/test_taxon_ae_%j.out
 #SBATCH --error=slurm/slurm_errors/test_taxon_ae_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4

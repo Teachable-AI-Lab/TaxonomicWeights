@@ -2,19 +2,22 @@
 #SBATCH --job-name=analyze_all_taxons
 #SBATCH --output=slurm/slurm_outputs/analyze_all_taxons_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_all_taxons_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
-#SBATCH --qos=long
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=1-00:00:00
 
-# Run analysis for taxon_ae_* and multi_taxon_ae_* output directories only,
-# dispatching to:
+# Run analysis for all taxon variant output directories, dispatching to:
 #
-#   taxon_ae_*       → analyze_celeba_hq_ae.py
-#   multi_taxon_ae_* → analyze_multi_taxon_ae_celeba_hq.py
+#   taxon_ae_*              → analyze_celeba_hq_ae.py
+#   multi_taxon_ae_*        → analyze_multi_taxon_ae_celeba_hq.py
+#   topk_taxon_ae_*         → analyze_topk_taxon_ae_celeba_hq.py
+#   topk_multi_taxon_ae_*   → analyze_topk_multi_taxon_ae_celeba_hq.py
+#   bias_taxon_ae_*         → analyze_bias_taxon_ae_celeba_hq.py
+#   bias_multi_taxon_ae_*   → analyze_bias_multi_taxon_ae_celeba_hq.py
 #
 # Pass --skip-existing to skip runs that already have an analysis/ directory.
 # Pass --dry-run to preview the commands without executing them.
@@ -35,6 +38,6 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_all_taxons (job ${SLURM_JOB_ID:-local})"
 
-python src/analyze/analyze_all.py --taxon-only $EXTRA_ARGS
+python src/analyze/analyze_all.py --taxon-only --skip-existing $EXTRA_ARGS
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_all_taxons (job ${SLURM_JOB_ID:-local})"

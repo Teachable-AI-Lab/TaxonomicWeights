@@ -1,5 +1,5 @@
 {
-  "experiment_name": "sae_jumprelu_celeba_hq_r18",
+  "experiment_name": "sae_topk_celeba_hq_r18",
   "data": {
     "data_root": "./data/celeba_hq",
     "image_size": 256,
@@ -8,15 +8,16 @@
     "val_split": 0.05
   },
   "model": {
-    "model_variant": "jumprelu",
+    "model_variant": "topk",
     "in_channels": 3,
     "resnet_variant": "18",
     "stage_channels": [64, 128, 256, 512],
     "stage_strides": [1, 2, 2, 2],
     "stage_blocks": null,
-    "target_l0": 64,
-    "bandwidth": 0.001,
-    "theta_init": 0.1,
+    "topk_k": 8,
+    "k_aux": 8,
+    "use_aux_loss": true,
+    "dead_threshold": 0.001,
     "kernel_size": 3,
     "use_stem": true,
     "stem_channels": 64,
@@ -35,7 +36,7 @@
     "max_train_steps": 0
   },
   "output": {
-    "output_dir": "./outputs/sae_jumprelu_celeba_hq_r18",
-    "analysis_save_dir": "./outputs/sae_jumprelu_celeba_hq_r18/analysis"
+    "output_dir": "./outputs/celeba_hq/sae_topk_celeba_hq_r18",
+    "analysis_save_dir": "./outputs/celeba_hq/sae_topk_celeba_hq_r18/analysis"
   }
 }

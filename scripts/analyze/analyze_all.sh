@@ -2,9 +2,9 @@
 #SBATCH --job-name=analyze_all
 #SBATCH --output=slurm/slurm_outputs/analyze_all_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_all_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
-#SBATCH --qos=long
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
+#SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -37,6 +37,6 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_all (job ${SLURM_JOB_ID:-local})"
 
-python src/analyze/analyze_all.py $EXTRA_ARGS
+python src/analyze/analyze_all.py --skip-existing $EXTRA_ARGS
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_all (job ${SLURM_JOB_ID:-local})"

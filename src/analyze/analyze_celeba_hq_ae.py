@@ -35,8 +35,31 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.taxon_ae import TaxonAutoencoder
-from src.utils.dataloader import CelebAHQLoader
+from src.model.topk_taxon_ae import TopKTaxonAutoencoder
+from src.model.bias_taxon_ae import BiasTaxonAutoencoder
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
 from torchvision import transforms
+
+
+def _detect_taxon_variant(state_dict: dict) -> str:
+    """Auto-detect taxon model variant from state_dict keys."""
+    for k in state_dict:
+        if '_steps_since_active' in k:
+            return 'topk'
+        if '_bias' in k and 'taxon_stages' in k:
+            return 'bias'
+    return 'vanilla'
+
+
+def _has_vanilla_taxonomy(model) -> bool:
+    """Return True if model stages support vanilla taxonomy methods."""
+    stage = model.encoder.taxon_stages[0]
+    return hasattr(stage, '_taxon_logits_per_depth')
+
+
+def _is_cifar(cfg: dict) -> bool:
+    """Infer dataset type from the config (image_size==32 -> CIFAR-10)."""
+    return cfg.get("data", {}).get("image_size", 256) == 32
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -72,14 +95,17 @@ def load_model(
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     mc = config.get("model", {})
-    model = TaxonAutoencoder(
+    state = checkpoint.get("model_state", checkpoint)
+    variant = mc.get("model_variant", _detect_taxon_variant(state))
+    # Normalise: "topk_taxon" → "topk", "bias_taxon" → "bias"
+    variant = variant.replace("_taxon", "").replace("_multi", "")
+
+    common_kw = dict(
         in_channels=mc.get("in_channels", 3),
         resnet_variant=mc.get("resnet_variant", "18"),
         stage_taxonomy_layers=tuple(mc.get("stage_taxonomy_layers", [5, 6, 7, 8])),
         stage_strides=tuple(mc.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=mc.get("stage_blocks", None),
-        temperature=mc.get("temperature", 1.0),
-        hard=mc.get("hard", False),
         kernel_size=mc.get("kernel_size", 3),
         use_stem=mc.get("use_stem", True),
         stem_channels=mc.get("stem_channels", 64),
@@ -89,16 +115,38 @@ def load_model(
         depth_decay=mc.get("depth_decay", 0.5),
     )
 
-    state = checkpoint.get("model_state", checkpoint)
+    if variant == 'topk':
+        model = TopKTaxonAutoencoder(
+            **common_kw,
+            k=mc.get("k", None),
+            k_aux=mc.get("k_aux", None),
+            dead_steps=mc.get("dead_steps", 2000),
+        )
+    elif variant == 'bias':
+        model = BiasTaxonAutoencoder(
+            **common_kw,
+            k=mc.get("k", None),
+            bias_update_rate=mc.get("bias_update_rate", 0.001),
+            bias_ema_decay=mc.get("bias_ema_decay", 0.99),
+        )
+    else:
+        model = TaxonAutoencoder(
+            **common_kw,
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
+        )
+
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
 
     print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
     if "train_stats" in checkpoint:
-        print(f"  train_loss={checkpoint['train_stats'].get('loss', '?'):.6f}")
+        tl = checkpoint['train_stats'].get('loss', '?')
+        print(f"  train_loss={tl:.6f}" if isinstance(tl, (int, float)) else f"  train_loss={tl}")
     if "val_stats" in checkpoint:
-        print(f"  val_loss={checkpoint['val_stats'].get('loss', '?'):.6f}")
+        vl = checkpoint['val_stats'].get('loss', '?')
+        print(f"  val_loss={vl:.6f}" if isinstance(vl, (int, float)) else f"  val_loss={vl}")
     return model, checkpoint
 
 
@@ -1437,7 +1485,7 @@ def analyze_reconstruction_quality(
             if i >= num_batches:
                 break
             images = images.to(device)
-            recon, _, _ = model(images)
+            recon, *_ = model(images)
             mse_list.extend(((images - recon) ** 2).mean(dim=(1, 2, 3)).cpu().numpy())
             mae_list.extend(torch.abs(images - recon).mean(dim=(1, 2, 3)).cpu().numpy())
 
@@ -1490,7 +1538,7 @@ def visualize_multiple_reconstructions(
         fig, axes = plt.subplots(2, num_images, figsize=(num_images * 2.5, 5))
 
         with torch.no_grad():
-            recon, _, _ = model(images)
+            recon, *_ = model(images)
 
         for i in range(num_images):
             axes[0, i].imshow(_to_display(images[i:i+1], normalized=normalized))
@@ -1650,7 +1698,7 @@ def analyze_partonomy_sparsity(
             z_orig, _ = model.encode(ablation_imgs)
             spatial = (z_orig.ndim == 4)
             n_units = z_orig.shape[1]
-            base_recon, _, _ = model(ablation_imgs)
+            base_recon, *_ = model(ablation_imgs)
             if base_recon.shape[2:] != ablation_imgs.shape[2:]:
                 base_recon = F.interpolate(base_recon, size=ablation_imgs.shape[2:],
                                            mode="bilinear", align_corners=False)
@@ -1931,25 +1979,32 @@ def main() -> None:
     print("=" * 80)
 
     print("\nLoading dataset...")
-    normalize = data_cfg.get("normalize", True)   # default: same normalization as training
-    if normalize:
-        tf = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ])
+    if _is_cifar(config):
+        loader = CIFAR10Loader(
+            batch_size=batch_size,
+            root=data_root,
+        )
+        _, eval_loader = loader.get_loaders()
     else:
-        tf = None  # CelebAHQLoader default (ToTensor only)
-    loader = CelebAHQLoader(
-        data_root=data_root,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        image_size=image_size,
-        val_split=val_split,
-        transform=tf,
-    )
-    _, val_loader = loader.get_loaders()
-    eval_loader = val_loader if val_loader is not None else loader.train_loader
+        normalize = data_cfg.get("normalize", True)   # default: same normalization as training
+        if normalize:
+            tf = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ])
+        else:
+            tf = None  # CelebAHQLoader default (ToTensor only)
+        loader = CelebAHQLoader(
+            data_root=data_root,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            image_size=image_size,
+            val_split=val_split,
+            transform=tf,
+        )
+        _, val_loader = loader.get_loaders()
+        eval_loader = val_loader if val_loader is not None else loader.train_loader
 
     print("\nLoading model...")
     model, _ = load_model(checkpoint_path, device, config)
@@ -1960,31 +2015,39 @@ def main() -> None:
     print("\n" + "=" * 80 + "\n1b. Filter Similarity Analysis\n" + "=" * 80)
     analyze_filter_similarity(model, save_dir)
 
-    print("\n" + "=" * 80 + "\n2. Taxonomy Probability Distributions\n" + "=" * 80)
-    visualize_taxonomy_distributions(model, eval_loader, device, save_dir,
-                                     num_batches=num_taxon_batches)
+    vanilla = _has_vanilla_taxonomy(model)
 
-    print("\n" + "=" * 80 + "\n2b. Taxonomy Path Probability Plots\n" + "=" * 80)
-    visualize_taxonomy_path_probs(model, eval_loader, device, save_dir)
+    if vanilla:
+        print("\n" + "=" * 80 + "\n2. Taxonomy Probability Distributions\n" + "=" * 80)
+        visualize_taxonomy_distributions(model, eval_loader, device, save_dir,
+                                         num_batches=num_taxon_batches)
 
-    print("\n" + "=" * 80 + "\n2c. Taxonomy Tree Activations\n" + "=" * 80)
-    visualize_taxonomy_tree(model, eval_loader, device, save_dir,
-                            num_images=num_act_images)
+        print("\n" + "=" * 80 + "\n2b. Taxonomy Path Probability Plots\n" + "=" * 80)
+        visualize_taxonomy_path_probs(model, eval_loader, device, save_dir)
 
-    print("\n" + "=" * 80 + "\n2d. Parse Tree Analysis\n" + "=" * 80)
-    analyze_parse_tree(model, eval_loader, device, save_dir,
-                       num_images=num_parse_images)
+        print("\n" + "=" * 80 + "\n2c. Taxonomy Tree Activations\n" + "=" * 80)
+        visualize_taxonomy_tree(model, eval_loader, device, save_dir,
+                                num_images=num_act_images)
 
-    print("\n" + "=" * 80 + "\n2e. Hierarchical Activation Maps\n" + "=" * 80)
-    analyze_hierarchical_activations(model, eval_loader, device, save_dir,
-                                     num_images=num_hier_images,
-                                     max_depth=max_hier_depth)
+        print("\n" + "=" * 80 + "\n2d. Parse Tree Analysis\n" + "=" * 80)
+        analyze_parse_tree(model, eval_loader, device, save_dir,
+                           num_images=num_parse_images)
 
-    print("\n" + "=" * 80 + "\n2f. Binary Split Maps\n" + "=" * 80)
-    analyze_binary_split_maps(model, eval_loader, device, save_dir,
-                              num_images=num_split_images,
-                              max_depth=max_hier_depth,
-                              max_pairs=max_split_pairs)
+        print("\n" + "=" * 80 + "\n2e. Hierarchical Activation Maps\n" + "=" * 80)
+        analyze_hierarchical_activations(model, eval_loader, device, save_dir,
+                                         num_images=num_hier_images,
+                                         max_depth=max_hier_depth)
+
+        print("\n" + "=" * 80 + "\n2f. Binary Split Maps\n" + "=" * 80)
+        analyze_binary_split_maps(model, eval_loader, device, save_dir,
+                                  num_images=num_split_images,
+                                  max_depth=max_hier_depth,
+                                  max_pairs=max_split_pairs)
+    else:
+        print("\n" + "=" * 80)
+        print("Skipping taxonomy-specific analyses (2, 2b-2f) — "
+              f"model variant ({model.__class__.__name__}) uses non-vanilla routing.")
+        print("=" * 80)
 
     print("\n" + "=" * 80 + "\n3. Latent Space Analysis\n" + "=" * 80)
     analyze_latent_sparsity(model, eval_loader, device, save_dir,
