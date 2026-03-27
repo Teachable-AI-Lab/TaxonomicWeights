@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.baseline_ae import BaselineConvAutoencoder
+from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 

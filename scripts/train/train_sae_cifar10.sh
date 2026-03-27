@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_sae_cifar10
 #SBATCH --output=slurm/slurm_outputs/train_sae_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/train_sae_cifar10_%j.err
-#SBATCH --partition=tail-lab
-#SBATCH --account=tail-lab
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4

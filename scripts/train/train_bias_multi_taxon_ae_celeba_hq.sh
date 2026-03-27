@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_bias_multi_taxon_ae_celeba_hq
 #SBATCH --output=slurm/slurm_outputs/train_bias_multi_taxon_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_bias_multi_taxon_ae_celeba_hq_%j.err
-#SBATCH --partition=tail-lab
-#SBATCH --account=tail-lab
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8

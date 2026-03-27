@@ -34,9 +34,9 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.taxon_ae import TaxonAutoencoder
-from src.model.topk_taxon_ae import TopKTaxonAutoencoder
-from src.model.bias_taxon_ae import BiasTaxonAutoencoder
+from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
+from src.model.cnn.taxon.topk_taxon_ae import TopKTaxonAutoencoder
+from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
 from torchvision import transforms
 
@@ -118,16 +118,18 @@ def load_model(
     if variant == 'topk':
         model = TopKTaxonAutoencoder(
             **common_kw,
-            k=mc.get("k", None),
             k_aux=mc.get("k_aux", None),
             dead_steps=mc.get("dead_steps", 2000),
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
         )
     elif variant == 'bias':
         model = BiasTaxonAutoencoder(
             **common_kw,
-            k=mc.get("k", None),
             bias_update_rate=mc.get("bias_update_rate", 0.001),
             bias_ema_decay=mc.get("bias_ema_decay", 0.99),
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
         )
     else:
         model = TaxonAutoencoder(

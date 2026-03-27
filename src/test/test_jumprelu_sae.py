@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.jumprelu_sae import JumpReLUSparseConvAutoencoder
-from src.model.encoder import resolve_resnet_stage_blocks
+from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
+from src.model.cnn.taxon.encoder import resolve_resnet_stage_blocks
 
 
 def parse_args() -> argparse.Namespace:

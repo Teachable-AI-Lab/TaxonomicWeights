@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.bias_taxon_ae import BiasTaxonAutoencoder
+from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 
@@ -175,10 +175,10 @@ def parse_args() -> argparse.Namespace:
                         default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
     parser.add_argument("--stage-strides", type=int, nargs=4,
                         default=m.get("stage_strides", [1, 2, 2, 2]))
-    parser.add_argument("--k", type=int, default=m.get("k", None))
     parser.add_argument("--bias-update-rate", type=float, default=m.get("bias_update_rate", 0.001))
     parser.add_argument("--bias-ema-decay", type=float, default=m.get("bias_ema_decay", 0.99))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
+    parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
     parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
@@ -195,9 +195,8 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    k_str = f"_k{args.k}" if args.k is not None else ""
     bur_str = f"_bur_{args.bias_update_rate:.0e}"
-    run_suffix = k_str + bur_str
+    run_suffix = bur_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -244,7 +243,6 @@ def main() -> None:
         stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
-        k=args.k,
         bias_update_rate=args.bias_update_rate,
         bias_ema_decay=args.bias_ema_decay,
         kernel_size=_mc.get("kernel_size", 3),
@@ -254,6 +252,7 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", False),
         output_activation=_mc.get("output_activation", "none"),
         temperature=args.temperature,
+        hard=args.hard,
         depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
 
@@ -290,7 +289,7 @@ def main() -> None:
         f"  train_size={train_size} val_size={val_size}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
-        f"  k={args.k} bias_update_rate={args.bias_update_rate}\n"
+        f"  bias_update_rate={args.bias_update_rate}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 
@@ -352,7 +351,7 @@ def main() -> None:
         # Print per-stage leaf bias terms
         with torch.no_grad():
             for s_idx, stage in enumerate(model.encoder.taxon_stages):
-                bias_vals = stage._leaf_bias.cpu().tolist()
+                bias_vals = stage._node_bias.cpu().tolist()
                 ema_vals = stage._ema_load.cpu().tolist()
                 bias_str = ", ".join(f"{v:+.4f}" for v in bias_vals)
                 ema_str = ", ".join(f"{v:.4f}" for v in ema_vals)

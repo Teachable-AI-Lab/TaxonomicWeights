@@ -59,10 +59,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.multi_taxon_ae import MultiTaxonAutoencoder
-from src.model.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
-from src.model.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
-from src.model.encoder import TaxonResNetStage
+from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
+from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
+from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
+from src.model.cnn.taxon.encoder import TaxonResNetStage
 from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
 
 
@@ -136,18 +136,20 @@ def load_model(
     if variant == 'topk':
         model = TopKMultiTaxonAutoencoder(
             **common_kw,
-            k=mc.get("k", None),
             k_aux=mc.get("k_aux", None),
             dead_steps=mc.get("dead_steps", 2000),
             gate_k=mc.get("gate_k", 1),
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
         )
     elif variant == 'bias':
         model = BiasMultiTaxonAutoencoder(
             **common_kw,
-            k=mc.get("k", None),
             bias_update_rate=mc.get("bias_update_rate", 0.001),
             bias_ema_decay=mc.get("bias_ema_decay", 0.99),
             gate_k=mc.get("gate_k", 1),
+            temperature=mc.get("temperature", 1.0),
+            hard=mc.get("hard", False),
         )
     else:
         model = MultiTaxonAutoencoder(

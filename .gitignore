@@ -6,3 +6,6 @@ slurm
 *.npz
 outputs
 archive_outputs
+hf_token
+cached_activations
+downloaded_saes

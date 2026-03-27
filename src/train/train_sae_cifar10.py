@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.sae import SparseConvAutoencoder
+from src.model.cnn.baseline.sae import SparseConvAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 

@@ -52,7 +52,7 @@ def visualize_bias_terms(model, save_dir: str) -> None:
     fig, axes = plt.subplots(n_stages, 2, figsize=(14, 3 * n_stages), squeeze=False)
 
     for s_idx, stage in enumerate(stages):
-        bias = stage._leaf_bias.cpu().numpy()
+        bias = stage._node_bias.cpu().numpy()
         ema = stage._ema_load.cpu().numpy()
         n_leaves = len(bias)
         xs = np.arange(n_leaves)
@@ -88,7 +88,7 @@ def visualize_bias_terms(model, save_dir: str) -> None:
     data = {}
     for s_idx, stage in enumerate(stages):
         data[f"stage_{s_idx+1}"] = {
-            "leaf_bias": stage._leaf_bias.cpu().tolist(),
+            "leaf_bias": stage._node_bias.cpu().tolist(),
             "ema_load": stage._ema_load.cpu().tolist(),
         }
     import json as _json

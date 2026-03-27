@@ -2,8 +2,8 @@
 #SBATCH --job-name=analyze_baseline_ae
 #SBATCH --output=slurm/slurm_outputs/analyze_baseline_ae_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_baseline_ae_%j.err
-#SBATCH --partition=tail-lab
-#SBATCH --account=tail-lab
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

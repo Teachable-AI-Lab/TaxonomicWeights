@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.gated_sae import GatedSparseConvAutoencoder
+from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 

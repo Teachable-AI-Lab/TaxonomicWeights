@@ -4,6 +4,8 @@ from .dataloader import (
     FashionMNISTLoader,
     ImageNetLoader,
     TargetRemappedSubset,
+    LLMActivationDataset,
+    LLMActivationLoader,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "FashionMNISTLoader",
     "ImageNetLoader",
     "TargetRemappedSubset",
+    "LLMActivationDataset",
+    "LLMActivationLoader",
 ]

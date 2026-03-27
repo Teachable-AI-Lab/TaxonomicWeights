@@ -58,7 +58,7 @@ def visualize_bias_terms(model, save_dir: str) -> None:
         n_hier = len(stage.hierarchies)
         fig, axes = plt.subplots(n_hier, 2, figsize=(14, 3 * n_hier), squeeze=False)
         for h_idx, hier in enumerate(stage.hierarchies):
-            bias = hier._leaf_bias.cpu().numpy()
+            bias = hier._node_bias.cpu().numpy()
             ema = hier._ema_load.cpu().numpy()
             n_leaves = len(bias)
             xs = np.arange(n_leaves)
@@ -126,7 +126,7 @@ def visualize_bias_terms(model, save_dir: str) -> None:
         }
         for h_idx, hier in enumerate(stage.hierarchies):
             stage_data["hierarchies"][f"h{h_idx+1}"] = {
-                "leaf_bias": hier._leaf_bias.cpu().tolist(),
+                "leaf_bias": hier._node_bias.cpu().tolist(),
                 "ema_load": hier._ema_load.cpu().tolist(),
             }
         data[f"stage_{s_idx+1}"] = stage_data

@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.taxon_ae import TaxonAutoencoder
+from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 

@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_gated_sae_celeba
 #SBATCH --output=slurm/slurm_outputs/train_gated_sae_celeba_%j.out
 #SBATCH --error=slurm/slurm_errors/train_gated_sae_celeba_%j.err
-#SBATCH --partition=tail-lab
-#SBATCH --account=tail-lab
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8

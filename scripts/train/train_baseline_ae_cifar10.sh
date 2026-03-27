@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_baseline_cifar10
 #SBATCH --output=slurm/slurm_outputs/train_baseline_ae_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/train_baseline_ae_cifar10_%j.err
-#SBATCH --partition=tail-lab
-#SBATCH --account=tail-lab
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

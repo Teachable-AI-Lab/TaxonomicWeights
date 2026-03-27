@@ -52,17 +52,17 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.taxon_ae import TaxonAutoencoder
-from src.model.multi_taxon_ae import MultiTaxonAutoencoder
-from src.model.topk_taxon_ae import TopKTaxonAutoencoder
-from src.model.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
-from src.model.bias_taxon_ae import BiasTaxonAutoencoder
-from src.model.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
-from src.model.sae import SparseConvAutoencoder
-from src.model.topk_sae import TopKSparseConvAutoencoder
-from src.model.gated_sae import GatedSparseConvAutoencoder
-from src.model.jumprelu_sae import JumpReLUSparseConvAutoencoder
-from src.model.baseline_ae import BaselineConvAutoencoder
+from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
+from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
+from src.model.cnn.taxon.topk_taxon_ae import TopKTaxonAutoencoder
+from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
+from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
+from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
+from src.model.cnn.baseline.sae import SparseConvAutoencoder
+from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
+from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
+from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
+from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 from torchvision import transforms  # noqa: F401 (used in transform construction)
 
@@ -288,7 +288,6 @@ def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTa
         stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [5, 6, 7, 8])),
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
-        k=a.get("k", None),
         k_aux=a.get("k_aux", None),
         dead_steps=a.get("dead_steps", 2000),
         kernel_size=a.get("kernel_size", 3),
@@ -298,6 +297,8 @@ def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTa
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
+        temperature=a.get("temperature", 1.0),
+        hard=a.get("hard", False),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
@@ -314,7 +315,6 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
         n_hierarchies=a.get("n_hierarchies", 3),
-        k=a.get("k", None),
         k_aux=a.get("k_aux", None),
         dead_steps=a.get("dead_steps", 2000),
         gate_k=a.get("gate_k", 1),
@@ -325,6 +325,8 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
+        temperature=a.get("temperature", 1.0),
+        hard=a.get("hard", False),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
@@ -340,7 +342,6 @@ def load_bias_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[BiasTa
         stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [5, 6, 7, 8])),
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
-        k=a.get("k", None),
         bias_update_rate=a.get("bias_update_rate", 0.001),
         bias_ema_decay=a.get("bias_ema_decay", 0.99),
         kernel_size=a.get("kernel_size", 3),
@@ -350,6 +351,8 @@ def load_bias_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[BiasTa
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
+        temperature=a.get("temperature", 1.0),
+        hard=a.get("hard", False),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
@@ -366,7 +369,6 @@ def load_bias_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
         n_hierarchies=a.get("n_hierarchies", 3),
-        k=a.get("k", None),
         bias_update_rate=a.get("bias_update_rate", 0.001),
         bias_ema_decay=a.get("bias_ema_decay", 0.99),
         gate_k=a.get("gate_k", 1),
@@ -377,6 +379,8 @@ def load_bias_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
+        temperature=a.get("temperature", 1.0),
+        hard=a.get("hard", False),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()

@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.taxon_ae import TaxonAutoencoder
-from src.model.encoder import resolve_resnet_stage_blocks
+from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
+from src.model.cnn.taxon.encoder import resolve_resnet_stage_blocks
 
 
 def parse_args() -> argparse.Namespace:

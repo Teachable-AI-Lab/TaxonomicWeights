@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
+from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 
@@ -193,11 +193,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-strides", type=int, nargs=4,
                         default=m.get("stage_strides", [1, 2, 2, 2]))
     parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
-    parser.add_argument("--k", type=int, default=m.get("k", None))
     parser.add_argument("--k-aux", type=int, default=m.get("k_aux", None))
     parser.add_argument("--dead-steps", type=int, default=m.get("dead_steps", 2000))
     parser.add_argument("--gate-k", type=int, default=m.get("gate_k", 1))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
+    parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
     parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
@@ -215,10 +215,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    k_str = f"_k{args.k}" if args.k is not None else ""
     hier_str = f"_K{args.n_hierarchies}"
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = k_str + hier_str + auxk_str
+    run_suffix = hier_str + auxk_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -266,7 +265,6 @@ def main() -> None:
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
         n_hierarchies=args.n_hierarchies,
-        k=args.k,
         k_aux=args.k_aux,
         dead_steps=args.dead_steps,
         gate_k=args.gate_k,
@@ -277,6 +275,7 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", False),
         output_activation=_mc.get("output_activation", "none"),
         temperature=args.temperature,
+        hard=args.hard,
         depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
 
@@ -312,7 +311,7 @@ def main() -> None:
         "Training setup:\n"
         f"  device={device}\n"
         f"  n_params={n_params:,}\n"
-        f"  n_hierarchies={args.n_hierarchies}  k={args.k}  k_aux={args.k_aux}\n"
+        f"  n_hierarchies={args.n_hierarchies}  k_aux={args.k_aux}\n"
         f"  train_size={train_size} val_size={val_size}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"

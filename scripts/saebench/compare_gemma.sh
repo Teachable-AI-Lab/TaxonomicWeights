@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name=compare_gemma_saebench
+#SBATCH --output=slurm/slurm_outputs/compare_gemma_saebench_%j.out
+#SBATCH --error=slurm/slurm_errors/compare_gemma_saebench_%j.err
+#SBATCH --partition=overcap
+#SBATCH --account=overcap
+#SBATCH --qos=short
+#SBATCH --gres=gpu:a40:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=0-12:00:00
+
+# ── Environment ────────────────────────────────────────────────────────────────
+source ~/flash/miniconda3/etc/profile.d/conda.sh
+conda activate taxon-weights
+export PYTHONUNBUFFERED=1
+
+# ── Working directory ──────────────────────────────────────────────────────────
+cd /nethome/ksingara3/flash/TaxonomicWeights
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
+
+# ── HuggingFace token (Gemma-2 is a gated model) ─────────────────────────────
+export HF_TOKEN="$(cat hf_token | tr -d '[:space:]')"
+export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+# ── Compare Gemma-2-2B SAE variants (TaxonSAE vs MultiTaxonSAE) ─────────────
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Gemma-2B comparison (job $SLURM_JOB_ID)"
+
+python src/eval/compare_saebench.py \
+    --configs configs/saebench/taxon_sae_gemma2b.json \
+              configs/saebench/multi_taxon_sae_gemma2b.json \
+    --output-dir outputs/saebench/gemma2b_layer12/comparison \
+    --include-baselines \
+    --baseline-width 4k \
+    --eval-types core sparse_probing scr tpp absorption \
+    --save-activations
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished Gemma-2B comparison (job $SLURM_JOB_ID)"
