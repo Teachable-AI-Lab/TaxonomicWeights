@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Compare SAEBench evaluation results across SAE variants with graphics.
 
-Loads multiple trained SAEs from their training configs, optionally adds
-pre-trained baselines, runs SAEBench evaluations, and generates comparison
+Auto-discovers all trained SAEs in a directory, collects their per-model
+eval results, optionally evaluates baselines, and generates comparison
 graphics.
 
 Usage:
-    # Pythia comparison (our models + baselines):
+    # Pythia comparison (auto-discover models + baselines):
     python src/eval/compare_saebench.py \
-        --configs configs/saebench/taxon_sae_pythia160m.json \
-                  configs/saebench/multi_taxon_sae_pythia160m.json \
-        --include-baselines --baseline-width 4k \
-        --eval-types core sparse_probing scr tpp absorption
+        --models-dir outputs/saebench/pythia160m_layer8 \
+        --model-name pythia-160m-deduped \
+        --include-baselines --baseline-width 4k
 
-    # Generate graphics only (skip re-evaluation):
+    # Generate graphics only (skip baseline evaluation):
     python src/eval/compare_saebench.py \
-        --configs configs/saebench/taxon_sae_pythia160m.json \
-                  configs/saebench/multi_taxon_sae_pythia160m.json \
+        --models-dir outputs/saebench/pythia160m_layer8 \
+        --model-name pythia-160m-deduped \
         --include-baselines --baseline-width 4k \
         --skip-eval
 """
@@ -46,7 +45,6 @@ from src.eval.run_saebench_evals import (
     load_custom_sae,
     load_baselines,
     run_evals,
-    checkpoint_from_config,
     MODEL_CONFIGS,
 )
 
@@ -84,43 +82,86 @@ def _deep_get(d: dict, *keys, default=None):
     return d
 
 
-def collect_results(output_base: str, sae_names: list[str]) -> dict[str, dict]:
-    """Scan eval result JSONs and aggregate metrics per SAE per eval type.
+def discover_models(models_dir: str) -> list[tuple[str, str, str]]:
+    """Scan *models_dir* for subdirectories containing ``checkpoints/best.pt``.
 
-    Returns: {sae_name: {eval_type: parsed_json_dict}}
+    Returns list of ``(checkpoint_path, variant, sae_name)``.
     """
-    base = Path(output_base)
+    base = Path(models_dir)
+    found = []
+    for ckpt in sorted(base.glob("*/checkpoints/best.pt")):
+        training_dir = ckpt.parent.parent
+        dirname = training_dir.name
+
+        if "multi_taxon_sae" in dirname:
+            variant = "multi_taxon"
+        elif "taxon_sae" in dirname:
+            variant = "taxon"
+        else:
+            print(f"  Skipping {dirname}: unrecognised variant")
+            continue
+
+        sae_name = dirname  # e.g. "taxon_sae_L10_dkl1e-02_t0p01"
+        found.append((str(ckpt), variant, sae_name))
+
+    return found
+
+
+def collect_results(
+    custom_entries: list[tuple[Path, str]],
+    baseline_dir: Path | None = None,
+    baseline_names: list[str] | None = None,
+) -> dict[str, dict]:
+    """Collect eval results from per-model ``eval_results/`` directories.
+
+    For custom models every JSON in their ``eval_results/`` belongs to them.
+    For baselines the shared *baseline_dir* is scanned and JSONs are matched
+    by ``sae_lens_id``.
+
+    Returns: ``{sae_name: {eval_type: parsed_json_dict}}``
+    """
     results: dict[str, dict] = {}
 
-    for json_path in sorted(base.rglob("*.json")):
-        try:
-            with open(json_path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, IOError):
+    # Custom models — each has its own eval_results/ subdirectory
+    for model_dir, sae_name in custom_entries:
+        eval_dir = model_dir / "eval_results"
+        if not eval_dir.exists():
+            print(f"  No eval results for {sae_name} (expected at {eval_dir})")
             continue
+        for json_path in sorted(eval_dir.rglob("*.json")):
+            try:
+                with open(json_path) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                continue
+            eval_type = data.get("eval_type_id", "")
+            if not eval_type:
+                continue
+            results.setdefault(sae_name, {})[eval_type] = data
 
-        # Determine eval type from the JSON itself
-        eval_type = data.get("eval_type_id", "")
-        sae_id = data.get("sae_lens_id", json_path.stem)
-
-        # Try to match sae_id to a known sae_name
-        matched_name = None
-        for name in sae_names:
-            if name == sae_id or name in sae_id or sae_id in name:
-                matched_name = name
-                break
-        if matched_name is None:
-            # Fall back to stem matching
-            for name in sae_names:
-                if json_path.stem == name or name in json_path.stem:
+    # Baselines — shared directory, match by sae_lens_id / stem
+    if baseline_dir and baseline_names and baseline_dir.exists():
+        for json_path in sorted(baseline_dir.rglob("*.json")):
+            try:
+                with open(json_path) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                continue
+            eval_type = data.get("eval_type_id", "")
+            sae_id = data.get("sae_lens_id", json_path.stem)
+            matched_name = None
+            for name in baseline_names:
+                if name == sae_id or name in sae_id or sae_id in name:
                     matched_name = name
                     break
-        if matched_name is None:
-            continue
-
-        if matched_name not in results:
-            results[matched_name] = {}
-        results[matched_name][eval_type] = data
+            if matched_name is None:
+                for name in baseline_names:
+                    if json_path.stem == name or name in json_path.stem:
+                        matched_name = name
+                        break
+            if matched_name is None:
+                continue
+            results.setdefault(matched_name, {})[eval_type] = data
 
     return results
 
@@ -320,21 +361,27 @@ def generate_graphics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare SAEBench evaluations across SAE variants"
+        description="Compare SAEBench evaluations across all trained SAE variants"
     )
-    parser.add_argument("--configs", nargs="+", required=True,
-                        help="Training config JSONs for our models")
+    parser.add_argument("--models-dir", required=True,
+                        help="Directory to scan for trained models "
+                             "(e.g., outputs/saebench/pythia160m_layer8)")
+    parser.add_argument("--model-name", required=True,
+                        help="TransformerLens model name "
+                             "(e.g., pythia-160m-deduped, gemma-2-2b)")
     parser.add_argument("--include-baselines", action="store_true",
-                        help="Also load SAEBench baseline SAEs for comparison")
+                        help="Include SAEBench baseline SAEs for comparison")
     parser.add_argument("--baseline-width", type=str, default="4k",
                         choices=["4k", "16k"])
     parser.add_argument("--max-baselines", type=int, default=6)
     parser.add_argument("--eval-types", nargs="+",
                         default=["core", "sparse_probing", "scr", "tpp", "absorption"])
     parser.add_argument("--output-dir", type=str, default="",
-                        help="Where to save results + graphics (auto from model name)")
+                        help="Where to save comparison graphics "
+                             "(default: {models-dir}/comparison)")
     parser.add_argument("--skip-eval", action="store_true",
-                        help="Skip evaluation, only generate graphics from existing results")
+                        help="Skip baseline evaluation; only generate graphics "
+                             "from existing results")
     parser.add_argument("--force-rerun", action="store_true")
     parser.add_argument("--save-activations", action="store_true")
     return parser.parse_args()
@@ -343,102 +390,117 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Resolve all configs
-    configs_info = []
-    model_name = None
-    for cfg_path in args.configs:
-        ckpt, variant, mname = checkpoint_from_config(cfg_path)
-        if model_name is None:
-            model_name = mname
-        elif mname != model_name:
-            print(f"Warning: mixed models ({model_name} vs {mname}), using {model_name}")
-        configs_info.append((ckpt, variant, mname))
+    if args.model_name not in MODEL_CONFIGS:
+        raise ValueError(f"Unsupported model: {args.model_name}")
 
-    if model_name not in MODEL_CONFIGS:
-        raise ValueError(f"Unsupported model: {model_name}")
-
-    mc = MODEL_CONFIGS[model_name]
+    mc = MODEL_CONFIGS[args.model_name]
     llm_batch_size = mc["batch_size"]
     llm_dtype = mc["dtype"]
     dtype = general_utils.str_to_dtype(llm_dtype)
 
-    # Determine output directory
-    if args.output_dir:
-        output_base = args.output_dir
-    else:
-        model_short = model_name.replace("-deduped", "").replace("-", "_")
-        output_base = f"eval_results/{model_short}_comparison"
-
     device = general_utils.setup_environment()
 
-    # Load our custom SAEs
-    sae_names = []
-    selected_saes = []
-    for ckpt, variant, _ in configs_info:
-        print(f"\nLoading {variant} SAE from {ckpt} ...")
-        sae = load_custom_sae(ckpt, variant, torch.device(device), dtype)
-        sae_name = f"{variant}_sae_{Path(ckpt).parent.parent.name}"
-        sae = sae.to(dtype=dtype)
-        sae.cfg.dtype = llm_dtype
-        selected_saes.append((sae_name, sae))
-        sae_names.append(sae_name)
-        print(f"  {sae_name} (d_sae={sae.cfg.d_sae})")
+    # ── Discover all trained models ──────────────────────────────────────
+    print(f"\nScanning {args.models_dir} for trained models ...")
+    discovered = discover_models(args.models_dir)
+    if not discovered:
+        print("No trained models found. Expected subdirectories with "
+              "checkpoints/best.pt")
+        return
 
-    # Load baselines
+    print(f"  Found {len(discovered)} model(s):")
+    for ckpt, variant, sae_name in discovered:
+        print(f"    {sae_name} ({variant}) -> {ckpt}")
+
+    # Build custom-model entries for result collection
+    sae_names: list[str] = []
+    custom_entries: list[tuple[Path, str]] = []
+    for ckpt, variant, sae_name in discovered:
+        model_dir = Path(ckpt).parent.parent
+        custom_entries.append((model_dir, sae_name))
+        sae_names.append(sae_name)
+
+    # ── Handle baselines ─────────────────────────────────────────────────
+    baseline_dir: Path | None = None
+    baseline_names: list[str] = []
     if args.include_baselines:
-        hook_layer = selected_saes[0][1].cfg.hook_layer
+        # Determine hook_layer from first discovered model
+        print(f"\nLoading first model to determine hook_layer ...")
+        first_ckpt, first_variant, _ = discovered[0]
+        first_sae = load_custom_sae(
+            first_ckpt, first_variant, torch.device(device), dtype,
+        )
+        hook_layer = first_sae.cfg.hook_layer
+        del first_sae
+        torch.cuda.empty_cache()
+
         baselines = load_baselines(
-            model_name, hook_layer, torch.device(device), dtype,
+            args.model_name, hook_layer, torch.device(device), dtype,
             width=args.baseline_width, max_baselines=args.max_baselines,
         )
-        for bname, bsae in baselines:
-            bsae = bsae.to(dtype=dtype)
-            bsae.cfg.dtype = llm_dtype
-        selected_saes.extend(baselines)
-        sae_names.extend([n for n, _ in baselines])
+
+        if baselines:
+            baseline_dir = (
+                Path(args.models_dir) / f"baselines_{args.baseline_width}"
+            )
+            baseline_output = str(baseline_dir / "eval_results")
+
+            for bname, bsae in baselines:
+                bsae = bsae.to(dtype=dtype)
+                bsae.cfg.dtype = llm_dtype
+            baseline_names = [n for n, _ in baselines]
+            sae_names.extend(baseline_names)
+
+            if not args.skip_eval:
+                print(f"\nEvaluating {len(baselines)} baselines ...")
+                run_evals(
+                    model_name=args.model_name,
+                    selected_saes=baselines,
+                    llm_batch_size=llm_batch_size,
+                    llm_dtype=llm_dtype,
+                    device=device,
+                    eval_types=args.eval_types,
+                    force_rerun=args.force_rerun,
+                    save_activations=args.save_activations,
+                    output_base=baseline_output,
+                )
+
+            # Free baseline SAEs
+            del baselines
+            torch.cuda.empty_cache()
 
     print(f"\nSAEs to compare: {sae_names}")
-    print(f"Output: {output_base}")
 
-    # Run evaluations
-    if not args.skip_eval:
-        print(f"\nRunning SAEBench evaluations ...")
-        run_evals(
-            model_name=model_name,
-            selected_saes=selected_saes,
-            llm_batch_size=llm_batch_size,
-            llm_dtype=llm_dtype,
-            device=device,
-            eval_types=args.eval_types,
-            force_rerun=args.force_rerun,
-            save_activations=args.save_activations,
-            output_base=output_base,
-        )
-    else:
-        print("\nSkipping evaluation (--skip-eval), loading existing results ...")
-
-    # Collect results from disk
-    print(f"\nCollecting results from {output_base} ...")
-    results = collect_results(output_base, sae_names)
+    # ── Collect results ──────────────────────────────────────────────────
+    print(f"\nCollecting results ...")
+    bl_eval_dir = baseline_dir / "eval_results" if baseline_dir else None
+    results = collect_results(
+        custom_entries=custom_entries,
+        baseline_dir=bl_eval_dir,
+        baseline_names=baseline_names,
+    )
 
     n_with_results = sum(1 for n in sae_names if n in results and results[n])
     print(f"  Found results for {n_with_results}/{len(sae_names)} SAEs")
 
     if n_with_results == 0:
-        print("No results found. Run without --skip-eval first.")
+        print("No results found. Run eval scripts first.")
         return
 
-    # Generate graphics
-    gfx_dir = Path(output_base) / "graphics"
-    model_short = model_name.replace("-deduped", "").replace("-", "_")
+    # ── Generate graphics ────────────────────────────────────────────────
+    output_dir = args.output_dir or str(
+        Path(args.models_dir) / "comparison"
+    )
+    gfx_dir = Path(output_dir) / "graphics"
+    model_short = args.model_name.replace("-deduped", "").replace("-", "_")
     title_prefix = f"{model_short} — "
     print(f"\nGenerating comparison graphics in {gfx_dir} ...")
     generate_graphics(results, sae_names, gfx_dir, title_prefix)
 
     # Save a summary CSV
-    _save_summary_csv(results, sae_names, Path(output_base))
+    _save_summary_csv(results, sae_names, Path(output_dir))
 
-    print(f"\nDone. All outputs in {output_base}/")
+    print(f"\nDone. All outputs in {output_dir}/")
 
 
 def _save_summary_csv(results: dict, sae_names: list[str], out_dir: Path) -> None:

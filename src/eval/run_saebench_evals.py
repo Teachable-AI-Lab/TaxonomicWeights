@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -148,6 +150,165 @@ def load_baselines(
     return selected
 
 
+# ── Taxonomy-specific activation analysis ─────────────────────────────────
+
+
+@torch.no_grad()
+def run_taxonomy_analysis(
+    selected_saes: list[tuple[str, object]],
+    model_name: str,
+    device: str,
+    output_base: str,
+    n_batches: int = 200,
+    context_size: int = 128,
+) -> None:
+    """Analyse per-depth activation statistics for TaxonSAE / MultiTaxonSAE.
+
+    For each taxonomy SAE in *selected_saes*, computes:
+      - per-depth L0 (mean #active features per token)
+      - per-depth feature firing rate
+      - routing path entropy (how decisive the tree is)
+      - overall L0 with hard vs soft routing comparison
+      - per-depth reconstruction contribution
+
+    Writes a JSON report to ``output_base/taxonomy/<sae_name>.json``.
+    Non-taxonomy SAEs (baselines) are silently skipped.
+    """
+    from sae_bench.sae_bench_utils.activations_store import ActivationsStore
+
+    out_dir = Path(output_base) / "taxonomy"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for sae_name, sae in selected_saes:
+        encoder = getattr(sae, "encoder", None)
+        if encoder is None:
+            continue  # skip baselines
+
+        # Determine if it's multi-hierarchy
+        hierarchies = getattr(encoder, "hierarchies", None)
+        is_multi = hierarchies is not None
+
+        # The single-tree stage used for stats
+        stage = hierarchies[0] if is_multi else encoder
+        n_layers = stage.n_taxonomy_layers
+        layer_channels = stage.layer_channels  # [2, 4, 8, ..., 2^L]
+        d_sae = sae.cfg.d_sae
+
+        print(f"\n[taxonomy] Analysing {sae_name}  (d_sae={d_sae}, "
+              f"n_layers={n_layers}, multi={is_multi})")
+
+        # Activation store for streaming batches
+        act_store = ActivationsStore(
+            model_name=model_name,
+            hook_name=sae.cfg.hook_name,
+            hook_layer=sae.cfg.hook_layer,
+            dataset="Skylion007/openwebtext",
+            context_size=context_size,
+            d_in=sae.cfg.d_in,
+            device=device,
+        )
+
+        # Accumulators
+        total_tokens = 0
+        # Per-depth: active count, total magnitude, total squared magnitude
+        depth_active_counts = [0.0 for _ in layer_channels]
+        depth_magnitude_sums = [0.0 for _ in layer_channels]
+        depth_firing_any = [torch.zeros(ch, device=device) for ch in layer_channels]
+        overall_l0_hard = 0.0
+        overall_l0_soft = 0.0
+        routing_entropy_sum = 0.0
+        recon_mse_total = 0.0
+
+        for batch_idx in range(n_batches):
+            x = act_store.next_batch().to(device=device, dtype=sae.W_dec.dtype)
+            flat = x.reshape(-1, x.shape[-1])
+            B = flat.shape[0]
+            total_tokens += B
+
+            centred = flat - sae.b_dec
+
+            # Hard-routing encode (for L0)
+            z_hard, _ = encoder(centred, hard=True)
+            overall_l0_hard += (z_hard > 0).float().sum(dim=-1).sum().item()
+
+            # Soft-routing encode (for comparison)
+            z_soft, _ = encoder(centred, hard=False)
+            overall_l0_soft += (z_soft > 0).float().sum(dim=-1).sum().item()
+
+            # Reconstruction MSE
+            x_hat = z_hard @ sae.W_dec + sae.b_dec
+            recon_mse_total += ((flat - x_hat) ** 2).sum().item()
+
+            # Per-depth analysis (on hard-routed output)
+            depth_splits = torch.split(z_hard, layer_channels, dim=1)
+            for d, z_d in enumerate(depth_splits):
+                active = (z_d > 0).float()
+                depth_active_counts[d] += active.sum(dim=-1).sum().item()
+                depth_magnitude_sums[d] += z_d.sum().item()
+                depth_firing_any[d] += active.any(dim=0).float()
+
+            # Routing entropy: run encoder internals to get path probs
+            if not is_multi:
+                all_logits = encoder.linear(centred)
+                d_logits = torch.split(all_logits, layer_channels, dim=1)
+                prev_logp = None
+                for d, lg in enumerate(d_logits):
+                    log_cond = encoder._pairwise_log_softmax(lg, encoder.temperature, False)
+                    logp = log_cond if prev_logp is None else log_cond + prev_logp.repeat_interleave(2, dim=1)
+                    prob = logp.exp()
+                    ent = -(prob * logp).sum(dim=1).mean().item()
+                    routing_entropy_sum += ent
+                    prev_logp = logp
+
+        # ── Summarise ──────────────────────────────────────────────────
+        mean_l0_hard = overall_l0_hard / total_tokens
+        mean_l0_soft = overall_l0_soft / total_tokens
+        mean_recon_mse = recon_mse_total / total_tokens
+
+        per_depth = []
+        for d, ch in enumerate(layer_channels):
+            l0_d = depth_active_counts[d] / total_tokens
+            mean_mag = depth_magnitude_sums[d] / max(depth_active_counts[d], 1)
+            alive_pct = (depth_firing_any[d] > 0).float().mean().item() * 100
+            per_depth.append({
+                "depth": d,
+                "channels": ch,
+                "l0": round(l0_d, 3),
+                "mean_magnitude": round(mean_mag, 5),
+                "alive_features_pct": round(alive_pct, 1),
+            })
+
+        report = {
+            "sae_name": sae_name,
+            "d_sae": d_sae,
+            "n_taxonomy_layers": n_layers,
+            "is_multi_hierarchy": is_multi,
+            "n_hierarchies": len(hierarchies) if is_multi else 1,
+            "total_tokens": total_tokens,
+            "mean_l0_hard_routing": round(mean_l0_hard, 2),
+            "mean_l0_soft_routing": round(mean_l0_soft, 2),
+            "mean_recon_mse": round(mean_recon_mse, 6),
+            "mean_routing_entropy": round(routing_entropy_sum / (n_batches * n_layers), 5)
+                if not is_multi else None,
+            "per_depth": per_depth,
+        }
+
+        out_path = out_dir / f"{sae_name}.json"
+        with open(out_path, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"  → saved {out_path}")
+
+        # Print summary
+        print(f"  L0 (hard): {mean_l0_hard:.1f}  |  L0 (soft): {mean_l0_soft:.1f}  "
+              f"|  MSE: {mean_recon_mse:.5f}")
+        for d_info in per_depth:
+            print(f"    depth {d_info['depth']:2d}  "
+                  f"(ch={d_info['channels']:5d}): "
+                  f"L0={d_info['l0']:.2f}  "
+                  f"alive={d_info['alive_features_pct']:.0f}%  "
+                  f"mag={d_info['mean_magnitude']:.4f}")
+
+
 def run_evals(
     model_name: str,
     selected_saes: list[tuple[str, object]],
@@ -254,6 +415,14 @@ def run_evals(
                 force_rerun,
             )
         ),
+        "taxonomy": (
+            lambda: run_taxonomy_analysis(
+                selected_saes=selected_saes,
+                model_name=model_name,
+                device=device,
+                output_base=output_base,
+            )
+        ),
     }
 
     for eval_type in eval_types:
@@ -315,7 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", type=str, default="",
                         help="TransformerLens model name")
     parser.add_argument("--eval-types", nargs="+",
-                        default=["core", "sparse_probing", "scr", "tpp", "absorption"],
+                        default=["core", "sparse_probing", "scr", "tpp", "absorption", "taxonomy"],
                         help="Which SAEBench evals to run")
     parser.add_argument("--include-baselines", action="store_true", default=False,
                         help="Also load and evaluate SAEBench baseline SAEs for comparison")
@@ -340,6 +509,11 @@ def parse_args() -> argparse.Namespace:
             args.variant = variant
         if not args.model_name:
             args.model_name = model_name
+        # Auto-derive output dir from checkpoint path
+        if args.output_dir == "eval_results":
+            args.output_dir = str(
+                Path(args.checkpoint).parent.parent / "eval_results"
+            )
 
     # Validate required fields
     if not args.checkpoint:
@@ -368,7 +542,7 @@ def main() -> None:
     # Load our custom SAE
     print(f"\nLoading {args.variant} SAE from {args.checkpoint} ...")
     sae = load_custom_sae(args.checkpoint, args.variant, torch.device(device), dtype)
-    sae_name = args.sae_name or f"{args.variant}_sae_{Path(args.checkpoint).parent.parent.name}"
+    sae_name = args.sae_name or Path(args.checkpoint).parent.parent.name
     sae = sae.to(dtype=dtype)
     sae.cfg.dtype = llm_dtype
 

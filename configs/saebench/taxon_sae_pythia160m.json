@@ -13,8 +13,8 @@
   },
   "model": {
     "model_variant": "taxon_sae",
-    "n_taxonomy_layers": 11,
-    "temperature": 0.01,
+    "n_taxonomy_layers": 10,
+    "temperature": 0.05,
     "hard": false,
     "depth_decay": 0.5
   },

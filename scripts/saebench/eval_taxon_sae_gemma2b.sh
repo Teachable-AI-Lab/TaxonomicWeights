@@ -28,8 +28,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TaxonSAE Gemma-2B SAEBench eval (j
 
 python src/eval/run_saebench_evals.py \
     --config configs/saebench/taxon_sae_gemma2b.json \
-    --output-dir outputs/saebench/gemma2b_layer12/eval_results \
-    --eval-types core sparse_probing scr tpp absorption \
+    --eval-types core sparse_probing scr tpp absorption taxonomy \
     --save-activations
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TaxonSAE Gemma-2B SAEBench eval (job $SLURM_JOB_ID)"

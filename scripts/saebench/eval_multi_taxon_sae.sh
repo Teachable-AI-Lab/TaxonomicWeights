@@ -24,8 +24,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting MultiTaxonSAE SAEBench evaluation 
 
 python src/eval/run_saebench_evals.py \
     --config configs/saebench/multi_taxon_sae_pythia160m.json \
-    --output-dir outputs/saebench/pythia160m_layer8/eval_results \
-    --eval-types core sparse_probing scr tpp absorption \
+    --eval-types core sparse_probing scr tpp absorption taxonomy \
     --save-activations
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished MultiTaxonSAE SAEBench evaluation (job $SLURM_JOB_ID)"

@@ -23,9 +23,8 @@ export PYTHONPATH="${PWD}:${PYTHONPATH}"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Pythia-160M comparison (job $SLURM_JOB_ID)"
 
 python src/eval/compare_saebench.py \
-    --configs configs/saebench/taxon_sae_pythia160m.json \
-              configs/saebench/multi_taxon_sae_pythia160m.json \
-    --output-dir outputs/saebench/pythia160m_layer8/comparison \
+    --models-dir outputs/saebench/pythia160m_layer8 \
+    --model-name pythia-160m-deduped \
     --include-baselines \
     --baseline-width 4k \
     --eval-types core sparse_probing scr tpp absorption \

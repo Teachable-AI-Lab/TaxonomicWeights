@@ -207,7 +207,7 @@ class MultiTaxonSAE(BaseSAE):
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         flat = flat - self.b_dec
-        z, _ = self.encoder(flat)
+        z, _ = self.encoder(flat, hard=True)   # hard routing at eval → exact zeros
         return z.reshape(*shape[:-1], -1)
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
