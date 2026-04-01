@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=train_taxon_gemma2b
-#SBATCH --output=slurm/slurm_outputs/train_taxon_gemma2b_%j.out
-#SBATCH --error=slurm/slurm_errors/train_taxon_gemma2b_%j.err
+#SBATCH --job-name=train_topk_multi_taxon_gemma2b
+#SBATCH --output=slurm/slurm_outputs/train_topk_multi_taxon_gemma2b_%j.out
+#SBATCH --error=slurm/slurm_errors/train_topk_multi_taxon_gemma2b_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
@@ -22,10 +22,10 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 export HF_TOKEN="$(cat hf_token | tr -d '[:space:]')"
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 
-# ── Train TaxonSAE (Gemma-2-2B, layer 12) ────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"
+# ── Train TopKMultiTaxonSAE (Gemma-2-2B, layer 12) ──────────────────────────
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TopKMultiTaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"
 
-python src/train/saebench/train_taxon_sae.py \
-    --config configs/saebench/taxon_sae_gemma2b.json
+python src/train/saebench/train_topk_multi_taxon_sae.py \
+    --config configs/saebench/topk_multi_taxon_sae_gemma2b.json
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TopKMultiTaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"

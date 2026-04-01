@@ -3,10 +3,7 @@
 
 Thin wrapper that reuses variant-independent analyses from
 ``analyze_celeba_hq_ae.py`` with the correct TopK-specific directory
-naming convention (``_k{K}_auxk_{W:.0e}``).
-
-Taxonomy-specific analyses (parse trees, binary splits, etc.) are skipped
-because TopK routing does not use pairwise softmax.
+naming convention (``_auxk_{W:.0e}``).
 """
 
 from __future__ import annotations
@@ -32,6 +29,12 @@ from src.analyze.analyze_celeba_hq_ae import (
     load_model,
     visualize_stage_filters,
     analyze_filter_similarity,
+    visualize_taxonomy_distributions,
+    visualize_taxonomy_path_probs,
+    visualize_taxonomy_tree,
+    analyze_parse_tree,
+    analyze_hierarchical_activations,
+    analyze_binary_split_maps,
     analyze_latent_sparsity,
     analyze_reconstruction_quality,
     visualize_multiple_reconstructions,
@@ -70,7 +73,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
     parser.add_argument("--seed", type=int, default=cfg.get("training", {}).get("seed", 42))
     # TopK-specific
-    parser.add_argument("--k", type=int, default=m.get("k", None))
     parser.add_argument("--auxk-weight", type=float, default=cfg.get("training", {}).get("auxk_weight", 0.0))
     # Analysis knobs
     parser.add_argument("--n-latent-batches", type=int, default=a.get("num_latent_batches", 50))
@@ -78,6 +80,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-recon-images", type=int, default=a.get("num_multiple_recon_images", 8))
     parser.add_argument("--n-recon-sets", type=int, default=a.get("num_reconstructions_per_image", 8))
     parser.add_argument("--n-act-images", type=int, default=a.get("num_activation_images", 3))
+    parser.add_argument("--n-taxon-batches", type=int, default=a.get("num_taxonomy_batches", 10))
+    parser.add_argument("--n-parse-images", type=int, default=a.get("num_parse_tree_images", 4))
+    parser.add_argument("--n-hier-images", type=int, default=a.get("num_hier_act_images", 4))
+    parser.add_argument("--max-hier-depth", type=int, default=a.get("max_hier_act_depth", 4))
+    parser.add_argument("--n-split-images", type=int, default=a.get("num_split_map_images", 4))
+    parser.add_argument("--max-split-pairs", type=int, default=a.get("max_split_pairs", 8))
     return parser.parse_args()
 
 
@@ -86,9 +94,8 @@ def main() -> None:
     config = load_config(args.config) if args.config else {}
 
     # ── run suffix (must match training script) ──
-    k_str = f"_k{args.k}" if args.k is not None else ""
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = k_str + auxk_str
+    run_suffix = auxk_str
 
     output_dir = Path(args.output_dir + run_suffix)
     analysis_dir = Path(args.analysis_save_dir or str(output_dir / "analysis"))
@@ -138,6 +145,32 @@ def main() -> None:
 
     print("\n[1b] Filter similarity analysis")
     analyze_filter_similarity(model, save_dir)
+
+    print("\n[2] Taxonomy probability distributions")
+    visualize_taxonomy_distributions(model, eval_loader, device, save_dir,
+                                     num_batches=args.n_taxon_batches)
+
+    print("\n[2b] Taxonomy path probability plots")
+    visualize_taxonomy_path_probs(model, eval_loader, device, save_dir)
+
+    print("\n[2c] Taxonomy tree activations")
+    visualize_taxonomy_tree(model, eval_loader, device, save_dir,
+                            num_images=args.n_act_images)
+
+    print("\n[2d] Parse tree analysis")
+    analyze_parse_tree(model, eval_loader, device, save_dir,
+                       num_images=args.n_parse_images)
+
+    print("\n[2e] Hierarchical activation maps")
+    analyze_hierarchical_activations(model, eval_loader, device, save_dir,
+                                     num_images=args.n_hier_images,
+                                     max_depth=args.max_hier_depth)
+
+    print("\n[2f] Binary split maps")
+    analyze_binary_split_maps(model, eval_loader, device, save_dir,
+                              num_images=args.n_split_images,
+                              max_depth=args.max_hier_depth,
+                              max_pairs=args.max_split_pairs)
 
     print("\n[3] Latent space sparsity")
     analyze_latent_sparsity(model, eval_loader, device, save_dir,

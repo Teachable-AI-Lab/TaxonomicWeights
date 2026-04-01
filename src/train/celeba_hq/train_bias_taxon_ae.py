@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Train BiasMultiTaxonAutoencoder on CIFAR-10 with ResNet-18 stage layout.
+"""Train BiasTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
 
-Uses K independent sigmoid+bias taxonomy hierarchies per encoder stage with a
-sigmoid+bias inter-hierarchy gate.  No auxiliary losses.
+Uses sigmoid routing with non-differentiable per-leaf biases for load
+balancing.  No auxiliary losses — diversity is maintained purely through
+the heuristic bias update rule.
 
 Loss:
     recon (MSE only — no regularisation terms)
@@ -25,17 +26,18 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
-from src.utils.dataloader import CIFAR10Loader
+from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
+from src.utils.dataloader import CelebAHQLoader
 
 
 def seed_everything(seed: int) -> None:
@@ -134,7 +136,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                label=f"best val (ep {best_ep})")
     ax.legend(fontsize=8)
 
-    plt.suptitle("Training curves (Bias Multi-Taxon AE)", fontsize=13, fontweight="bold")
+    plt.suptitle("Training curves (Bias Taxon AE)", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -158,26 +160,25 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train Bias Multi-Taxon AE on CIFAR-10")
+    parser = argparse.ArgumentParser(description="Train Bias Taxon AE on CelebA-HQ")
     parser.add_argument("--config", type=str, default="")
     # data
-    parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data"))
+    parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
     parser.add_argument("--output-dir", type=str,
-                        default=o.get("output_dir", "./outputs/bias_multi_taxon_ae_cifar10_r18"))
-    parser.add_argument("--image-size", type=int, default=d.get("image_size", 32))
-    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 128))
-    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 4))
-    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.1))
+                        default=o.get("output_dir", "./outputs/bias_taxon_ae_celeba_hq_r18"))
+    parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
+    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
+    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
+    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
     # model
     parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
     parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
-                        default=m.get("stage_taxonomy_layers", [3, 4, 5, 6]))
+                        default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
     parser.add_argument("--stage-strides", type=int, nargs=4,
                         default=m.get("stage_strides", [1, 2, 2, 2]))
-    parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
+
     parser.add_argument("--bias-update-rate", type=float, default=m.get("bias_update_rate", 0.001))
     parser.add_argument("--bias-ema-decay", type=float, default=m.get("bias_ema_decay", 0.99))
-    parser.add_argument("--gate-k", type=int, default=m.get("gate_k", 1))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
     # training
@@ -196,9 +197,8 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    hier_str = f"_K{args.n_hierarchies}"
     bur_str = f"_bur_{args.bias_update_rate:.0e}"
-    run_suffix = hier_str + bur_str
+    run_suffix = bur_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -207,53 +207,44 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # CIFAR10Loader applies its own normalisation (mean/std=0.5); no extra tf needed.
-    cifar_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
-    full_train_loader, _ = cifar_loader.get_loaders()
+    tf = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
 
-    # Carve a proper validation split out of the training set.
-    trainset  = cifar_loader.trainset
-    val_size  = int(len(trainset) * args.val_split)
-    train_size = len(trainset) - val_size
-    generator = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset = random_split(trainset, [train_size, val_size],
-                                            generator=generator)
-
-    train_loader = DataLoader(
-        train_subset,
+    celeba_loader = CelebAHQLoader(
+        data_root=args.data_root,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
+        image_size=args.image_size,
+        val_split=args.val_split,
+        seed=args.seed,
         pin_memory=(device.type == "cuda"),
+        transform=tf,
     )
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+    train_loader, val_loader = celeba_loader.get_loaders()
+    if val_loader is None:
+        raise RuntimeError("val_split must be > 0 to produce a validation loader")
 
     _mc = {}
     if args.config:
         with open(args.config) as _f:
             _mc = json.load(_f).get("model", {})
 
-    model = BiasMultiTaxonAutoencoder(
+    model = BiasTaxonAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         resnet_variant=args.resnet_variant,
         stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
-        n_hierarchies=args.n_hierarchies,
         bias_update_rate=args.bias_update_rate,
         bias_ema_decay=args.bias_ema_decay,
-        gate_k=args.gate_k,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
-        stem_stride=_mc.get("stem_stride", 1),
-        use_stem_maxpool=_mc.get("use_stem_maxpool", False),
+        stem_stride=_mc.get("stem_stride", 2),
+        use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         temperature=args.temperature,
         hard=args.hard,
@@ -287,18 +278,14 @@ def main() -> None:
         best_val = float(state.get("best_val", float("inf")))
         print(f"Resumed from {resume_path} at epoch={start_epoch}")
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         "Training setup:\n"
         f"  device={device}\n"
-        f"  n_params={n_params:,}\n"
-        f"  n_hierarchies={args.n_hierarchies}\n"
-        f"  bias_update_rate={args.bias_update_rate}\n"
-        f"  train_size={train_size} val_size={val_size}\n"
+        f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
-        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}\n"
-        f"  output_dir={output_dir}"
+        f"  bias_update_rate={args.bias_update_rate}\n"
+        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 
     history: dict = {
@@ -356,22 +343,15 @@ def main() -> None:
             f"val_loss={val_stats['loss']:.5f}"
         )
 
-        # Print per-stage, per-hierarchy leaf bias and gate bias terms
+        # Print per-stage leaf bias terms
         with torch.no_grad():
-            for s_idx, stage in enumerate(model.encoder.multi_taxon_stages):
-                for h_idx, hier in enumerate(stage.hierarchies):
-                    bias_vals = hier._node_bias.cpu().tolist()
-                    ema_vals = hier._ema_load.cpu().tolist()
-                    bias_str = ", ".join(f"{v:+.4f}" for v in bias_vals)
-                    ema_str = ", ".join(f"{v:.4f}" for v in ema_vals)
-                    print(f"  S{s_idx+1} H{h_idx+1} leaf biases:  [{bias_str}]")
-                    print(f"  S{s_idx+1} H{h_idx+1} ema loads:    [{ema_str}]")
-                gate_vals = stage._gate_bias.cpu().tolist()
-                gate_ema = stage._gate_ema_load.cpu().tolist()
-                gate_str = ", ".join(f"{v:+.4f}" for v in gate_vals)
-                gate_ema_str = ", ".join(f"{v:.4f}" for v in gate_ema)
-                print(f"  S{s_idx+1}    gate biases:  [{gate_str}]")
-                print(f"  S{s_idx+1}    gate ema:     [{gate_ema_str}]")
+            for s_idx, stage in enumerate(model.encoder.taxon_stages):
+                bias_vals = stage._node_bias.cpu().tolist()
+                ema_vals = stage._ema_load.cpu().tolist()
+                bias_str = ", ".join(f"{v:+.4f}" for v in bias_vals)
+                ema_str = ", ".join(f"{v:.4f}" for v in ema_vals)
+                print(f"  Stage {s_idx+1} leaf biases:  [{bias_str}]")
+                print(f"  Stage {s_idx+1} ema loads:    [{ema_str}]")
 
         history["epochs"].append(epoch)
         history["train_loss"].append(train_stats["loss"])

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Train MultiTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
+"""Train BiasMultiTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
 
-Extends the single-hierarchy Taxon AE with K independent taxonomy hierarchies
-per encoder stage and an inter-hierarchy gate.
+Uses K independent sigmoid+bias taxonomy hierarchies per encoder stage with a
+sigmoid+bias inter-hierarchy gate.  No auxiliary losses.
 
 Loss:
-    recon + dkl_weight * dkl
-          + entropy_weight * entropy
-          + gate_dkl_weight * gate_dkl
-          + gate_entropy_weight * gate_entropy
+    recon (MSE only — no regularisation terms)
 """
 
 from __future__ import annotations
@@ -34,11 +31,11 @@ from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
+from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -54,7 +51,6 @@ def build_scheduler(
     epochs: int,
     warmup_epochs: int,
 ) -> LambdaLR:
-    """Cosine decay with linear warmup (step-wise)."""
     total_steps = max(1, steps_per_epoch * epochs)
     warmup_steps = max(1, steps_per_epoch * warmup_epochs)
 
@@ -72,46 +68,24 @@ def run_validation(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    hard: bool,
-    dkl_weight: float,
-    entropy_weight: float,
-    gate_dkl_weight: float,
-    gate_entropy_weight: float,
 ) -> dict:
     model.eval()
-    total_loss = total_recon = total_dkl = total_entropy = 0.0
-    total_gate_dkl = total_gate_entropy = 0.0
+    total_loss = 0.0
     num_batches = 0
 
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        recon, dkl, entropy, gate_dkl, gate_entropy = model(images, hard=hard)
+        (recon,) = model(images)
         recon_loss = F.mse_loss(recon, images)
-        loss = (recon_loss
-                + dkl_weight          * dkl
-                + entropy_weight      * entropy
-                + gate_dkl_weight     * gate_dkl
-                + gate_entropy_weight * gate_entropy)
-
-        total_loss         += float(loss.item())
-        total_recon        += float(recon_loss.item())
-        total_dkl          += float(dkl.item())
-        total_entropy      += float(entropy.item())
-        total_gate_dkl     += float(gate_dkl.item())
-        total_gate_entropy += float(gate_entropy.item())
+        total_loss += float(recon_loss.item())
         num_batches += 1
 
     if num_batches == 0:
-        return {"loss": 0.0, "recon": 0.0, "dkl": 0.0, "entropy": 0.0,
-                "gate_dkl": 0.0, "gate_entropy": 0.0}
+        return {"loss": 0.0, "recon": 0.0}
 
     return {
-        "loss":         total_loss         / num_batches,
-        "recon":        total_recon        / num_batches,
-        "dkl":          total_dkl          / num_batches,
-        "entropy":      total_entropy      / num_batches,
-        "gate_dkl":     total_gate_dkl     / num_batches,
-        "gate_entropy": total_gate_entropy / num_batches,
+        "loss":  total_loss / num_batches,
+        "recon": total_loss / num_batches,
     }
 
 
@@ -120,7 +94,6 @@ def save_recon_preview(
     loader: DataLoader,
     device: torch.device,
     save_path: Path,
-    hard: bool,
     num_images: int = 8,
 ) -> None:
     model.eval()
@@ -128,10 +101,10 @@ def save_recon_preview(
     images = images[:num_images].to(device)
 
     with torch.no_grad():
-        recon, _, _, _, _ = model(images, hard=hard)
+        (recon,) = model(images)
 
     vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
-    vis_recon  = (recon.clamp(-1, 1) + 1.0) * 0.5
+    vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
 
     grid = make_grid(torch.cat([vis_input, vis_recon], dim=0), nrow=num_images)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +112,6 @@ def save_recon_preview(
 
 
 def save_training_curves(history: dict, output_dir: Path) -> None:
-    """Save 6-panel training curves and dump raw history JSON."""
     import json as _json
 
     epochs = history["epochs"]
@@ -149,33 +121,21 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     with open(output_dir / "training_history.json", "w") as _f:
         _json.dump(history, _f, indent=2)
 
-    fig, axes = plt.subplots(1, 6, figsize=(30, 4))
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4))
+    ax.plot(epochs, history["train_loss"], label="train", linewidth=1.5)
+    ax.plot(epochs, history["val_loss"],   label="val",   linewidth=1.5, linestyle="--")
+    ax.set_title("Reconstruction Loss", fontsize=11)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    best_ep = epochs[int(min(range(len(history["val_loss"])),
+                            key=lambda i: history["val_loss"][i]))]
+    ax.axvline(best_ep, color="red", linestyle=":", linewidth=1.0,
+               label=f"best val (ep {best_ep})")
+    ax.legend(fontsize=8)
 
-    panels = [
-        ("Total loss",          "train_loss",         "val_loss"),
-        ("Recon loss",          "train_recon",        "val_recon"),
-        ("DKL penalty",         "train_dkl",          "val_dkl"),
-        ("Entropy penalty",     "train_entropy",      "val_entropy"),
-        ("Gate DKL penalty",    "train_gate_dkl",     "val_gate_dkl"),
-        ("Gate Entropy penalty","train_gate_entropy",  "val_gate_entropy"),
-    ]
-
-    for ax, (title, train_key, val_key) in zip(axes, panels):
-        ax.plot(epochs, history[train_key], label="train", linewidth=1.5)
-        ax.plot(epochs, history[val_key],   label="val",   linewidth=1.5, linestyle="--")
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-        if train_key == "train_loss":
-            best_ep = epochs[int(min(range(len(history[val_key])),
-                                    key=lambda i: history[val_key][i]))]
-            ax.axvline(best_ep, color="red", linestyle=":", linewidth=1.0,
-                       label=f"best val (ep {best_ep})")
-            ax.legend(fontsize=7)
-
-    plt.suptitle("Training curves", fontsize=13, fontweight="bold")
+    plt.suptitle("Training curves (Bias Multi-Taxon AE)", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -199,54 +159,36 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(
-        description="Train MultiTaxon ResNet-18 AE on CelebA-HQ"
-    )
-    parser.add_argument("--config", type=str, default="",
-                        help="Path to JSON config file")
+    parser = argparse.ArgumentParser(description="Train Bias Multi-Taxon AE on CelebA-HQ")
+    parser.add_argument("--config", type=str, default="")
     # data
-    parser.add_argument("--data-root", type=str,
-                        default=d.get("data_root", "./data/celeba_hq"))
+    parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
     parser.add_argument("--output-dir", type=str,
-                        default=o.get("output_dir", "./outputs/multi_taxon_ae_celeba_hq"))
+                        default=o.get("output_dir", "./outputs/bias_multi_taxon_ae_celeba_hq_r18"))
     parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
     parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
     parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
     parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
     # model
-    parser.add_argument("--resnet-variant", type=str,
-                        default=m.get("resnet_variant", "18"))
+    parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
     parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
-                        default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
+                        default=m.get("stage_taxonomy_layers", [3, 4, 5, 6]))
     parser.add_argument("--stage-strides", type=int, nargs=4,
                         default=m.get("stage_strides", [1, 2, 2, 2]))
-    parser.add_argument("--n-hierarchies", type=int,
-                        default=m.get("n_hierarchies", 3))
-    parser.add_argument("--temperature", type=float,
-                        default=m.get("temperature", 1.0))
-    parser.add_argument("--hard", action="store_true",
-                        default=m.get("hard", False),
-                        help="Straight-through hard routing in taxonomy softmax + gate")
+    parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
+    parser.add_argument("--bias-update-rate", type=float, default=m.get("bias_update_rate", 0.001))
+    parser.add_argument("--bias-ema-decay", type=float, default=m.get("bias_ema_decay", 0.99))
+    parser.add_argument("--gate-k", type=int, default=m.get("gate_k", 1))
+    parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
+    parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
-    parser.add_argument("--learning-rate", type=float,
-                        default=t.get("learning_rate", 3e-4))
-    parser.add_argument("--weight-decay", type=float,
-                        default=t.get("weight_decay", 1e-4))
-    parser.add_argument("--warmup-epochs", type=int,
-                        default=t.get("warmup_epochs", 3))
-    parser.add_argument("--dkl-weight", type=float,
-                        default=t.get("dkl_weight", 1e-3))
-    parser.add_argument("--entropy-weight", type=float,
-                        default=t.get("entropy_weight", 0.0))
-    parser.add_argument("--gate-dkl-weight", type=float,
-                        default=t.get("gate_dkl_weight", 1e-2))
-    parser.add_argument("--gate-entropy-weight", type=float,
-                        default=t.get("gate_entropy_weight", 0.0))
+    parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
+    parser.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
+    parser.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
     parser.add_argument("--save-every", type=int, default=t.get("save_every", 5))
     parser.add_argument("--seed", type=int, default=t.get("seed", 42))
-    parser.add_argument("--max-train-steps", type=int,
-                        default=t.get("max_train_steps", 0))
+    parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
     return parser.parse_args()
 
@@ -255,18 +197,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    # Build run suffix from hyperparams so different runs don't collide.
-    dkl_suffix      = f"_dkl_{args.dkl_weight:.0e}"
-    temp_str        = f"{args.temperature:g}".replace(".", "p")
-    temp_suffix     = f"_temp_{temp_str}"
-    hard_suffix     = "_hard" if args.hard else ""
-    hier_suffix     = f"_K{args.n_hierarchies}"
-    entropy_suffix  = f"_ew_{args.entropy_weight:.0e}"   if args.entropy_weight      else ""
-    gdkl_suffix     = f"_gdkl_{args.gate_dkl_weight:.0e}" if args.gate_dkl_weight   else ""
-    gew_suffix      = f"_gew_{args.gate_entropy_weight:.0e}" if args.gate_entropy_weight else ""
-    run_suffix = (dkl_suffix + temp_suffix + hard_suffix + hier_suffix
-                  + entropy_suffix + gdkl_suffix + gew_suffix)
-
+    hier_str = f"_K{args.n_hierarchies}"
+    bur_str = f"_bur_{args.bias_update_rate:.0e}"
+    run_suffix = hier_str + bur_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -275,13 +208,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tf = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
+    tf = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
 
     celeba_loader = CelebAHQLoader(
         data_root=args.data_root,
@@ -297,27 +228,29 @@ def main() -> None:
     if val_loader is None:
         raise RuntimeError("val_split must be > 0 to produce a validation loader")
 
-    # Extra model params from config that aren't exposed as CLI flags.
-    _mc: dict = {}
+    _mc = {}
     if args.config:
         with open(args.config) as _f:
             _mc = json.load(_f).get("model", {})
 
-    model = MultiTaxonAutoencoder(
+    model = BiasMultiTaxonAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         resnet_variant=args.resnet_variant,
         stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
         n_hierarchies=args.n_hierarchies,
-        temperature=args.temperature,
-        hard=args.hard,
+        bias_update_rate=args.bias_update_rate,
+        bias_ema_decay=args.bias_ema_decay,
+        gate_k=args.gate_k,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
         stem_stride=_mc.get("stem_stride", 2),
         use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
+        temperature=args.temperature,
+        hard=args.hard,
         depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
 
@@ -353,108 +286,92 @@ def main() -> None:
         "Training setup:\n"
         f"  device={device}\n"
         f"  n_params={n_params:,}\n"
-        f"  hard={args.hard}  n_hierarchies={args.n_hierarchies}\n"
+        f"  n_hierarchies={args.n_hierarchies}\n"
+        f"  bias_update_rate={args.bias_update_rate}\n"
         f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
-        f"  dkl_weight={args.dkl_weight}  entropy_weight={args.entropy_weight}\n"
-        f"  gate_dkl_weight={args.gate_dkl_weight}  gate_entropy_weight={args.gate_entropy_weight}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}\n"
         f"  output_dir={output_dir}"
     )
 
     history: dict = {
-        "epochs":             [],
-        "train_loss":         [],
-        "train_recon":        [],
-        "train_dkl":          [],
-        "train_entropy":      [],
-        "train_gate_dkl":     [],
-        "train_gate_entropy": [],
-        "val_loss":           [],
-        "val_recon":          [],
-        "val_dkl":            [],
-        "val_entropy":        [],
-        "val_gate_dkl":       [],
-        "val_gate_entropy":   [],
+        "epochs":      [],
+        "train_loss":  [],
+        "train_recon": [],
+        "val_loss":    [],
+        "val_recon":   [],
     }
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
 
-        running = {k: 0.0 for k in
-                   ("loss", "recon", "dkl", "entropy", "gate_dkl", "gate_entropy")}
+        running_loss = 0.0
         num_batches = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            recon, dkl, entropy, gate_dkl, gate_entropy = model(images, hard=args.hard)
-            recon_loss = F.mse_loss(recon, images)
-            loss = (recon_loss
-                    + args.dkl_weight          * dkl
-                    + args.entropy_weight      * entropy
-                    + args.gate_dkl_weight     * gate_dkl
-                    + args.gate_entropy_weight * gate_entropy)
+            (recon,) = model(images)
+            loss = F.mse_loss(recon, images)
 
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            running["loss"]         += float(loss.item())
-            running["recon"]        += float(recon_loss.item())
-            running["dkl"]          += float(dkl.item())
-            running["entropy"]      += float(entropy.item())
-            running["gate_dkl"]     += float(gate_dkl.item())
-            running["gate_entropy"] += float(gate_entropy.item())
+            running_loss += float(loss.item())
             num_batches += 1
             global_step += 1
 
             if batch_idx % 50 == 0:
-                avg = {k: v / num_batches for k, v in running.items()}
+                avg_loss = running_loss / num_batches
                 lr = optimizer.param_groups[0]["lr"]
                 print(
-                    f"epoch={epoch} batch={batch_idx}/{len(train_loader)} "
-                    f"step={global_step} lr={lr:.3e} "
-                    f"loss={avg['loss']:.5f} recon={avg['recon']:.5f} "
-                    f"dkl={avg['dkl']:.5f} entropy={avg['entropy']:.5f} "
-                    f"gate_dkl={avg['gate_dkl']:.5f} gate_entropy={avg['gate_entropy']:.5f}"
+                    f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
+                    f"lr={lr:.3e} loss={avg_loss:.5f}"
                 )
 
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                 break
 
-        train_stats = {k: v / max(1, num_batches) for k, v in running.items()}
+        train_stats = {
+            "loss":  running_loss / max(1, num_batches),
+            "recon": running_loss / max(1, num_batches),
+        }
 
-        val_stats = run_validation(
-            model=model,
-            loader=val_loader,
-            device=device,
-            hard=args.hard,
-            dkl_weight=args.dkl_weight,
-            entropy_weight=args.entropy_weight,
-            gate_dkl_weight=args.gate_dkl_weight,
-            gate_entropy_weight=args.gate_entropy_weight,
-        )
+        val_stats = run_validation(model=model, loader=val_loader, device=device)
 
         elapsed = time.time() - epoch_start
         print(
             f"epoch={epoch:03d} time={elapsed:.1f}s "
-            f"train_loss={train_stats['loss']:.5f} train_recon={train_stats['recon']:.5f} "
-            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f} "
-            f"val_gate_dkl={val_stats['gate_dkl']:.5f}"
+            f"train_loss={train_stats['loss']:.5f} "
+            f"val_loss={val_stats['loss']:.5f}"
         )
 
+        # Print per-stage, per-hierarchy leaf bias and gate bias terms
+        with torch.no_grad():
+            for s_idx, stage in enumerate(model.encoder.multi_taxon_stages):
+                for h_idx, hier in enumerate(stage.hierarchies):
+                    bias_vals = hier._node_bias.cpu().tolist()
+                    ema_vals = hier._ema_load.cpu().tolist()
+                    bias_str = ", ".join(f"{v:+.4f}" for v in bias_vals)
+                    ema_str = ", ".join(f"{v:.4f}" for v in ema_vals)
+                    print(f"  S{s_idx+1} H{h_idx+1} leaf biases:  [{bias_str}]")
+                    print(f"  S{s_idx+1} H{h_idx+1} ema loads:    [{ema_str}]")
+                gate_vals = stage._gate_bias.cpu().tolist()
+                gate_ema = stage._gate_ema_load.cpu().tolist()
+                gate_str = ", ".join(f"{v:+.4f}" for v in gate_vals)
+                gate_ema_str = ", ".join(f"{v:.4f}" for v in gate_ema)
+                print(f"  S{s_idx+1}    gate biases:  [{gate_str}]")
+                print(f"  S{s_idx+1}    gate ema:     [{gate_ema_str}]")
+
         history["epochs"].append(epoch)
-        for split, stats in (("train", train_stats), ("val", val_stats)):
-            history[f"{split}_loss"].append(stats["loss"])
-            history[f"{split}_recon"].append(stats["recon"])
-            history[f"{split}_dkl"].append(stats["dkl"])
-            history[f"{split}_entropy"].append(stats["entropy"])
-            history[f"{split}_gate_dkl"].append(stats["gate_dkl"])
-            history[f"{split}_gate_entropy"].append(stats["gate_entropy"])
+        history["train_loss"].append(train_stats["loss"])
+        history["train_recon"].append(train_stats["recon"])
+        history["val_loss"].append(val_stats["loss"])
+        history["val_recon"].append(val_stats["recon"])
 
         if epoch % args.save_every == 0:
             ckpt_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"
@@ -492,7 +409,6 @@ def main() -> None:
             loader=val_loader,
             device=device,
             save_path=preview_dir / f"epoch_{epoch:03d}.png",
-            hard=args.hard,
             num_images=8,
         )
 

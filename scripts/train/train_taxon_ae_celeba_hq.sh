@@ -23,7 +23,7 @@ CONFIG="${1:-configs/celeba_hq/taxon_ae_celeba_hq.json}"
 # ── Run training ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_taxon_ae_celeba_hq (job $SLURM_JOB_ID) config=$CONFIG"
 
-python src/train/train_taxon_ae_celeba_hq.py \
+python src/train/celeba_hq/train_taxon_ae.py \
     --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_taxon_ae_celeba_hq (job $SLURM_JOB_ID)"

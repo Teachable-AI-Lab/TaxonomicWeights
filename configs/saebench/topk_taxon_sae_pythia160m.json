@@ -1,5 +1,5 @@
 {
-  "experiment_name": "multi_taxon_sae_pythia160m",
+  "experiment_name": "topk_taxon_sae_pythia160m",
   "data": {
     "model_name": "pythia-160m-deduped",
     "hook_layer": 8,
@@ -12,28 +12,27 @@
     "cached_activations_path": "./cached_activations/pythia160m_layer8"
   },
   "model": {
-    "model_variant": "multi_taxon_sae",
-    "n_taxonomy_layers": 4,
-    "n_hierarchies": 15,
-    "temperature": 0.05,
+    "model_variant": "topk_taxon_sae",
+    "n_taxonomy_layers": 10,
+    "temperature": 0.5,
     "hard": false,
-    "depth_decay": 0.5
+    "depth_decay": 0.5,
+    "k_aux": 0,
+    "dead_steps": 2000
+    
   },
   "training": {
     "total_steps": 0,
     "learning_rate": 3e-4,
     "weight_decay": 0,
     "warmup_steps": 1000,
-    "dkl_weight": 1e-2,
-    "entropy_weight": 0.0,
-    "gate_dkl_weight": 1e-2,
-    "gate_entropy_weight": 0.0,
+    "auxk_weight": 0.03125,
     "normalize_decoder": true,
     "save_every": 5000,
     "log_every": 100,
     "seed": 42
   },
   "output": {
-    "output_dir": "./outputs/saebench/pythia160m_layer8/multi_taxon_sae"
+    "output_dir": "./outputs/saebench/pythia160m_layer8/topk_taxon_sae"
   }
 }

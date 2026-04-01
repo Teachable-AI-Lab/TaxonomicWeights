@@ -26,7 +26,7 @@ python src/data/cache_activations.py \
     --hook-layer 8 \
     --n-tokens 500000000 \
     --batch-size 4096 \
-    --context-length 128 \
+    --context-length 1024 \
     --dtype float32 \
     --output-dir ./cached_activations/pythia160m_layer8
 

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=train_taxon_sae
-#SBATCH --output=slurm/slurm_outputs/train_taxon_sae_%j.out
-#SBATCH --error=slurm/slurm_errors/train_taxon_sae_%j.err
+#SBATCH --job-name=train_topk_taxon_sae
+#SBATCH --output=slurm/slurm_outputs/train_topk_taxon_sae_%j.out
+#SBATCH --error=slurm/slurm_errors/train_topk_taxon_sae_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
@@ -18,10 +18,10 @@ export PYTHONUNBUFFERED=1
 # ── Working directory ──────────────────────────────────────────────────────────
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
-# ── Train TaxonSAE (Pythia-160M, layer 8) ────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TaxonSAE training (job $SLURM_JOB_ID)"
+# ── Train TopKTaxonSAE (Pythia-160M, layer 8) ────────────────────────────────
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TopKTaxonSAE training (job $SLURM_JOB_ID)"
 
-python src/train/saebench/train_taxon_sae.py \
-    --config configs/saebench/taxon_sae_pythia160m.json
+python src/train/saebench/train_topk_taxon_sae.py \
+    --config configs/saebench/topk_taxon_sae_pythia160m.json
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TaxonSAE training (job $SLURM_JOB_ID)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TopKTaxonSAE training (job $SLURM_JOB_ID)"

@@ -30,7 +30,7 @@ python src/data/cache_activations.py \
     --hook-layer 12 \
     --n-tokens 500000000 \
     --batch-size 2048 \
-    --context-length 128 \
+    --context-length 1024 \
     --dtype bfloat16 \
     --output-dir ./cached_activations/gemma2b_layer12
 

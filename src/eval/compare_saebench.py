@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +56,8 @@ RANDOM_SEED = 42
 _CUSTOM_COLOURS = {
     "taxon": "#1f77b4",
     "multi_taxon": "#9467bd",
+    "topk_taxon": "#2ca02c",
+    "topk_multi_taxon": "#d62728",
 }
 _BASELINE_COLOURS = [
     "#ff7f0e", "#2ca02c", "#d62728", "#8c564b",
@@ -64,6 +67,10 @@ _BASELINE_COLOURS = [
 
 def _sae_colour(name: str, baseline_idx: int = 0) -> str:
     nl = name.lower()
+    if "topk_multi_taxon" in nl:
+        return _CUSTOM_COLOURS["topk_multi_taxon"]
+    if "topk_taxon" in nl:
+        return _CUSTOM_COLOURS["topk_taxon"]
     if "multi_taxon" in nl:
         return _CUSTOM_COLOURS["multi_taxon"]
     if "taxon" in nl:
@@ -93,7 +100,11 @@ def discover_models(models_dir: str) -> list[tuple[str, str, str]]:
         training_dir = ckpt.parent.parent
         dirname = training_dir.name
 
-        if "multi_taxon_sae" in dirname:
+        if "topk_multi_taxon_sae" in dirname:
+            variant = "topk_multi_taxon"
+        elif "topk_taxon_sae" in dirname:
+            variant = "topk_taxon"
+        elif "multi_taxon_sae" in dirname:
             variant = "multi_taxon"
         elif "taxon_sae" in dirname:
             variant = "taxon"
@@ -197,16 +208,29 @@ def _bar_chart(ax, names, values, colours, title, ylabel="", fmt=".4f"):
 def _short_name(name: str) -> str:
     """Shorten SAE name for display."""
     n = name
-    for prefix in ("taxon_sae_", "multi_taxon_sae_", "baseline_"):
+    for prefix in ("topk_multi_taxon_sae_", "topk_taxon_sae_", "multi_taxon_sae_", "taxon_sae_", "baseline_"):
         if n.startswith(prefix):
             n = n[len(prefix):]
             break
     # Capitalize type prefix
     nl = name.lower()
-    if "multi_taxon" in nl:
+    if "topk_multi_taxon" in nl:
+        return f"TopKMultiTaxon ({n})" if n != name else "TopKMultiTaxonSAE"
+    elif "topk_taxon" in nl:
+        return f"TopKTaxon ({n})" if n != name else "TopKTaxonSAE"
+    elif "multi_taxon" in nl:
         return f"MultiTaxon ({n})" if n != name else "MultiTaxonSAE"
     elif "taxon" in nl:
         return f"Taxon ({n})" if n != name else "TaxonSAE"
+    elif name.lower().startswith("baseline_"):
+        # Descriptive baseline names like baseline_BatchTopK_k20 or baseline_Standard_l1_0.04
+        m = re.match(r'^(.+?)_k(\d+)$', n)
+        if m:
+            return f"{m.group(1)} (k={m.group(2)})"
+        m = re.match(r'^(.+?)_l1_([\d.eE+-]+)$', n)
+        if m:
+            return f"{m.group(1)} (L1={m.group(2)})"
+        return n
     else:
         return name
 

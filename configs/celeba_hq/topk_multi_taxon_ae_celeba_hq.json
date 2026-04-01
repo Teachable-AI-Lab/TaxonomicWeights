@@ -23,7 +23,7 @@
     "stem_stride": 2,
     "use_stem_maxpool": true,
     "output_activation": "none",
-    "temperature": 0.5,
+    "temperature": 0.1,
     "depth_decay": 0.5
   },
   "training": {
@@ -31,7 +31,7 @@
     "learning_rate": 3e-4,
     "weight_decay": 1e-4,
     "warmup_epochs": 3,
-    "auxk_weight": 1e-2,
+    "auxk_weight": 1e-1,
     "save_every": 5,
     "seed": 42,
     "max_train_steps": 0

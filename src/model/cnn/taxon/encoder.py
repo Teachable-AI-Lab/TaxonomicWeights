@@ -904,7 +904,7 @@ class TopKTaxonResNetStage(nn.Module):
         Returns:
             - Concatenated taxonomy-gated stage activations.
             - Concatenated log path probabilities.
-            - Dict with ``{"entropy", "dead_frac"}``.
+            - Dict with ``{"entropy", "dkl", "dead_frac"}``.
         """
         outputs: List[torch.Tensor] = []
         logps: List[torch.Tensor] = []
@@ -912,6 +912,7 @@ class TopKTaxonResNetStage(nn.Module):
         prev: Optional[torch.Tensor] = None
 
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         for depth_idx, logits in enumerate(self._taxon_logits_per_depth(x)):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
@@ -919,9 +920,10 @@ class TopKTaxonResNetStage(nn.Module):
             prob = logp.exp()
             out = logits * prob
 
-            entropy_i, _ = self._regularization_terms(prob, logp)
+            entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
             total_entropy = total_entropy + depth_weight * entropy_i
+            total_dkl = total_dkl + depth_weight * dkl_i
 
             all_probs.append(prob)
             outputs.append(out)
@@ -941,7 +943,7 @@ class TopKTaxonResNetStage(nn.Module):
         return (
             torch.cat(outputs, dim=1),
             torch.cat(logps, dim=1),
-            {"entropy": total_entropy, "dead_frac": dead_frac},
+            {"entropy": total_entropy, "dkl": total_dkl, "dead_frac": dead_frac},
         )
 
     def compute_auxk_loss(
@@ -1097,22 +1099,33 @@ class TopKTaxonResNetEncoder(nn.Module):
 
         total_dead_frac = x.new_zeros(())
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         for stage_idx, stage in enumerate(self.taxon_stages, start=1):
             x, stage_logp, regs = stage(x, hard=hard)
             total_dead_frac = total_dead_frac + regs["dead_frac"]
             total_entropy = total_entropy + regs["entropy"]
+            total_dkl = total_dkl + regs["dkl"]
             if return_details:
                 details["shape_trace"].append((f"stage{stage_idx}", tuple(x.shape)))
                 details["stages"].append({
                     "name": f"stage{stage_idx}",
+                    "output": x,
+                    "logp": stage_logp,
                     "output_shape": tuple(x.shape),
+                    "logp_shape": tuple(stage_logp.shape),
+                    "layer_channels": list(stage.layer_channels),
+                    "taxonomy_depth": stage.n_taxonomy_layers,
+                    "n_blocks": stage.n_blocks,
+                    "stride": stage.stride,
                     "dead_frac": regs["dead_frac"],
                     "entropy": regs["entropy"],
+                    "dkl": regs["dkl"],
                 })
 
         details["dead_frac"] = total_dead_frac
         details["entropy"] = total_entropy
+        details["dkl"] = total_dkl
 
         return x, details
 
@@ -1199,8 +1212,18 @@ class TopKMultiTaxonResNetStage(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         gate = self._compute_gate(x)   # [B, K, H, W]
 
+        # Gate regularisation (entropy + coverage KL)
+        eps = 1e-8
+        log_gate = gate.clamp_min(eps).log()
+        gate_entropy = -(gate * log_gate).sum(dim=1).mean()
+        marginal = gate.mean(dim=(0, 2, 3))
+        marginal = marginal / marginal.sum().clamp_min(eps)
+        uniform_logp = -math.log(gate.shape[1])
+        gate_dkl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
+
         total_dead = x.new_zeros(())
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
         all_outputs: List[torch.Tensor] = []
         all_logps:   List[torch.Tensor] = []
 
@@ -1211,11 +1234,19 @@ class TopKMultiTaxonResNetStage(nn.Module):
             all_logps.append(logp_k)
             total_dead = total_dead + regs_k["dead_frac"]
             total_entropy = total_entropy + regs_k["entropy"]
+            total_dkl = total_dkl + regs_k["dkl"]
 
         return (
             torch.cat(all_outputs, dim=1),
             torch.cat(all_logps, dim=1),
-            {"dead_frac": total_dead, "entropy": total_entropy},
+            {
+                "dead_frac": total_dead,
+                "entropy": total_entropy,
+                "dkl": total_dkl,
+                "gate_entropy": gate_entropy,
+                "gate_dkl": gate_dkl,
+                "gate_probs": gate,
+            },
         )
 
 
@@ -1333,25 +1364,33 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
 
         total_dead_frac = x.new_zeros(())
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         for stage_idx, stage in enumerate(self.multi_taxon_stages, start=1):
             x, stage_logp, regs = stage(x, hard=hard)
             total_dead_frac = total_dead_frac + regs["dead_frac"]
             total_entropy = total_entropy + regs["entropy"]
+            total_dkl = total_dkl + regs["dkl"]
             if return_details:
                 details["shape_trace"].append((f"stage{stage_idx}", tuple(x.shape)))
                 details["stages"].append({
                     "name": f"stage{stage_idx}",
                     "output": x,
+                    "logp": stage_logp,
                     "output_shape": tuple(x.shape),
                     "n_hierarchies": self.n_hierarchies,
                     "hierarchy_out_channels": stage.hierarchy_out_channels,
+                    "gate_probs": regs["gate_probs"],
                     "dead_frac": regs["dead_frac"],
                     "entropy": regs["entropy"],
+                    "dkl": regs["dkl"],
+                    "gate_entropy": regs["gate_entropy"],
+                    "gate_dkl": regs["gate_dkl"],
                 })
 
         details["dead_frac"] = total_dead_frac
         details["entropy"] = total_entropy
+        details["dkl"] = total_dkl
         return x, details
 
 
@@ -1502,7 +1541,7 @@ class BiasTaxonResNetStage(nn.Module):
         Returns:
             - Concatenated taxonomy-gated stage activations.
             - Concatenated log path probabilities.
-            - Dict with ``{"entropy"}``.
+            - Dict with ``{"entropy", "dkl"}``.
         """
         outputs: List[torch.Tensor] = []
         logps: List[torch.Tensor] = []
@@ -1510,6 +1549,7 @@ class BiasTaxonResNetStage(nn.Module):
         prev: Optional[torch.Tensor] = None
 
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         channel_offset = 0
         for depth_idx, logits in enumerate(self._taxon_logits_per_depth(x)):
@@ -1524,9 +1564,10 @@ class BiasTaxonResNetStage(nn.Module):
             # Gate ORIGINAL logits with biased probabilities.
             out = logits * prob
 
-            entropy_i, _ = self._regularization_terms(prob, logp)
+            entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
             total_entropy = total_entropy + depth_weight * entropy_i
+            total_dkl = total_dkl + depth_weight * dkl_i
 
             all_probs.append(prob)
             outputs.append(out)
@@ -1550,7 +1591,7 @@ class BiasTaxonResNetStage(nn.Module):
         return (
             torch.cat(outputs, dim=1),
             torch.cat(logps, dim=1),
-            {"entropy": total_entropy},
+            {"entropy": total_entropy, "dkl": total_dkl},
         )
 
 
@@ -1661,20 +1702,31 @@ class BiasTaxonResNetEncoder(nn.Module):
             details["shape_trace"].append(("stem", tuple(x.shape)))
 
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         for stage_idx, stage in enumerate(self.taxon_stages, start=1):
             x, stage_logp, regs = stage(x, hard=hard)
             total_entropy = total_entropy + regs["entropy"]
+            total_dkl = total_dkl + regs["dkl"]
             if return_details:
                 details["shape_trace"].append((f"stage{stage_idx}", tuple(x.shape)))
                 details["stages"].append({
                     "name": f"stage{stage_idx}",
+                    "output": x,
+                    "logp": stage_logp,
                     "output_shape": tuple(x.shape),
+                    "logp_shape": tuple(stage_logp.shape),
+                    "layer_channels": list(stage.layer_channels),
+                    "taxonomy_depth": stage.n_taxonomy_layers,
+                    "n_blocks": stage.n_blocks,
+                    "stride": stage.stride,
                     "entropy": regs["entropy"],
+                    "dkl": regs["dkl"],
                 })
 
         details["latent_shape"] = tuple(x.shape)
         details["entropy"] = total_entropy
+        details["dkl"] = total_dkl
         return x, details
 
 
@@ -1772,7 +1824,17 @@ class BiasMultiTaxonResNetStage(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         gate = self._compute_gate(x)
 
+        # Gate regularisation (entropy + coverage KL)
+        eps = 1e-8
+        log_gate = gate.clamp_min(eps).log()
+        gate_entropy = -(gate * log_gate).sum(dim=1).mean()
+        marginal = gate.mean(dim=(0, 2, 3))
+        marginal = marginal / marginal.sum().clamp_min(eps)
+        uniform_logp = -math.log(gate.shape[1])
+        gate_dkl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
+
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
         all_outputs: List[torch.Tensor] = []
         all_logps:   List[torch.Tensor] = []
 
@@ -1782,11 +1844,18 @@ class BiasMultiTaxonResNetStage(nn.Module):
             all_outputs.append(out_k * gate_k)
             all_logps.append(logp_k)
             total_entropy = total_entropy + regs_k["entropy"]
+            total_dkl = total_dkl + regs_k["dkl"]
 
         return (
             torch.cat(all_outputs, dim=1),
             torch.cat(all_logps, dim=1),
-            {"entropy": total_entropy},
+            {
+                "entropy": total_entropy,
+                "dkl": total_dkl,
+                "gate_entropy": gate_entropy,
+                "gate_dkl": gate_dkl,
+                "gate_probs": gate,
+            },
         )
 
 
@@ -1903,23 +1972,31 @@ class BiasMultiTaxonResNetEncoder(nn.Module):
             details["shape_trace"].append(("stem", tuple(x.shape)))
 
         total_entropy = x.new_zeros(())
+        total_dkl = x.new_zeros(())
 
         for stage_idx, stage in enumerate(self.multi_taxon_stages, start=1):
             x, stage_logp, regs = stage(x, hard=hard)
             total_entropy = total_entropy + regs["entropy"]
+            total_dkl = total_dkl + regs["dkl"]
             if return_details:
                 details["shape_trace"].append((f"stage{stage_idx}", tuple(x.shape)))
                 details["stages"].append({
                     "name": f"stage{stage_idx}",
                     "output": x,
+                    "logp": stage_logp,
                     "output_shape": tuple(x.shape),
                     "n_hierarchies": self.n_hierarchies,
                     "hierarchy_out_channels": stage.hierarchy_out_channels,
+                    "gate_probs": regs["gate_probs"],
                     "entropy": regs["entropy"],
+                    "dkl": regs["dkl"],
+                    "gate_entropy": regs["gate_entropy"],
+                    "gate_dkl": regs["gate_dkl"],
                 })
 
         details["latent_shape"] = tuple(x.shape)
         details["entropy"] = total_entropy
+        details["dkl"] = total_dkl
         return x, details
 
 

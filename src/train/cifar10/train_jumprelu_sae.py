@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Train JumpReLUSparseConvAutoencoder on CelebA-HQ.
+"""Train JumpReLUSparseConvAutoencoder on CIFAR-10.
 
-Mirrors src/train/train_sae_celeba_hq.py.  Sparsity is controlled by a
-learned per-channel JumpReLU threshold, targeting a desired mean L0 count.
+Mirrors src/train/train_sae_cifar10.py.  Sparsity is controlled by a
+*learned per-channel threshold* (JumpReLU).  The sparsity penalty is the
+squared deviation of the mean active-feature count from ``target_l0``:
+
+    L_sparse = (L̂₀ − target_l0)²
 
 Loss:
-    total = MSE(recon, x) + sparsity_weight * (L̂₀ − target_l0)²
+    total = MSE(recon, x) + sparsity_weight * L_sparse
 """
 
 from __future__ import annotations
@@ -26,21 +29,20 @@ from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
-from src.utils.dataloader import CelebAHQLoader
+from src.utils.dataloader import CIFAR10Loader
 
 
 # ---------------------------------------------------------------------------
-# Utilities  (identical to CIFAR-10 variant)
+# Utilities
 # ---------------------------------------------------------------------------
 
 def seed_everything(seed: int) -> None:
@@ -90,13 +92,12 @@ def run_validation(
         num_batches  += 1
 
     if num_batches == 0:
-        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0, "l0": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0}
 
     return {
         "loss":     total_loss   / num_batches,
         "recon":    total_recon  / num_batches,
         "sparsity": total_sparse / num_batches,
-        "l0":       0.0,  # filled in separately
     }
 
 
@@ -129,9 +130,9 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     panels = [
-        ("Total loss",         "train_loss",     "val_loss"),
-        ("Recon loss",         "train_recon",     "val_recon"),
-        ("Sparsity (L̂₀−λ)²",  "train_sparsity",  "val_sparsity"),
+        ("Total loss",        "train_loss",     "val_loss"),
+        ("Recon loss",        "train_recon",     "val_recon"),
+        ("Sparsity (L̂₀−λ)²", "train_sparsity",  "val_sparsity"),
     ]
     for ax, (title, tk, vk) in zip(axes, panels):
         ax.plot(epochs, history[tk], label="train", linewidth=1.5)
@@ -148,8 +149,18 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
+    # Also plot mean L0 if available
+    if history.get("train_l0"):
+        ax4 = fig.add_axes([0.0, -0.3, 0.3, 0.25])  # extra panel below
+        ax4.plot(epochs, history["train_l0"], label="train L̂₀", linewidth=1.5)
+        ax4.plot(epochs, history["val_l0"],   label="val L̂₀",   linewidth=1.5, linestyle="--")
+        ax4.axhline(history.get("target_l0", 64), color="red", linestyle=":", linewidth=1,
+                    label=f"target={history.get('target_l0', 64)}")
+        ax4.set_title("Mean L0 (active features/pos)", fontsize=11)
+        ax4.set_xlabel("Epoch"); ax4.legend(fontsize=8); ax4.grid(True, alpha=0.3)
+
     plt.suptitle(
-        f"JumpReLU SAE CelebA-HQ training  (target_l0={history.get('target_l0', '?')})",
+        f"JumpReLU SAE CIFAR-10 training  (target_l0={history.get('target_l0', '?')})",
         fontsize=13, fontweight="bold",
     )
     plt.tight_layout()
@@ -178,14 +189,12 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train JumpReLU SAE on CelebA-HQ")
+    parser = argparse.ArgumentParser(description="Train JumpReLU SAE on CIFAR-10")
     parser.add_argument("--config",           type=str,   default="")
-    parser.add_argument("--data-root",        type=str,   default=d.get("data_root",        "./data/celeba_hq"))
-    parser.add_argument("--output-dir",       type=str,   default=o.get("output_dir",       "./outputs/sae_jumprelu_celeba_hq_r18"))
-    parser.add_argument("--image-size",       type=int,   default=d.get("image_size",       256))
-    parser.add_argument("--val-split",        type=float, default=d.get("val_split",        0.05))
-    parser.add_argument("--batch-size",       type=int,   default=d.get("batch_size",       32))
-    parser.add_argument("--num-workers",      type=int,   default=d.get("num_workers",      8))
+    parser.add_argument("--data-root",        type=str,   default=d.get("data_root",        "./data/cifar10"))
+    parser.add_argument("--output-dir",       type=str,   default=o.get("output_dir",       "./outputs/sae_jumprelu_cifar10_r18"))
+    parser.add_argument("--batch-size",       type=int,   default=d.get("batch_size",       128))
+    parser.add_argument("--num-workers",      type=int,   default=d.get("num_workers",      4))
     parser.add_argument("--resnet-variant",   type=str,   default=m.get("resnet_variant",   "18"))
     parser.add_argument("--stage-channels",   type=int,   nargs=4,
                         default=m.get("stage_channels",   [64, 128, 256, 512]))
@@ -194,9 +203,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-l0",        type=float, default=m.get("target_l0",        64.0))
     parser.add_argument("--bandwidth",        type=float, default=m.get("bandwidth",        0.001))
     parser.add_argument("--theta-init",       type=float, default=m.get("theta_init",       0.1))
-    parser.add_argument("--stem-stride",      type=int,   default=m.get("stem_stride",      2))
+    parser.add_argument("--stem-stride",      type=int,   default=m.get("stem_stride",      1))
     parser.add_argument("--use-stem-maxpool", action=argparse.BooleanOptionalAction,
-                        default=m.get("use_stem_maxpool", True))
+                        default=m.get("use_stem_maxpool", False))
     parser.add_argument("--epochs",           type=int,   default=t.get("epochs",           90))
     parser.add_argument("--learning-rate",    type=float, default=t.get("learning_rate",    3e-4))
     parser.add_argument("--weight-decay",     type=float, default=t.get("weight_decay",     1e-4))
@@ -225,21 +234,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tf = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    loader_obj = CelebAHQLoader(
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        image_size=args.image_size,
-        val_split=args.val_split,
-        seed=42,
-        pin_memory=(device.type == "cuda"),
-        transform=tf,
-    )
+    loader_obj = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
     train_loader, val_loader = loader_obj.get_loaders()
 
     _mc: dict = {}
@@ -284,10 +279,10 @@ def main() -> None:
         print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
     print(
-        "Training setup (JumpReLU SAE CelebA-HQ):\n"
+        "Training setup (JumpReLU SAE CIFAR-10):\n"
         f"  device={device}  target_l0={args.target_l0}  bandwidth={args.bandwidth}\n"
         f"  sparsity_weight={args.sparsity_weight}  theta_init={args.theta_init}\n"
-        f"  image_size={args.image_size}  val_split={args.val_split}\n"
+        f"  train_size={len(loader_obj.trainset)}  val_size={len(loader_obj.testset)}\n"
         f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
         f"  lr={args.learning_rate}  wd={args.weight_decay}"
     )
@@ -301,7 +296,8 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
-        running_loss = running_recon = running_sparse = running_l0 = 0.0
+        running_loss = running_recon = running_sparse = 0.0
+        running_l0 = 0.0
         num_batches = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
@@ -316,8 +312,9 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
 
+            # Estimate L0 for logging (no STE needed, just count)
             with torch.no_grad():
-                _, enc_info = model.encode(images)
+                latent, enc_info = model.encode(images)
                 l0_val = float(enc_info.get("l0_hat", 0.0))
 
             running_loss   += float(loss.item())
@@ -348,6 +345,7 @@ def main() -> None:
         }
         val_stats = run_validation(model, val_loader, device, args.sparsity_weight)
 
+        # Estimate val L0 separately
         with torch.no_grad():
             model.eval()
             val_l0_total = 0.0

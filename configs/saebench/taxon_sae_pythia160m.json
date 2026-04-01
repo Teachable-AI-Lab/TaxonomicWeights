@@ -4,8 +4,8 @@
     "model_name": "pythia-160m-deduped",
     "hook_layer": 8,
     "hook_name": "blocks.8.hook_resid_post",
-    "dataset": "Skylion007/openwebtext",
-    "context_length": 128,
+    "dataset": "HuggingFaceFW/fineweb",
+    "context_length": 1024,
     "n_tokens": 500000000,
     "batch_size": 4096,
     "dtype": "float32",
@@ -19,7 +19,7 @@
     "depth_decay": 0.5
   },
   "training": {
-    "total_steps": 30000,
+    "total_steps": 0,
     "learning_rate": 3e-4,
     "weight_decay": 0,
     "warmup_steps": 1000,

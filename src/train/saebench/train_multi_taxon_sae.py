@@ -49,16 +49,29 @@ def build_scheduler(
     total_steps: int,
     warmup_steps: int,
 ) -> LambdaLR:
-    total_steps = max(1, total_steps)
+    """Linear warmup then constant LR (matches dictionary_learning / SAEBench)."""
     warmup_steps = max(1, warmup_steps)
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def remove_gradient_parallel_to_decoder_directions(
+    W_dec: torch.Tensor,
+) -> None:
+    """Project out the gradient component parallel to each decoder row.
+
+    Prevents decoder norms from growing — matches the SAEBench /
+    dictionary_learning training convention.
+    """
+    if W_dec.grad is None:
+        return
+    parallel = (W_dec.grad * W_dec.data).sum(dim=1, keepdim=True)
+    W_dec.grad -= parallel * W_dec.data
 
 
 # ── Cached activation data loader (streaming, one chunk at a time) ─────────
@@ -204,7 +217,8 @@ def parse_args() -> argparse.Namespace:
     # training
     parser.add_argument("--output-dir",           type=str,   default=o.get("output_dir",
                                                               "./outputs/saebench/multi_taxon_sae"))
-    parser.add_argument("--total-steps",          type=int,   default=t.get("total_steps", 30_000))
+    parser.add_argument("--total-steps",          type=int,   default=t.get("total_steps", 0),
+                        help="Total training steps (0 = auto from n_tokens / batch_size)")
     parser.add_argument("--learning-rate",        type=float, default=t.get("learning_rate", 3e-4))
     parser.add_argument("--weight-decay",         type=float, default=t.get("weight_decay", 0.0))
     parser.add_argument("--warmup-steps",         type=int,   default=t.get("warmup_steps", 1000))
@@ -228,6 +242,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
     use_cache = bool(args.cached_activations_path)
+
+    # Auto-calculate total_steps from n_tokens / batch_size if not set
+    if args.total_steps <= 0:
+        args.total_steps = args.n_tokens // args.batch_size
+        print(f"Auto total_steps = {args.n_tokens} / {args.batch_size} = {args.total_steps}")
 
     # ── Output directory ────────────────────────────────────────────────
     dkl_suffix = f"_dkl{args.dkl_weight:.0e}"
@@ -373,6 +392,13 @@ def main() -> None:
                 + args.gate_entropy_weight * gate_entropy)
 
         loss.backward()
+
+        # Gradient projection: remove component parallel to decoder rows
+        remove_gradient_parallel_to_decoder_directions(sae.W_dec)
+
+        # Gradient clipping (matches SAEBench / dictionary_learning)
+        torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+
         optimizer.step()
         scheduler.step()
 
@@ -411,16 +437,19 @@ def main() -> None:
             steps_per_sec = steps_done / elapsed if elapsed > 0 else 0
             eta_sec = (args.total_steps - step - 1) / steps_per_sec if steps_per_sec > 0 else 0
 
-            tqdm.write(
-                f"[step {step+1:>6d}/{args.total_steps}] "
-                f"lr={lr:.2e}  loss={avg['loss']:.5f}  "
-                f"recon={avg['recon']:.5f}  dkl={avg['dkl']:.5f}  "
-                f"g_dkl={avg['gate_dkl']:.5f}  g_ent={avg['gate_entropy']:.5f}  "
-                f"L0={avg['l0']:.1f}  alive={alive_pct:.1f}%  "
-                f"speed={steps_per_sec:.1f} step/s  "
-                f"ETA={eta_sec/60:.0f}min",
-                file=sys.stdout,
-            )
+            try:
+                tqdm.write(
+                    f"[step {step+1:>6d}/{args.total_steps}] "
+                    f"lr={lr:.2e}  loss={avg['loss']:.5f}  "
+                    f"recon={avg['recon']:.5f}  dkl={avg['dkl']:.5f}  "
+                    f"g_dkl={avg['gate_dkl']:.5f}  g_ent={avg['gate_entropy']:.5f}  "
+                    f"L0={avg['l0']:.1f}  alive={alive_pct:.1f}%  "
+                    f"speed={steps_per_sec:.1f} step/s  "
+                    f"ETA={eta_sec/60:.0f}min",
+                    file=sys.stdout,
+                )
+            except OSError:
+                pass  # stale NFS file handle
 
             for k in ["loss", "recon", "dkl", "entropy", "gate_dkl", "gate_entropy", "l0"]:
                 history[k].append(avg[k])

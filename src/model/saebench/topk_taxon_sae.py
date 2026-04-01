@@ -1,10 +1,12 @@
-"""SAEBench-compatible Taxon SAE.
+"""SAEBench-compatible TopK Taxon SAE.
 
-Combines a linear taxonomy encoder (binary-tree pairwise-softmax routing)
-with the SAEBench BaseSAE interface.
+Replaces DKL regularisation with dead-node tracking and an AuxK auxiliary loss
+that revives underused features.  Routing uses the same binary-tree
+pairwise-softmax mechanism as :class:`TaxonSAE`, but sparsity is enforced
+by keeping only one active path per hierarchy (k = n_taxonomy_layers).
 
-The latent width (d_sae) is determined entirely by the taxonomy tree:
-  d_sae = 2^(n_taxonomy_layers + 1) - 2
+Reference: Gao et al., "Scaling and Evaluating Sparse Autoencoders",
+arXiv:2406.04093.
 """
 
 from __future__ import annotations
@@ -19,24 +21,23 @@ import torch.nn.functional as F
 from sae_bench.custom_saes.base_sae import BaseSAE
 
 
-# ── Taxonomy routing stage ───────────────────────────────────────────────
+# ── TopK taxonomy routing stage ──────────────────────────────────────────
 
-class LinearTaxonStage(nn.Module):
-    """One taxonomy tree over a linear projection.
+class TopKLinearTaxonStage(nn.Module):
+    """Linear taxonomy tree with dead-node tracking + AuxK revival.
 
-    Mirrors :class:`TaxonResNetStage` (CNN) but replaces ``ResidualConvBlock``
-    with ``nn.Linear`` and operates on 2-D ``[B, d_model]`` tensors.
-
-    Raw (unconstrained) logits drive the pairwise-softmax routing decisions,
-    while ``ReLU(logits)`` provides non-negative feature magnitudes.  This
-    decouples routing expressiveness from the sparsity mechanism.
+    Same routing as :class:`LinearTaxonStage`, but instead of DKL / entropy
+    regularisation, diversity is encouraged by tracking nodes that consistently
+    lose their sibling competition.
 
     Args:
         d_input:  Dimensionality of the input activation vector.
         n_taxonomy_layers:  Depth of the binary tree (L).
         temperature:  Softmax temperature for sibling competition.
         hard:  Use straight-through hard routing.
-        depth_decay:  Exponential weight decay per depth for regularisers.
+        depth_decay:  Exponential weight decay per depth.
+        k_aux:  Number of dead features used in the aux loss (default: half).
+        dead_steps:  Steps without winning before a node is flagged dead.
     """
 
     def __init__(
@@ -46,9 +47,10 @@ class LinearTaxonStage(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        k_aux: Optional[int] = None,
+        dead_steps: int = 2000,
     ) -> None:
         super().__init__()
-
         if n_taxonomy_layers < 1:
             raise ValueError(f"n_taxonomy_layers must be >= 1, got {n_taxonomy_layers}")
 
@@ -57,40 +59,23 @@ class LinearTaxonStage(nn.Module):
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
+        self.dead_steps = int(dead_steps)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(n_taxonomy_layers)
+        # Default: revive one dead path = one node per depth level
+        self.k_aux = k_aux if k_aux is not None else n_taxonomy_layers
 
         self.linear = nn.Linear(d_input, self.total_out_channels)
 
+        self.register_buffer(
+            "_steps_since_active",
+            torch.zeros(self.total_out_channels, dtype=torch.long),
+        )
+
     @staticmethod
     def output_channels(n_taxonomy_layers: int) -> int:
-        """Total output features for depths [2, 4, ..., 2^L]."""
         return (1 << (n_taxonomy_layers + 1)) - 2
-
-    def _pairwise_log_softmax(
-        self,
-        logits: torch.Tensor,
-        tau: float,
-        hard: bool,
-        eps: float = 1e-8,
-    ) -> torch.Tensor:
-        """Pairwise softmax over sibling pairs — *log-space* for regularisation.
-
-        Returns log-conditional probabilities [B, C].
-        """
-        B, C = logits.shape
-        pair_logits = logits.view(B, C // 2, 2)
-        y_soft = torch.softmax(pair_logits / tau, dim=2)
-
-        if hard:
-            argmax = y_soft.argmax(dim=2, keepdim=True)
-            y_hard = torch.zeros_like(pair_logits).scatter_(2, argmax, 1.0)
-            probs = y_hard - y_soft.detach() + y_soft
-        else:
-            probs = y_soft
-
-        return probs.clamp_min(eps).log().view(B, C)
 
     def _pairwise_softmax(
         self,
@@ -98,11 +83,6 @@ class LinearTaxonStage(nn.Module):
         tau: float,
         hard: bool,
     ) -> torch.Tensor:
-        """Pairwise softmax — *raw probability* space for feature gating.
-
-        With hard routing the losing sibling gets exactly 0 (not eps), so
-        ``relu(logit) * gate_prob`` produces true zeros on off-path features.
-        """
         B, C = logits.shape
         pair_logits = logits.view(B, C // 2, 2)
         y_soft = torch.softmax(pair_logits / tau, dim=2)
@@ -116,83 +96,71 @@ class LinearTaxonStage(nn.Module):
 
         return probs.view(B, C)
 
-    def _regularization_terms(
-        self,
-        prob: torch.Tensor,
-        logp: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Entropy and coverage-DKL for one depth level."""
-        local_entropy = -(prob * logp).sum(dim=1).mean()
-
-        marginal = prob.mean(dim=0)
-        marginal = marginal / marginal.sum().clamp_min(eps)
-        uniform_logp = -math.log(prob.shape[1])
-        coverage_kl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
-
-        return local_entropy, coverage_kl
-
     def forward(
         self,
         x: torch.Tensor,
         hard: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Run one taxonomy stage.
-
-        Args:
-            x: [B, d_input] activation vectors.
-            hard: Override for hard routing.
-
-        Returns:
-            gated_output: [B, total_out_channels] — taxonomy-gated features.
-            info: Dict with ``dkl`` and ``entropy`` scalars.
-        """
         if hard is None:
             hard = self.default_hard
 
-        # Raw logits (unconstrained) for routing; ReLU'd for feature values
-        all_logits = self.linear(x)                         # [B, total_out_channels]
+        all_logits = self.linear(x)
         depth_logits = torch.split(all_logits, self.layer_channels, dim=1)
 
         outputs: List[torch.Tensor] = []
-        prev_logp: Optional[torch.Tensor] = None
+        all_probs: List[torch.Tensor] = []
         prev_gate: Optional[torch.Tensor] = None
-        total_entropy = x.new_zeros(())
-        total_dkl = x.new_zeros(())
 
         for depth_idx, logits in enumerate(depth_logits):
-            # Log-space routing for regularisation (entropy / DKL)
-            log_cond = self._pairwise_log_softmax(logits, self.temperature, hard)
-            logp = log_cond if prev_logp is None else log_cond + prev_logp.repeat_interleave(2, dim=1)
-            prob = logp.exp()
-
-            # Raw-probability routing for feature gating (exact zeros with hard)
             cond = self._pairwise_softmax(logits, self.temperature, hard)
             gate_prob = cond if prev_gate is None else cond * prev_gate.repeat_interleave(2, dim=1)
 
-            # Feature values: non-negative magnitude × routing probability
             out = F.relu(logits) * gate_prob
-
-            entropy_i, dkl_i = self._regularization_terms(prob, logp)
-            w = self.depth_decay ** depth_idx
-            total_entropy = total_entropy + w * entropy_i
-            total_dkl = total_dkl + w * dkl_i
-
             outputs.append(out)
-            prev_logp = logp
+            all_probs.append(gate_prob)
             prev_gate = gate_prob
 
-        return torch.cat(outputs, dim=1), {"dkl": total_dkl, "entropy": total_entropy}
+        # Dead-node tracking
+        if self.training:
+            all_prob = torch.cat(all_probs, dim=1)
+            any_active = all_prob.amax(dim=0) > 0.5
+            self._steps_since_active[any_active] = 0
+            self._steps_since_active[~any_active] += 1
+
+        dead_frac = (self._steps_since_active >= self.dead_steps).float().mean()
+
+        return torch.cat(outputs, dim=1), {"dead_frac": dead_frac}
+
+    def compute_auxk_loss(
+        self,
+        x: torch.Tensor,
+        x_recon: torch.Tensor,
+    ) -> torch.Tensor:
+        """AuxK loss: train dead features to model reconstruction error."""
+        dead_mask = self._steps_since_active >= self.dead_steps
+        n_dead = int(dead_mask.sum().item())
+        if n_dead == 0:
+            return x.new_zeros(())
+
+        all_logits = self.linear(x - x_recon.detach() + x)
+        dead_float = dead_mask.to(dtype=x.dtype).unsqueeze(0)
+        dead_vals = F.relu(all_logits) * dead_float
+
+        k_aux_eff = min(self.k_aux, n_dead)
+        _, aux_idx = dead_vals.topk(k_aux_eff, dim=-1)
+        aux_mask = torch.zeros_like(dead_vals)
+        aux_mask.scatter_(1, aux_idx, 1.0)
+
+        error = (x - x_recon).detach()
+        dead_signal = (dead_vals * aux_mask).sum(dim=1, keepdim=True)
+        error_norm = error.norm(dim=1, keepdim=True)
+        return F.mse_loss(dead_signal, error_norm)
 
 
 # ── SAEBench wrapper ─────────────────────────────────────────────────────
 
-class TaxonSAE(BaseSAE):
-    """SAEBench-compatible linear taxonomy SAE.
-
-    Internally uses a LinearTaxonStage encoder (binary-tree pairwise softmax
-    routing) and a linear decoder, but exposes the standard BaseSAE interface.
-    """
+class TopKTaxonSAE(BaseSAE):
+    """SAEBench-compatible linear taxonomy SAE with TopK sparsity + AuxK loss."""
 
     def __init__(
         self,
@@ -205,10 +173,11 @@ class TaxonSAE(BaseSAE):
         temperature: float = 0.5,
         hard: bool = False,
         depth_decay: float = 0.5,
+        k_aux: Optional[int] = None,
+        dead_steps: int = 2000,
         hook_name: str | None = None,
     ):
-        d_sae = LinearTaxonStage.output_channels(n_taxonomy_layers)
-
+        d_sae = TopKLinearTaxonStage.output_channels(n_taxonomy_layers)
         hook_name = hook_name or f"blocks.{hook_layer}.hook_resid_post"
         super().__init__(d_in, d_sae, model_name, hook_layer, device, dtype, hook_name)
 
@@ -216,25 +185,25 @@ class TaxonSAE(BaseSAE):
         self.temperature = temperature
         self.default_hard = hard
         self.depth_decay = depth_decay
+        self.k_aux = k_aux
+        self.dead_steps = dead_steps
 
-        # Taxonomy-structured encoder
-        self.encoder = LinearTaxonStage(
+        self.encoder = TopKLinearTaxonStage(
             d_input=d_in,
             n_taxonomy_layers=n_taxonomy_layers,
             temperature=temperature,
             hard=hard,
             depth_decay=depth_decay,
+            k_aux=k_aux,
+            dead_steps=dead_steps,
         )
 
-        # W_dec: [d_sae, d_in]  — decoder directions (unit-normed rows)
         self.W_dec = nn.Parameter(torch.empty(d_sae, d_in, device=device, dtype=dtype))
         nn.init.kaiming_uniform_(self.W_dec, a=math.sqrt(5))
         with torch.no_grad():
             self.W_dec.data /= self.W_dec.data.norm(dim=1, keepdim=True)
 
-        # W_enc: [d_in, d_sae]  — kept for BaseSAE compatibility but NOT used
         self.W_enc = nn.Parameter(torch.zeros(d_in, d_sae, device=device, dtype=dtype))
-
         self.b_dec = nn.Parameter(torch.zeros(d_in, device=device, dtype=dtype))
         self.b_enc = nn.Parameter(torch.zeros(d_sae, device=device, dtype=dtype))
 
@@ -248,7 +217,7 @@ class TaxonSAE(BaseSAE):
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         flat = flat - self.b_dec
-        z, _ = self.encoder(flat)              # uses self.default_hard from config
+        z, _ = self.encoder(flat)
         return z.reshape(*shape[:-1], -1)
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
@@ -258,7 +227,7 @@ class TaxonSAE(BaseSAE):
         return self.decode(self.encode(x))
 
     # ------------------------------------------------------------------
-    # Training helpers (not part of SAEBench interface)
+    # Training helpers
     # ------------------------------------------------------------------
 
     def encode_with_info(
@@ -277,6 +246,13 @@ class TaxonSAE(BaseSAE):
         info["x_hat"] = x_hat
         return x_hat, info
 
+    def compute_auxk_loss(
+        self, x: torch.Tensor, x_recon: torch.Tensor
+    ) -> torch.Tensor:
+        flat_x = x.reshape(-1, x.shape[-1]) - self.b_dec
+        flat_recon = x_recon.reshape(-1, x_recon.shape[-1]) - self.b_dec
+        return self.encoder.compute_auxk_loss(flat_x, flat_recon)
+
     @torch.no_grad()
     def normalize_decoder(self) -> None:
         norms = self.W_dec.data.norm(dim=1, keepdim=True)
@@ -288,13 +264,15 @@ class TaxonSAE(BaseSAE):
 
     def get_checkpoint_args(self) -> dict:
         return {
-            "model_variant": "taxon_sae",
+            "model_variant": "topk_taxon_sae",
             "d_in": self.cfg.d_in,
             "d_sae": self.cfg.d_sae,
             "n_taxonomy_layers": self.n_taxonomy_layers,
             "temperature": self.temperature,
             "hard": self.default_hard,
             "depth_decay": self.depth_decay,
+            "k_aux": self.k_aux,
+            "dead_steps": self.dead_steps,
             "model_name": self.cfg.model_name,
             "hook_layer": self.cfg.hook_layer,
             "hook_name": self.cfg.hook_name,
@@ -306,7 +284,7 @@ class TaxonSAE(BaseSAE):
         path: str,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> "TaxonSAE":
+    ) -> "TopKTaxonSAE":
         state = torch.load(path, map_location="cpu", weights_only=False)
         args = state["args"]
         sae = cls(
@@ -319,6 +297,8 @@ class TaxonSAE(BaseSAE):
             temperature=args.get("temperature", 0.5),
             hard=args.get("hard", False),
             depth_decay=args.get("depth_decay", 0.5),
+            k_aux=args.get("k_aux"),
+            dead_steps=args.get("dead_steps", 2000),
             hook_name=args.get("hook_name"),
         )
         sae.load_state_dict(state["model_state"])

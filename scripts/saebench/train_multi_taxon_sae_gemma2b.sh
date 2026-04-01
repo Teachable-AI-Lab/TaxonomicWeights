@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=0-12:00:00
+#SBATCH --time=2-00:00:00
 
 # ── Environment ────────────────────────────────────────────────────────────────
 source ~/flash/miniconda3/etc/profile.d/conda.sh

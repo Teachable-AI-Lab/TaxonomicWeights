@@ -23,7 +23,7 @@ CONFIG="${1:-configs/cifar10/topk_multi_taxon_ae_cifar10.json}"
 # ── Run training ──────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_topk_multi_taxon_ae_cifar10 (job $SLURM_JOB_ID) config=$CONFIG"
 
-python src/train/train_topk_multi_taxon_ae_cifar10.py \
+python src/train/cifar10/train_topk_multi_taxon_ae.py \
     --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_topk_multi_taxon_ae_cifar10 (job $SLURM_JOB_ID)"

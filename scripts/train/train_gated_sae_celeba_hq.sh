@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Run training ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_gated_sae_celeba_hq (job $SLURM_JOB_ID)"
 
-python src/train/train_gated_sae_celeba_hq.py \
+python src/train/celeba_hq/train_gated_sae.py \
     --config configs/celeba_hq/gated_sae_celeba_hq.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_gated_sae_celeba_hq (job $SLURM_JOB_ID)"

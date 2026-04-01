@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train TopKTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
+"""Train TopKMultiTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
 
-Uses TopK leaf selection per taxonomy stage.  Dead leaves are revived via
-an AuxK reconstruction-error loss.
+Uses K independent TopK taxonomy hierarchies per encoder stage with a TopK
+inter-hierarchy gate.
 
 Loss:
     recon + auxk_weight * auxk_loss
@@ -31,11 +31,11 @@ from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.topk_taxon_ae import TopKTaxonAutoencoder
+from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -133,9 +133,9 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     panels = [
-        ("Total loss", "train_loss",      "val_loss"),
-        ("Recon loss", "train_recon",     "val_recon"),
-        ("AuxK loss",  "train_auxk",      "val_auxk"),
+        ("Total loss", "train_loss",  "val_loss"),
+        ("Recon loss", "train_recon", "val_recon"),
+        ("AuxK loss",  "train_auxk",  "val_auxk"),
     ]
 
     for ax, (title, train_key, val_key) in zip(axes, panels):
@@ -153,7 +153,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
-    plt.suptitle("Training curves (TopK Taxon AE)", fontsize=13, fontweight="bold")
+    plt.suptitle("Training curves (TopK Multi-Taxon AE)", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -177,11 +177,12 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train TopK Taxon AE on CelebA-HQ")
+    parser = argparse.ArgumentParser(description="Train TopK Multi-Taxon AE on CelebA-HQ")
     parser.add_argument("--config", type=str, default="")
     # data
     parser.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
-    parser.add_argument("--output-dir", type=str, default=o.get("output_dir", "./outputs/topk_taxon_ae_celeba_hq_r18"))
+    parser.add_argument("--output-dir", type=str,
+                        default=o.get("output_dir", "./outputs/topk_multi_taxon_ae_celeba_hq_r18"))
     parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
     parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
     parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
@@ -189,12 +190,13 @@ def parse_args() -> argparse.Namespace:
     # model
     parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
     parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
-                        default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
+                        default=m.get("stage_taxonomy_layers", [3, 4, 5, 6]))
     parser.add_argument("--stage-strides", type=int, nargs=4,
                         default=m.get("stage_strides", [1, 2, 2, 2]))
-
+    parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
     parser.add_argument("--k-aux", type=int, default=m.get("k_aux", None))
     parser.add_argument("--dead-steps", type=int, default=m.get("dead_steps", 2000))
+    parser.add_argument("--gate-k", type=int, default=m.get("gate_k", 1))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
     # training
@@ -214,8 +216,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
+    hier_str = f"_K{args.n_hierarchies}"
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = auxk_str
+    run_suffix = hier_str + auxk_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -249,14 +252,16 @@ def main() -> None:
         with open(args.config) as _f:
             _mc = json.load(_f).get("model", {})
 
-    model = TopKTaxonAutoencoder(
+    model = TopKMultiTaxonAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         resnet_variant=args.resnet_variant,
         stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
+        n_hierarchies=args.n_hierarchies,
         k_aux=args.k_aux,
         dead_steps=args.dead_steps,
+        gate_k=args.gate_k,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
@@ -295,27 +300,24 @@ def main() -> None:
         best_val = float(state.get("best_val", float("inf")))
         print(f"Resumed from {resume_path} at epoch={start_epoch}")
 
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         "Training setup:\n"
         f"  device={device}\n"
+        f"  n_params={n_params:,}\n"
+        f"  n_hierarchies={args.n_hierarchies}  k_aux={args.k_aux}\n"
         f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
-        f"  k_aux={args.k_aux} dead_steps={args.dead_steps}\n"
         f"  auxk_weight={args.auxk_weight}\n"
-        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
+        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}\n"
+        f"  output_dir={output_dir}"
     )
 
     history: dict = {
-        "epochs":        [],
-        "train_loss":    [],
-        "train_recon":   [],
-        "train_auxk":    [],
-        "train_dead":    [],
-        "val_loss":      [],
-        "val_recon":     [],
-        "val_auxk":      [],
-        "val_dead":      [],
+        "epochs":     [],
+        "train_loss": [], "train_recon": [], "train_auxk": [], "train_dead": [],
+        "val_loss":   [], "val_recon":   [], "val_auxk":   [], "val_dead":   [],
     }
 
     for epoch in range(start_epoch, args.epochs + 1):

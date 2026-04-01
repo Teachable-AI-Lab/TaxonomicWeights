@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train MultiTaxonAutoencoder on CIFAR-10 with ResNet-18 stage layout.
+"""Train MultiTaxonAutoencoder on CelebA-HQ with ResNet-18 stage layout.
 
 Extends the single-hierarchy Taxon AE with K independent taxonomy hierarchies
 per encoder stage and an inter-hierarchy gate.
@@ -28,17 +28,18 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
-from src.utils.dataloader import CIFAR10Loader
+from src.utils.dataloader import CelebAHQLoader
 
 
 def seed_everything(seed: int) -> None:
@@ -199,19 +200,19 @@ def parse_args() -> argparse.Namespace:
     o = cfg.get("output", {})
 
     parser = argparse.ArgumentParser(
-        description="Train MultiTaxon ResNet-18 AE on CIFAR-10"
+        description="Train MultiTaxon ResNet-18 AE on CelebA-HQ"
     )
     parser.add_argument("--config", type=str, default="",
                         help="Path to JSON config file")
     # data
     parser.add_argument("--data-root", type=str,
-                        default=d.get("data_root", "./data"))
+                        default=d.get("data_root", "./data/celeba_hq"))
     parser.add_argument("--output-dir", type=str,
-                        default=o.get("output_dir", "./outputs/multi_taxon_ae_cifar10"))
-    parser.add_argument("--image-size", type=int, default=d.get("image_size", 32))
-    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 128))
-    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 4))
-    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.1))
+                        default=o.get("output_dir", "./outputs/multi_taxon_ae_celeba_hq"))
+    parser.add_argument("--image-size", type=int, default=d.get("image_size", 256))
+    parser.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
+    parser.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
+    parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
     # model
     parser.add_argument("--resnet-variant", type=str,
                         default=m.get("resnet_variant", "18"))
@@ -274,32 +275,27 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # CIFAR10Loader applies its own normalisation (mean/std=0.5); no extra tf needed.
-    cifar_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
-    full_train_loader, _ = cifar_loader.get_loaders()
-
-    # Carve a proper validation split out of the training set.
-    trainset  = cifar_loader.trainset
-    val_size  = int(len(trainset) * args.val_split)
-    train_size = len(trainset) - val_size
-    generator = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset = random_split(trainset, [train_size, val_size],
-                                            generator=generator)
-
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+    tf = transforms.Compose(
+        [
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
     )
-    val_loader = DataLoader(
-        val_subset,
+
+    celeba_loader = CelebAHQLoader(
+        data_root=args.data_root,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
+        image_size=args.image_size,
+        val_split=args.val_split,
+        seed=args.seed,
         pin_memory=(device.type == "cuda"),
+        transform=tf,
     )
+    train_loader, val_loader = celeba_loader.get_loaders()
+    if val_loader is None:
+        raise RuntimeError("val_split must be > 0 to produce a validation loader")
 
     # Extra model params from config that aren't exposed as CLI flags.
     _mc: dict = {}
@@ -319,8 +315,8 @@ def main() -> None:
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
-        stem_stride=_mc.get("stem_stride", 1),
-        use_stem_maxpool=_mc.get("use_stem_maxpool", False),
+        stem_stride=_mc.get("stem_stride", 2),
+        use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
@@ -358,7 +354,7 @@ def main() -> None:
         f"  device={device}\n"
         f"  n_params={n_params:,}\n"
         f"  hard={args.hard}  n_hierarchies={args.n_hierarchies}\n"
-        f"  train_size={train_size} val_size={val_size}\n"
+        f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
         f"  dkl_weight={args.dkl_weight}  entropy_weight={args.entropy_weight}\n"

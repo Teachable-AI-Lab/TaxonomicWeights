@@ -3,11 +3,7 @@
 
 Thin wrapper that reuses variant-independent analyses from
 ``analyze_multi_taxon_ae_celeba_hq.py`` with the correct TopK-specific
-directory naming convention (``_k{K}_K{H}_auxk_{W:.0e}``).
-
-Taxonomy-specific analyses (parse trees, binary splits, taxonomy
-distributions, gate distributions, per-stage regs) are skipped because TopK
-routing does not use pairwise softmax or vanilla regularisation terms.
+directory naming convention (``_K{H}_auxk_{W:.0e}``).
 """
 
 from __future__ import annotations
@@ -34,12 +30,20 @@ from src.analyze.analyze_multi_taxon_ae_celeba_hq import (
     save_training_curves,
     visualize_stage_filters,
     analyze_filter_similarity,
+    visualize_taxonomy_distributions,
+    visualize_taxonomy_path_probs,
+    visualize_taxonomy_tree,
+    analyze_parse_trees,
+    analyze_hierarchical_activations,
+    analyze_binary_split_maps,
     visualize_stage_activations,
     analyze_reconstruction_quality,
     visualize_multiple_reconstructions,
     analyze_latent_sparsity,
     analyze_partonomy_sparsity,
+    analyze_gate_distributions,
     analyze_cross_hierarchy_similarity,
+    analyze_per_stage_regs,
 )
 
 
@@ -73,7 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
     parser.add_argument("--seed", type=int, default=cfg.get("training", {}).get("seed", 42))
     # TopK-specific
-    parser.add_argument("--k", type=int, default=m.get("k", None))
     parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
     parser.add_argument("--auxk-weight", type=float, default=cfg.get("training", {}).get("auxk_weight", 0.0))
     # Analysis knobs
@@ -83,6 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-recon-sets", type=int, default=a.get("num_reconstructions_per_image", 8))
     parser.add_argument("--n-act-images", type=int, default=a.get("num_activation_images", 3))
     parser.add_argument("--n-analysis-batches", type=int, default=a.get("num_taxonomy_batches", 10))
+    parser.add_argument("--n-parse-images", type=int, default=a.get("num_parse_tree_images", 4))
+    parser.add_argument("--n-hier-images", type=int, default=a.get("num_hier_act_images", 4))
+    parser.add_argument("--max-hier-depth", type=int, default=a.get("max_hier_act_depth", 4))
+    parser.add_argument("--n-split-images", type=int, default=a.get("num_split_map_images", 4))
+    parser.add_argument("--max-split-pairs", type=int, default=a.get("max_split_pairs", 8))
     return parser.parse_args()
 
 
@@ -91,10 +99,9 @@ def main() -> None:
     config = load_config(args.config) if args.config else {}
 
     # ── run suffix (must match training script) ──
-    k_str = f"_k{args.k}" if args.k is not None else ""
     hier_str = f"_K{args.n_hierarchies}"
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = k_str + hier_str + auxk_str
+    run_suffix = hier_str + auxk_str
 
     output_dir = Path(args.output_dir + run_suffix)
     analysis_dir = Path(args.analysis_save_dir or str(output_dir / "analysis"))
@@ -156,6 +163,32 @@ def main() -> None:
     print("\n[A1b] Filter similarity analysis")
     analyze_filter_similarity(model, save_dir)
 
+    print("\n[A2] Taxonomy regularisation distributions")
+    visualize_taxonomy_distributions(model, val_loader, device, save_dir,
+                                     num_batches=args.n_analysis_batches)
+
+    print("\n[A3] Path probability plots")
+    visualize_taxonomy_path_probs(model, val_loader, device, save_dir)
+
+    print("\n[A4] Taxonomy tree activations")
+    visualize_taxonomy_tree(model, val_loader, device, save_dir,
+                            num_images=args.n_act_images)
+
+    print("\n[A5] Parse-tree analysis")
+    analyze_parse_trees(model, val_loader, device, save_dir,
+                        num_images=args.n_parse_images)
+
+    print("\n[A6] Hierarchical activation maps")
+    analyze_hierarchical_activations(model, val_loader, device, save_dir,
+                                     num_images=args.n_hier_images,
+                                     max_depth=args.max_hier_depth)
+
+    print("\n[A7] Binary split maps")
+    analyze_binary_split_maps(model, val_loader, device, save_dir,
+                              num_images=args.n_split_images,
+                              max_depth=args.max_hier_depth,
+                              max_pairs=args.max_split_pairs)
+
     print("\n[A8] Stage activation maps")
     visualize_stage_activations(model, val_loader, device, save_dir,
                                 num_images=args.n_act_images)
@@ -176,9 +209,17 @@ def main() -> None:
     print("\n[B5] Partonomy sparsity suite")
     analyze_partonomy_sparsity(model, val_loader, device, save_dir)
 
+    print("\n[C1] Gate distributions")
+    analyze_gate_distributions(model, val_loader, device, save_dir,
+                               n_batches=args.n_analysis_batches)
+
     print("\n[C2] Cross-hierarchy cosine similarity")
     analyze_cross_hierarchy_similarity(model, val_loader, device, save_dir,
                                        n_batches=args.n_analysis_batches)
+
+    print("\n[C3] Per-stage regularisation stats")
+    analyze_per_stage_regs(model, val_loader, device, save_dir,
+                           n_batches=args.n_analysis_batches)
 
     print("\n" + "=" * 80)
     print(f"Analysis complete! All outputs saved to: {analysis_dir}")

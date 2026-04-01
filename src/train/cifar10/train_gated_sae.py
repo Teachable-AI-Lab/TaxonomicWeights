@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Train JumpReLUSparseConvAutoencoder on CIFAR-10.
+"""Train GatedSparseConvAutoencoder on CIFAR-10.
 
-Mirrors src/train/train_sae_cifar10.py.  Sparsity is controlled by a
-*learned per-channel threshold* (JumpReLU).  The sparsity penalty is the
-squared deviation of the mean active-feature count from ``target_l0``:
-
-    L_sparse = (L̂₀ − target_l0)²
+Mirrors src/train/train_sae_cifar10.py.  Sparsity is induced via
+L1 penalty on the pre-gate activations of the Gated SAE encoder, weighted
+by ``sparsity_weight``.
 
 Loss:
-    total = MSE(recon, x) + sparsity_weight * L_sparse
+    total = MSE(recon, x) + sparsity_weight * sparsity
 """
 
 from __future__ import annotations
@@ -33,11 +31,11 @@ from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
+from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
 from src.utils.dataloader import CIFAR10Loader
 
 
@@ -130,9 +128,9 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     panels = [
-        ("Total loss",        "train_loss",     "val_loss"),
-        ("Recon loss",        "train_recon",     "val_recon"),
-        ("Sparsity (L̂₀−λ)²", "train_sparsity",  "val_sparsity"),
+        ("Total loss",       "train_loss",     "val_loss"),
+        ("Recon loss",       "train_recon",    "val_recon"),
+        ("Gate L1 sparsity", "train_sparsity", "val_sparsity"),
     ]
     for ax, (title, tk, vk) in zip(axes, panels):
         ax.plot(epochs, history[tk], label="train", linewidth=1.5)
@@ -149,20 +147,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
-    # Also plot mean L0 if available
-    if history.get("train_l0"):
-        ax4 = fig.add_axes([0.0, -0.3, 0.3, 0.25])  # extra panel below
-        ax4.plot(epochs, history["train_l0"], label="train L̂₀", linewidth=1.5)
-        ax4.plot(epochs, history["val_l0"],   label="val L̂₀",   linewidth=1.5, linestyle="--")
-        ax4.axhline(history.get("target_l0", 64), color="red", linestyle=":", linewidth=1,
-                    label=f"target={history.get('target_l0', 64)}")
-        ax4.set_title("Mean L0 (active features/pos)", fontsize=11)
-        ax4.set_xlabel("Epoch"); ax4.legend(fontsize=8); ax4.grid(True, alpha=0.3)
-
-    plt.suptitle(
-        f"JumpReLU SAE CIFAR-10 training  (target_l0={history.get('target_l0', '?')})",
-        fontsize=13, fontweight="bold",
-    )
+    plt.suptitle("Gated SAE CIFAR-10 training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
     out_path = output_dir / "training_curves.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -189,32 +174,31 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train JumpReLU SAE on CIFAR-10")
-    parser.add_argument("--config",           type=str,   default="")
-    parser.add_argument("--data-root",        type=str,   default=d.get("data_root",        "./data/cifar10"))
-    parser.add_argument("--output-dir",       type=str,   default=o.get("output_dir",       "./outputs/sae_jumprelu_cifar10_r18"))
-    parser.add_argument("--batch-size",       type=int,   default=d.get("batch_size",       128))
-    parser.add_argument("--num-workers",      type=int,   default=d.get("num_workers",      4))
-    parser.add_argument("--resnet-variant",   type=str,   default=m.get("resnet_variant",   "18"))
-    parser.add_argument("--stage-channels",   type=int,   nargs=4,
-                        default=m.get("stage_channels",   [64, 128, 256, 512]))
-    parser.add_argument("--stage-strides",    type=int,   nargs=4,
-                        default=m.get("stage_strides",    [1, 2, 2, 2]))
-    parser.add_argument("--target-l0",        type=float, default=m.get("target_l0",        64.0))
-    parser.add_argument("--bandwidth",        type=float, default=m.get("bandwidth",        0.001))
-    parser.add_argument("--theta-init",       type=float, default=m.get("theta_init",       0.1))
-    parser.add_argument("--stem-stride",      type=int,   default=m.get("stem_stride",      1))
+    parser = argparse.ArgumentParser(description="Train Gated SAE on CIFAR-10")
+    parser.add_argument("--config",          type=str,   default="")
+    parser.add_argument("--data-root",       type=str,   default=d.get("data_root",       "./data/cifar10"))
+    parser.add_argument("--output-dir",      type=str,   default=o.get("output_dir",      "./outputs/sae_gated_cifar10_r18"))
+    parser.add_argument("--batch-size",      type=int,   default=d.get("batch_size",      128))
+    parser.add_argument("--num-workers",     type=int,   default=d.get("num_workers",     4))
+    parser.add_argument("--resnet-variant",  type=str,   default=m.get("resnet_variant",  "18"))
+    parser.add_argument("--stage-channels",  type=int,   nargs=4,
+                        default=m.get("stage_channels",  [64, 128, 256, 512]))
+    parser.add_argument("--stage-strides",   type=int,   nargs=4,
+                        default=m.get("stage_strides",   [1, 2, 2, 2]))
+    parser.add_argument("--use-gate-ste",    action=argparse.BooleanOptionalAction,
+                        default=m.get("use_gate_ste", False))
+    parser.add_argument("--stem-stride",     type=int,   default=m.get("stem_stride",     1))
     parser.add_argument("--use-stem-maxpool", action=argparse.BooleanOptionalAction,
                         default=m.get("use_stem_maxpool", False))
-    parser.add_argument("--epochs",           type=int,   default=t.get("epochs",           90))
-    parser.add_argument("--learning-rate",    type=float, default=t.get("learning_rate",    3e-4))
-    parser.add_argument("--weight-decay",     type=float, default=t.get("weight_decay",     1e-4))
-    parser.add_argument("--warmup-epochs",    type=int,   default=t.get("warmup_epochs",    3))
-    parser.add_argument("--sparsity-weight",  type=float, default=t.get("sparsity_weight",  1e-4))
-    parser.add_argument("--save-every",       type=int,   default=t.get("save_every",       5))
-    parser.add_argument("--seed",             type=int,   default=t.get("seed",             42))
-    parser.add_argument("--max-train-steps",  type=int,   default=t.get("max_train_steps",  0))
-    parser.add_argument("--resume",           type=str,   default="")
+    parser.add_argument("--epochs",          type=int,   default=t.get("epochs",          90))
+    parser.add_argument("--learning-rate",   type=float, default=t.get("learning_rate",   3e-4))
+    parser.add_argument("--weight-decay",    type=float, default=t.get("weight_decay",    1e-4))
+    parser.add_argument("--warmup-epochs",   type=int,   default=t.get("warmup_epochs",   3))
+    parser.add_argument("--sparsity-weight", type=float, default=t.get("sparsity_weight", 1e-3))
+    parser.add_argument("--save-every",      type=int,   default=t.get("save_every",      5))
+    parser.add_argument("--seed",            type=int,   default=t.get("seed",            42))
+    parser.add_argument("--max-train-steps", type=int,   default=t.get("max_train_steps", 0))
+    parser.add_argument("--resume",          type=str,   default="")
     return parser.parse_args()
 
 
@@ -226,7 +210,8 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    output_dir  = Path(args.output_dir + f"_l0{int(args.target_l0)}_sw{args.sparsity_weight:.0e}")
+    ste_tag     = "_ste" if args.use_gate_ste else ""
+    output_dir  = Path(args.output_dir + f"_sw{args.sparsity_weight:.0e}{ste_tag}")
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -242,15 +227,13 @@ def main() -> None:
         with open(args.config) as f:
             _mc = json.load(f).get("model", {})
 
-    model = JumpReLUSparseConvAutoencoder(
+    model = GatedSparseConvAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         resnet_variant=args.resnet_variant,
         stage_channels=tuple(args.stage_channels),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
-        target_l0=args.target_l0,
-        bandwidth=args.bandwidth,
-        theta_init=args.theta_init,
+        use_gate_ste=args.use_gate_ste,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
@@ -279,25 +262,38 @@ def main() -> None:
         print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
     print(
-        "Training setup (JumpReLU SAE CIFAR-10):\n"
-        f"  device={device}  target_l0={args.target_l0}  bandwidth={args.bandwidth}\n"
-        f"  sparsity_weight={args.sparsity_weight}  theta_init={args.theta_init}\n"
+        "Training setup (Gated SAE CIFAR-10):\n"
+        f"  device={device}  use_gate_ste={args.use_gate_ste}  sparsity_weight={args.sparsity_weight}\n"
         f"  train_size={len(loader_obj.trainset)}  val_size={len(loader_obj.testset)}\n"
-        f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
-        f"  lr={args.learning_rate}  wd={args.weight_decay}"
+        f"  batch_size={args.batch_size}  epochs={args.epochs}"
     )
 
     history: dict = {
-        "epochs": [], "target_l0": args.target_l0,
-        "train_loss": [], "train_recon": [], "train_sparsity": [], "train_l0": [],
-        "val_loss":   [], "val_recon":   [], "val_sparsity":   [], "val_l0":   [],
+        "epochs": [],
+        "train_loss": [], "train_recon": [], "train_sparsity": [],
+        "val_loss":   [], "val_recon":   [], "val_sparsity":   [],
+    }
+
+    _args_dict = {
+        "model_variant": "gated",
+        "in_channels": 3,
+        "resnet_variant": args.resnet_variant,
+        "stage_channels": list(args.stage_channels),
+        "stage_strides": list(args.stage_strides),
+        "stage_blocks": _mc.get("stage_blocks", None),
+        "use_gate_ste": args.use_gate_ste,
+        "kernel_size": _mc.get("kernel_size", 3),
+        "use_stem": _mc.get("use_stem", True),
+        "stem_channels": _mc.get("stem_channels", 64),
+        "stem_stride": args.stem_stride,
+        "use_stem_maxpool": args.use_stem_maxpool,
+        "output_activation": _mc.get("output_activation", "none"),
     }
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
         running_loss = running_recon = running_sparse = 0.0
-        running_l0 = 0.0
         num_batches = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
@@ -312,15 +308,9 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
 
-            # Estimate L0 for logging (no STE needed, just count)
-            with torch.no_grad():
-                latent, enc_info = model.encode(images)
-                l0_val = float(enc_info.get("l0_hat", 0.0))
-
             running_loss   += float(loss.item())
             running_recon  += float(recon_loss.item())
             running_sparse += float(sparsity.item())
-            running_l0     += l0_val
             num_batches    += 1
             global_step    += 1
 
@@ -329,9 +319,7 @@ def main() -> None:
                 print(
                     f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                     f"lr={lr:.3e} loss={running_loss/num_batches:.5f} "
-                    f"recon={running_recon/num_batches:.5f} "
-                    f"sparsity={running_sparse/num_batches:.3f} "
-                    f"l0={running_l0/num_batches:.1f}"
+                    f"recon={running_recon/num_batches:.5f} sparsity={running_sparse/num_batches:.5f}"
                 )
 
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
@@ -341,59 +329,23 @@ def main() -> None:
             "loss":     running_loss   / max(1, num_batches),
             "recon":    running_recon  / max(1, num_batches),
             "sparsity": running_sparse / max(1, num_batches),
-            "l0":       running_l0     / max(1, num_batches),
         }
         val_stats = run_validation(model, val_loader, device, args.sparsity_weight)
-
-        # Estimate val L0 separately
-        with torch.no_grad():
-            model.eval()
-            val_l0_total = 0.0
-            val_l0_batches = 0
-            for imgs_v, _ in val_loader:
-                _, enc_info_v = model.encode(imgs_v.to(device))
-                val_l0_total += float(enc_info_v.get("l0_hat", 0.0))
-                val_l0_batches += 1
-                if val_l0_batches >= 10:
-                    break
-            val_stats["l0"] = val_l0_total / max(1, val_l0_batches)
 
         elapsed = time.time() - epoch_start
         print(
             f"epoch={epoch:03d} time={elapsed:.1f}s "
             f"train_loss={train_stats['loss']:.5f} train_recon={train_stats['recon']:.5f} "
-            f"train_l0={train_stats['l0']:.1f} "
-            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f} "
-            f"val_l0={val_stats['l0']:.1f}  (target={args.target_l0})"
+            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f}"
         )
 
         history["epochs"].append(epoch)
         history["train_loss"].append(train_stats["loss"])
         history["train_recon"].append(train_stats["recon"])
         history["train_sparsity"].append(train_stats["sparsity"])
-        history["train_l0"].append(train_stats["l0"])
         history["val_loss"].append(val_stats["loss"])
         history["val_recon"].append(val_stats["recon"])
         history["val_sparsity"].append(val_stats["sparsity"])
-        history["val_l0"].append(val_stats["l0"])
-
-        _args_dict = {
-            "model_variant":  "jumprelu",
-            "in_channels":    3,
-            "resnet_variant": args.resnet_variant,
-            "stage_channels": list(args.stage_channels),
-            "stage_strides":  list(args.stage_strides),
-            "stage_blocks":   _mc.get("stage_blocks", None),
-            "target_l0":      args.target_l0,
-            "bandwidth":      args.bandwidth,
-            "theta_init":     args.theta_init,
-            "kernel_size":    _mc.get("kernel_size", 3),
-            "use_stem":       _mc.get("use_stem", True),
-            "stem_channels":  _mc.get("stem_channels", 64),
-            "stem_stride":    args.stem_stride,
-            "use_stem_maxpool": args.use_stem_maxpool,
-            "output_activation": _mc.get("output_activation", "none"),
-        }
 
         if epoch % args.save_every == 0:
             state = {

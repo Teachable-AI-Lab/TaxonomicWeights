@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Run training ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_jumprelu_sae_cifar10 (job $SLURM_JOB_ID)"
 
-python src/train/train_jumprelu_sae_cifar10.py \
+python src/train/cifar10/train_jumprelu_sae.py \
     --config configs/cifar10/jumprelu_sae_cifar10.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_jumprelu_sae_cifar10 (job $SLURM_JOB_ID)"

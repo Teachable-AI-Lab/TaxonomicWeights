@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Train SparseConvAutoencoder on full CelebA-HQ with a ResNet-18 stage layout.
+"""Train SparseConvAutoencoder on CIFAR-10.
 
-Mirrors src/train/train_taxon_ae_celeba_hq.py — same training loop structure, same
-optimizer / scheduler, same checkpoint and preview logic — but uses the SAE
-instead of TaxonAutoencoder.
+Same structure as src/train/train_sae_celeba_hq.py but uses CIFAR10Loader and
+defaults suited to 32×32 images (stem_stride=1, no max-pool, larger batches).
 
 Loss:
     total = MSE(recon, x) + sparsity_weight * sparsity
@@ -26,22 +25,22 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 
 import sys
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.baseline.sae import SparseConvAutoencoder
-from src.utils.dataloader import CelebAHQLoader
+from src.utils.dataloader import CIFAR10Loader
 
 
 # ---------------------------------------------------------------------------
-# Utilities (identical pattern to train_taxon_ae_celeba_hq.py)
+# Utilities
 # ---------------------------------------------------------------------------
 
 def seed_everything(seed: int) -> None:
@@ -86,17 +85,17 @@ def run_validation(
         recon_loss = F.mse_loss(recon, images)
         loss = recon_loss + sparsity_weight * sparsity
 
-        total_loss += float(loss.item())
-        total_recon += float(recon_loss.item())
+        total_loss   += float(loss.item())
+        total_recon  += float(recon_loss.item())
         total_sparse += float(sparsity.item())
-        num_batches += 1
+        num_batches  += 1
 
     if num_batches == 0:
         return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0}
 
     return {
-        "loss": total_loss / num_batches,
-        "recon": total_recon / num_batches,
+        "loss":     total_loss   / num_batches,
+        "recon":    total_recon  / num_batches,
         "sparsity": total_sparse / num_batches,
     }
 
@@ -115,7 +114,7 @@ def save_recon_preview(
     with torch.no_grad():
         recon, _ = model(images)
 
-    # Convert from [-1, 1] to [0, 1] for visualization.
+    # CIFAR10Loader normalises to [-1, 1] (mean=0.5, std=0.5) — undo here.
     vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
     vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
 
@@ -155,7 +154,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
-    plt.suptitle("SAE CelebA-HQ training curves", fontsize=13, fontweight="bold")
+    plt.suptitle("SAE CIFAR-10 training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -169,7 +168,6 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    # First pass: load config defaults.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
     pre_args, _ = pre.parse_known_args()
@@ -184,29 +182,29 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train SparseConvAutoencoder on CelebA-HQ")
-    parser.add_argument("--config", type=str, default="")
+    parser = argparse.ArgumentParser(description="Train SparseConvAutoencoder on CIFAR-10")
+    parser.add_argument("--config",      type=str, default="")
     # data
-    parser.add_argument("--data-root",   type=str,   default=d.get("data_root",   "./data/celeba_hq"))
-    parser.add_argument("--output-dir",  type=str,   default=o.get("output_dir",  "./outputs/sae_celeba_hq"))
-    parser.add_argument("--image-size",  type=int,   default=d.get("image_size",  256))
-    parser.add_argument("--batch-size",  type=int,   default=d.get("batch_size",  32))
-    parser.add_argument("--num-workers", type=int,   default=d.get("num_workers", 8))
-    parser.add_argument("--val-split",   type=float, default=d.get("val_split",   0.05))
+    parser.add_argument("--data-root",   type=str,   default=d.get("data_root",   "./data/cifar10"))
+    parser.add_argument("--output-dir",  type=str,   default=o.get("output_dir",  "./outputs/sae_cifar10"))
+    parser.add_argument("--image-size",  type=int,   default=d.get("image_size",  32))
+    parser.add_argument("--batch-size",  type=int,   default=d.get("batch_size",  128))
+    parser.add_argument("--num-workers", type=int,   default=d.get("num_workers", 4))
+    parser.add_argument("--val-split",   type=float, default=d.get("val_split",   0.1))
     # model
     parser.add_argument("--resnet-variant", type=str,  default=m.get("resnet_variant", "18"))
     parser.add_argument("--stage-channels", type=int, nargs=4,
                         default=m.get("stage_channels", [64, 128, 256, 512]))
     parser.add_argument("--stage-strides",  type=int, nargs=4,
                         default=m.get("stage_strides",  [1, 2, 2, 2]))
-    parser.add_argument("--sparsity-type",   type=str,   default=m.get("sparsity_type",   "l1"))
-    parser.add_argument("--sparsity-target", type=float, default=m.get("sparsity_target", 0.05))
-    parser.add_argument("--latent-activation", type=str, default=m.get("latent_activation", "relu"))
-    parser.add_argument("--stem-stride",      type=int,  default=m.get("stem_stride", 2))
+    parser.add_argument("--sparsity-type",    type=str,   default=m.get("sparsity_type",   "l1"))
+    parser.add_argument("--sparsity-target",  type=float, default=m.get("sparsity_target", 0.05))
+    parser.add_argument("--latent-activation", type=str,  default=m.get("latent_activation", "relu"))
+    parser.add_argument("--stem-stride",      type=int,   default=m.get("stem_stride",      1))
     parser.add_argument(
         "--use-stem-maxpool",
         action=argparse.BooleanOptionalAction,
-        default=m.get("use_stem_maxpool", True),
+        default=m.get("use_stem_maxpool", False),
     )
     # training
     parser.add_argument("--epochs",          type=int,   default=t.get("epochs",          90))
@@ -230,7 +228,7 @@ def main() -> None:
     seed_everything(args.seed)
 
     sparse_suffix = f"_spw_{args.sparsity_weight:.0e}_spt_{args.sparsity_type}"
-    output_dir = Path(args.output_dir + sparse_suffix)
+    output_dir  = Path(args.output_dir + sparse_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -238,25 +236,31 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tf = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    # CIFAR10Loader uses its own normalisation; pass root and batch_size only.
+    cifar_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
+    full_train_loader, test_loader = cifar_loader.get_loaders()
 
-    celeba_loader = CelebAHQLoader(
-        data_root=args.data_root,
+    # Carve a proper validation split out of the training set at the dataset level.
+    trainset = cifar_loader.trainset
+    val_size  = int(len(trainset) * args.val_split)
+    train_size = len(trainset) - val_size
+    generator = torch.Generator().manual_seed(args.seed)
+    train_subset, val_subset = random_split(trainset, [train_size, val_size], generator=generator)
+
+    train_loader = DataLoader(
+        train_subset,
         batch_size=args.batch_size,
+        shuffle=True,
         num_workers=args.num_workers,
-        image_size=args.image_size,
-        val_split=args.val_split,
-        seed=args.seed,
         pin_memory=(device.type == "cuda"),
-        transform=tf,
     )
-    train_loader, val_loader = celeba_loader.get_loaders()
-    if val_loader is None:
-        raise RuntimeError("val_split must be > 0 to produce a validation loader")
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
     # Load extra model params from config if available.
     _mc: dict = {}
@@ -295,7 +299,7 @@ def main() -> None:
     )
     start_epoch = 1
     global_step = 0
-    best_val = float("inf")
+    best_val    = float("inf")
 
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
@@ -304,14 +308,14 @@ def main() -> None:
         scheduler.load_state_dict(state["scheduler_state"])
         start_epoch = int(state["epoch"]) + 1
         global_step = int(state.get("global_step", 0))
-        best_val = float(state.get("best_val", float("inf")))
+        best_val    = float(state.get("best_val", float("inf")))
         print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
     print(
-        "Training setup (SAE CelebA-HQ):\n"
+        "Training setup (SAE CIFAR-10):\n"
         f"  device={device}\n"
         f"  sparsity_type={args.sparsity_type}  sparsity_weight={args.sparsity_weight}\n"
-        f"  train_size={len(celeba_loader.trainset)}  val_size={len(celeba_loader.valset)}\n"
+        f"  train_size={train_size}  val_size={val_size}\n"
         f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
         f"  lr={args.learning_rate}  wd={args.weight_decay}\n"
         f"  stage_channels={tuple(args.stage_channels)}"
@@ -331,7 +335,7 @@ def main() -> None:
         model.train()
         epoch_start = time.time()
         running_loss = running_recon = running_sparse = 0.0
-        num_batches = 0
+        num_batches  = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
@@ -351,7 +355,7 @@ def main() -> None:
             num_batches    += 1
             global_step    += 1
 
-            if batch_idx % 50 == 0:
+            if batch_idx % 100 == 0:
                 avg_loss   = running_loss   / num_batches
                 avg_recon  = running_recon  / num_batches
                 avg_sparse = running_sparse / num_batches

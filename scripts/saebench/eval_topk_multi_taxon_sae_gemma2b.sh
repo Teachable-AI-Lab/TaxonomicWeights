@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=train_taxon_gemma2b
-#SBATCH --output=slurm/slurm_outputs/train_taxon_gemma2b_%j.out
-#SBATCH --error=slurm/slurm_errors/train_taxon_gemma2b_%j.err
+#SBATCH --job-name=eval_topk_multi_taxon_gemma2b
+#SBATCH --output=slurm/slurm_outputs/eval_topk_multi_taxon_gemma2b_%j.out
+#SBATCH --error=slurm/slurm_errors/eval_topk_multi_taxon_gemma2b_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-12:00:00
 
 # ── Environment ────────────────────────────────────────────────────────────────
 source ~/flash/miniconda3/etc/profile.d/conda.sh
@@ -17,15 +17,18 @@ export PYTHONUNBUFFERED=1
 
 # ── Working directory ──────────────────────────────────────────────────────────
 cd /nethome/ksingara3/flash/TaxonomicWeights
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 # ── HuggingFace token (Gemma-2 is a gated model) ─────────────────────────────
 export HF_TOKEN="$(cat hf_token | tr -d '[:space:]')"
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 
-# ── Train TaxonSAE (Gemma-2-2B, layer 12) ────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"
+# ── Evaluate TopKMultiTaxonSAE on SAEBench (Gemma-2-2B) ─────────────────────
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting TopKMultiTaxonSAE Gemma-2B SAEBench eval (job $SLURM_JOB_ID)"
 
-python src/train/saebench/train_taxon_sae.py \
-    --config configs/saebench/taxon_sae_gemma2b.json
+python src/eval/run_saebench_evals.py \
+    --config configs/saebench/topk_multi_taxon_sae_gemma2b.json \
+    --eval-types core sparse_probing scr tpp absorption taxonomy \
+    --save-activations
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TaxonSAE Gemma-2B training (job $SLURM_JOB_ID)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished TopKMultiTaxonSAE Gemma-2B SAEBench eval (job $SLURM_JOB_ID)"

@@ -20,7 +20,7 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 # ── Run training ───────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_sae_celeba_hq (job $SLURM_JOB_ID)"
 
-python src/train/train_sae_celeba_hq.py \
+python src/train/celeba_hq/train_sae.py \
     --config configs/celeba_hq/sae_celeba_hq.json
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_sae_celeba_hq (job $SLURM_JOB_ID)"

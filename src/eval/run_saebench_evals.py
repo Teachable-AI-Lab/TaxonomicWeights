@@ -40,6 +40,8 @@ from sae_bench.custom_saes.run_all_evals_dictionary_learning_saes import (
 
 from src.model.saebench.taxon_sae import TaxonSAE
 from src.model.saebench.multi_taxon_sae import MultiTaxonSAE
+from src.model.saebench.topk_taxon_sae import TopKTaxonSAE
+from src.model.saebench.topk_multi_taxon_sae import TopKMultiTaxonSAE
 
 RANDOM_SEED = 42
 
@@ -82,12 +84,16 @@ def load_custom_sae(
     variant: str,
     device: torch.device,
     dtype: torch.dtype,
-) -> TaxonSAE | MultiTaxonSAE:
+) -> TaxonSAE | MultiTaxonSAE | TopKTaxonSAE | TopKMultiTaxonSAE:
     """Load a trained TaxonSAE or MultiTaxonSAE from checkpoint."""
     if variant == "taxon":
         sae = TaxonSAE.from_checkpoint(checkpoint, device, dtype)
     elif variant == "multi_taxon":
         sae = MultiTaxonSAE.from_checkpoint(checkpoint, device, dtype)
+    elif variant == "topk_taxon":
+        sae = TopKTaxonSAE.from_checkpoint(checkpoint, device, dtype)
+    elif variant == "topk_multi_taxon":
+        sae = TopKMultiTaxonSAE.from_checkpoint(checkpoint, device, dtype)
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -98,6 +104,38 @@ def load_custom_sae(
         sae.normalize_decoder()
 
     return sae
+
+
+_TRAINER_DISPLAY: dict[str, str] = {
+    "BatchTopKTrainer": "BatchTopK",
+    "TopKTrainer": "TopK",
+    "MatryoshkaBatchTopKTrainer": "MatryoshkaBatchTopK",
+    "JumpReluTrainer": "JumpReLU",
+    "StandardTrainerAprilUpdate": "Standard",
+    "PAnnealTrainer": "PAnneal",
+    "GatedSAETrainer": "GatedSAE",
+}
+
+
+def _baseline_name_from_config(config_path: str, fallback: str) -> str:
+    """Derive a human-readable baseline name from a DL-SAE config.json."""
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        t = cfg.get("trainer", {})
+        tc = t.get("trainer_class", "")
+        display = _TRAINER_DISPLAY.get(tc) or tc.removesuffix("Trainer") or tc
+        # k-based trainers (TopK, JumpReLU target_l0)
+        k = t.get("k") if t.get("k") is not None else t.get("target_l0")
+        if k is not None:
+            return f"baseline_{display}_k{k}"
+        # L1-penalty-based trainers
+        l1 = t.get("l1_penalty") if t.get("l1_penalty") is not None else t.get("sparsity_penalty")
+        if l1 is not None:
+            return f"baseline_{display}_l1_{l1}"
+        return f"baseline_{display}"
+    except Exception:
+        return fallback
 
 
 def load_baselines(
@@ -141,7 +179,11 @@ def load_baselines(
                 dtype=dtype,
                 layer=hook_layer,
             )
-            name = f"baseline_{loc.split('/')[-1] if '/' in loc else loc}"
+            config_path = os.path.join(
+                "downloaded_saes", repo_id.replace("/", "_"), loc, "config.json"
+            )
+            fallback = f"baseline_{loc.split('/')[-1] if '/' in loc else loc}"
+            name = _baseline_name_from_config(config_path, fallback)
             selected.append((name, sae))
             print(f"  Loaded baseline: {name}")
         except Exception as e:
@@ -174,10 +216,17 @@ def run_taxonomy_analysis(
     Writes a JSON report to ``output_base/taxonomy/<sae_name>.json``.
     Non-taxonomy SAEs (baselines) are silently skipped.
     """
-    from sae_bench.sae_bench_utils.activations_store import ActivationsStore
+    from sae_lens.training.activations_store import ActivationsStore
+    from transformer_lens import HookedTransformer
 
     out_dir = Path(output_base) / "taxonomy"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load model once for all SAEs
+    mcfg = MODEL_CONFIGS.get(model_name, {})
+    dtype = getattr(torch, mcfg.get("dtype", "float32"))
+    print(f"[taxonomy] Loading {model_name} ({dtype}) for activation streaming ...")
+    llm = HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype)
 
     for sae_name, sae in selected_saes:
         encoder = getattr(sae, "encoder", None)
@@ -198,22 +247,37 @@ def run_taxonomy_analysis(
               f"n_layers={n_layers}, multi={is_multi})")
 
         # Activation store for streaming batches
+        store_batch = max(1, mcfg.get("batch_size", 256) // context_size)
         act_store = ActivationsStore(
-            model_name=model_name,
-            hook_name=sae.cfg.hook_name,
-            hook_layer=sae.cfg.hook_layer,
+            model=llm,
             dataset="Skylion007/openwebtext",
+            streaming=True,
+            hook_name=sae.cfg.hook_name,
+            hook_head_index=None,
             context_size=context_size,
             d_in=sae.cfg.d_in,
-            device=device,
+            n_batches_in_buffer=32,
+            total_training_tokens=n_batches * mcfg.get("batch_size", 256),
+            store_batch_size_prompts=store_batch,
+            train_batch_size_tokens=mcfg.get("batch_size", 256),
+            prepend_bos=True,
+            normalize_activations="none",
+            device=torch.device(device),
+            dtype=dtype,
         )
+
+        # For multi-taxon, z_hard is [B, K * sum(layer_channels)], so build
+        # a flat split list that covers all K hierarchies.
+        n_hierarchies = len(hierarchies) if is_multi else 1
+        flat_split_sizes = layer_channels * n_hierarchies  # repeat K times
 
         # Accumulators
         total_tokens = 0
-        # Per-depth: active count, total magnitude, total squared magnitude
+        # Per-depth: aggregate across hierarchies
         depth_active_counts = [0.0 for _ in layer_channels]
         depth_magnitude_sums = [0.0 for _ in layer_channels]
-        depth_firing_any = [torch.zeros(ch, device=device) for ch in layer_channels]
+        depth_firing_any = [torch.zeros(ch * n_hierarchies, device=device)
+                           for ch in layer_channels]
         overall_l0_hard = 0.0
         overall_l0_soft = 0.0
         routing_entropy_sum = 0.0
@@ -240,8 +304,13 @@ def run_taxonomy_analysis(
             recon_mse_total += ((flat - x_hat) ** 2).sum().item()
 
             # Per-depth analysis (on hard-routed output)
-            depth_splits = torch.split(z_hard, layer_channels, dim=1)
-            for d, z_d in enumerate(depth_splits):
+            # Split into [n_layers * n_hierarchies] chunks, then aggregate
+            # by depth across hierarchies.
+            all_splits = torch.split(z_hard, flat_split_sizes, dim=1)
+            for d in range(n_layers):
+                # Gather the d-th depth from each hierarchy
+                chunks = [all_splits[d + k * n_layers] for k in range(n_hierarchies)]
+                z_d = torch.cat(chunks, dim=1)  # [B, ch * n_hierarchies]
                 active = (z_d > 0).float()
                 depth_active_counts[d] += active.sum(dim=-1).sum().item()
                 depth_magnitude_sums[d] += z_d.sum().item()
@@ -251,10 +320,17 @@ def run_taxonomy_analysis(
             if not is_multi:
                 all_logits = encoder.linear(centred)
                 d_logits = torch.split(all_logits, layer_channels, dim=1)
+                is_topk_stage = not hasattr(encoder, "_pairwise_log_softmax")
                 prev_logp = None
                 for d, lg in enumerate(d_logits):
-                    log_cond = encoder._pairwise_log_softmax(lg, encoder.temperature, False)
-                    logp = log_cond if prev_logp is None else log_cond + prev_logp.repeat_interleave(2, dim=1)
+                    if is_topk_stage:
+                        # TopK stage: compute entropy from soft probs directly
+                        probs = encoder._pairwise_softmax(lg, encoder.temperature, False)
+                        probs = probs.clamp(min=1e-8)
+                        logp = probs.log()
+                    else:
+                        logp = encoder._pairwise_log_softmax(lg, encoder.temperature, False)
+                    logp = logp if prev_logp is None else logp + prev_logp.repeat_interleave(2, dim=1)
                     prob = logp.exp()
                     ent = -(prob * logp).sum(dim=1).mean().item()
                     routing_entropy_sum += ent
@@ -267,12 +343,14 @@ def run_taxonomy_analysis(
 
         per_depth = []
         for d, ch in enumerate(layer_channels):
+            total_ch = ch * n_hierarchies
             l0_d = depth_active_counts[d] / total_tokens
             mean_mag = depth_magnitude_sums[d] / max(depth_active_counts[d], 1)
             alive_pct = (depth_firing_any[d] > 0).float().mean().item() * 100
             per_depth.append({
                 "depth": d,
                 "channels": ch,
+                "total_channels": total_ch,
                 "l0": round(l0_d, 3),
                 "mean_magnitude": round(mean_mag, 5),
                 "alive_features_pct": round(alive_pct, 1),
@@ -283,7 +361,7 @@ def run_taxonomy_analysis(
             "d_sae": d_sae,
             "n_taxonomy_layers": n_layers,
             "is_multi_hierarchy": is_multi,
-            "n_hierarchies": len(hierarchies) if is_multi else 1,
+            "n_hierarchies": n_hierarchies,
             "total_tokens": total_tokens,
             "mean_l0_hard_routing": round(mean_l0_hard, 2),
             "mean_l0_soft_routing": round(mean_l0_soft, 2),
@@ -321,6 +399,17 @@ def run_evals(
     output_base: str = "eval_results",
 ) -> None:
     """Run selected SAEBench evaluations."""
+
+    # Pre-create artifacts directories that SAEBench SCR/TPP expects
+    if save_activations and selected_saes:
+        _, first_sae = selected_saes[0]
+        hook_name = getattr(getattr(first_sae, "cfg", None), "hook_name", None)
+        if hook_name:
+            for eval_type in ("scr", "tpp"):
+                os.makedirs(
+                    os.path.join("artifacts", eval_type, model_name, hook_name),
+                    exist_ok=True,
+                )
 
     eval_runners = {
         "absorption": (
@@ -429,11 +518,20 @@ def run_evals(
         if eval_type not in eval_runners:
             print(f"Unknown eval type: {eval_type}, skipping")
             continue
-        print(f"\n{'='*60}")
-        print(f"Running {eval_type} evaluation")
-        print(f"{'='*60}\n")
+        try:
+            print(f"\n{'='*60}")
+            print(f"Running {eval_type} evaluation")
+            print(f"{'='*60}\n")
+        except OSError:
+            pass
         os.makedirs(f"{output_base}/{eval_type}", exist_ok=True)
-        eval_runners[eval_type]()
+        try:
+            eval_runners[eval_type]()
+        except OSError as e:
+            if e.errno in (39, 116):  # 39=Dir not empty (NFS), 116=Stale file handle
+                print(f"  Non-fatal OSError (errno {e.errno}) during {eval_type}, continuing: {e}")
+            else:
+                raise
 
 
 def checkpoint_from_config(config_path: str) -> tuple[str, str, str]:
@@ -444,25 +542,36 @@ def checkpoint_from_config(config_path: str) -> tuple[str, str, str]:
     with open(config_path) as f:
         cfg = json.load(f)
 
-    model_variant = cfg["model"]["model_variant"]       # "taxon_sae" or "multi_taxon_sae"
-    variant = model_variant.replace("_sae", "")          # "taxon" or "multi_taxon"
+    model_variant = cfg["model"]["model_variant"]       # "taxon_sae" / "multi_taxon_sae" / "topk_taxon_sae" / "topk_multi_taxon_sae"
+    variant = model_variant.replace("_sae", "")          # "taxon" / "multi_taxon" / "topk_taxon" / "topk_multi_taxon"
     model_name = cfg["data"]["model_name"]
     output_dir = cfg["output"]["output_dir"]
 
     L = cfg["model"]["n_taxonomy_layers"]
-    dkl = cfg["training"]["dkl_weight"]
     temp = cfg["model"]["temperature"]
     hard = cfg["model"].get("hard", False)
-
-    dkl_suffix = f"_dkl{dkl:.0e}"
     temp_str = f"{temp:g}".replace(".", "p")
     hard_str = "_hard" if hard else ""
 
-    if variant == "multi_taxon":
-        K = cfg["model"]["n_hierarchies"]
-        suffix = f"_L{L}_K{K}{dkl_suffix}_t{temp_str}{hard_str}"
+    is_topk = variant.startswith("topk_")
+
+    if is_topk:
+        # TopK variants: no dkl suffix
+        if variant == "topk_multi_taxon":
+            K = cfg["model"]["n_hierarchies"]
+            gate_k = cfg["model"].get("gate_k", 4)
+            suffix = f"_L{L}_K{K}_gk{gate_k}_t{temp_str}{hard_str}"
+        else:
+            suffix = f"_L{L}_t{temp_str}{hard_str}"
     else:
-        suffix = f"_L{L}{dkl_suffix}_t{temp_str}{hard_str}"
+        # DKL variants
+        dkl = cfg["training"]["dkl_weight"]
+        dkl_suffix = f"_dkl{dkl:.0e}"
+        if variant == "multi_taxon":
+            K = cfg["model"]["n_hierarchies"]
+            suffix = f"_L{L}_K{K}{dkl_suffix}_t{temp_str}{hard_str}"
+        else:
+            suffix = f"_L{L}{dkl_suffix}_t{temp_str}{hard_str}"
 
     checkpoint = f"{output_dir}{suffix}/checkpoints/best.pt"
     return checkpoint, variant, model_name
@@ -477,7 +586,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default="",
                         help="Path to trained TaxonSAE/MultiTaxonSAE checkpoint")
     parser.add_argument("--variant", type=str, default="",
-                        choices=["taxon", "multi_taxon", ""],
+                        choices=["taxon", "multi_taxon", "topk_taxon", "topk_multi_taxon", ""],
                         help="Model variant")
     parser.add_argument("--sae-name", type=str, default="",
                         help="Name for this SAE in results (auto-generated if empty)")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Train TaxonSAE on LLM residual-stream activations using SAEBench conventions.
+"""Train TopKMultiTaxonSAE on LLM residual-stream activations using SAEBench conventions.
 
 Supports two data modes:
   1. Streaming via ActivationsStore (--dataset, runs LLM on-the-fly)
   2. Cached activations (--cached-activations-path, loads .pt chunks from disk)
 
-Loss:  MSE(x_hat, x) + dkl_weight * dkl + entropy_weight * entropy
+Loss:  MSE(x_hat, x) + auxk_weight * auxk_loss
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.saebench.taxon_sae import TaxonSAE
+from src.model.saebench.topk_multi_taxon_sae import TopKMultiTaxonSAE
 
 
 def seed_everything(seed: int) -> None:
@@ -62,34 +62,18 @@ def build_scheduler(
 def remove_gradient_parallel_to_decoder_directions(
     W_dec: torch.Tensor,
 ) -> None:
-    """Project out the gradient component parallel to each decoder row.
-
-    Prevents decoder norms from growing — matches the SAEBench /
-    dictionary_learning training convention.
-    """
     if W_dec.grad is None:
         return
-    # W_dec: [d_sae, d_in], each row is a unit direction
-    # Remove component of grad parallel to the row direction
     parallel = (W_dec.grad * W_dec.data).sum(dim=1, keepdim=True)
     W_dec.grad -= parallel * W_dec.data
 
 
-# ── Cached activation data loader (streaming, one chunk at a time) ─────────
 class CachedActivationLoader:
-    """Streams pre-cached .pt activation chunks from disk one at a time.
-
-    Instead of loading all chunks into RAM (which can exceed memory for
-    large caches), this loader keeps only one chunk resident at a time,
-    shuffles within it, and shuffles the chunk order each epoch.
-    """
-
     def __init__(self, cache_dir: str, batch_size: int, device: torch.device,
                  dtype: torch.dtype, seed: int = 42):
         self.batch_size = batch_size
         self.device = device
         self.dtype = dtype
-        self.seed = seed
 
         self.chunk_files = sorted(glob.glob(os.path.join(cache_dir, "chunk_*.pt")))
         if not self.chunk_files:
@@ -106,14 +90,12 @@ class CachedActivationLoader:
         else:
             self.meta = {}
 
-        # Probe first chunk for shape info
         first = torch.load(self.chunk_files[0], map_location="cpu", weights_only=True)
         self.d_model = first.shape[1]
         self.n_chunks = len(self.chunk_files)
-        n_total = first.shape[0] * self.n_chunks  # approximate
+        n_total = first.shape[0] * self.n_chunks
         print(f"  Streaming loader: {self.n_chunks} chunks, "
-              f"~{n_total:,} vectors of dim {self.d_model} "
-              f"(~{n_total * self.d_model * 4 / 1e9:.1f} GB on disk)")
+              f"~{n_total:,} vectors of dim {self.d_model}")
         del first
 
         self._rng = random.Random(seed)
@@ -125,16 +107,13 @@ class CachedActivationLoader:
         self._load_next_chunk()
 
     def _load_next_chunk(self) -> None:
-        """Load the next chunk from disk and shuffle it."""
         if self._chunk_idx >= self.n_chunks:
-            # New epoch: reshuffle chunk order
             self._rng.shuffle(self._chunk_order)
             self._chunk_idx = 0
         file_idx = self._chunk_order[self._chunk_idx]
         self._current_chunk = torch.load(
             self.chunk_files[file_idx], map_location="cpu", weights_only=True
         )
-        # Shuffle within chunk
         perm = torch.randperm(self._current_chunk.shape[0])
         self._current_chunk = self._current_chunk[perm]
         self._pos = 0
@@ -160,8 +139,8 @@ def save_training_curves(history: dict, output_dir: Path, title: str) -> None:
     panels = [
         ("Total loss", "loss"),
         ("Recon loss (MSE)", "recon"),
-        ("DKL penalty", "dkl"),
-        ("Entropy penalty", "entropy"),
+        ("AuxK loss", "auxk"),
+        ("Dead fraction", "dead_frac"),
         ("L0 sparsity", "l0"),
         ("Alive features (%)", "alive_pct"),
     ]
@@ -194,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train TaxonSAE (SAEBench-compatible)")
+    parser = argparse.ArgumentParser(description="Train TopKMultiTaxonSAE (SAEBench-compatible)")
     parser.add_argument("--config",               type=str,   default="")
     # data
     parser.add_argument("--model-name",           type=str,   default=d.get("model_name", "pythia-160m-deduped"))
@@ -208,20 +187,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cached-activations-path", type=str,
                         default=d.get("cached_activations_path", ""))
     # model
-    parser.add_argument("--n-taxonomy-layers",    type=int,   default=m.get("n_taxonomy_layers", 8))
+    parser.add_argument("--n-taxonomy-layers",    type=int,   default=m.get("n_taxonomy_layers", 6))
+    parser.add_argument("--n-hierarchies",        type=int,   default=m.get("n_hierarchies", 8))
     parser.add_argument("--temperature",          type=float, default=m.get("temperature", 0.5))
     parser.add_argument("--hard",                 action="store_true", default=m.get("hard", False))
     parser.add_argument("--depth-decay",          type=float, default=m.get("depth_decay", 0.5))
+    parser.add_argument("--gate-k",               type=int,   default=m.get("gate_k", 4))
+    parser.add_argument("--k-aux",                type=int,   default=m.get("k_aux", 0),
+                        help="AuxK top-k among dead nodes (0 = auto = half)")
+    parser.add_argument("--dead-steps",           type=int,   default=m.get("dead_steps", 2000))
     # training
     parser.add_argument("--output-dir",           type=str,   default=o.get("output_dir",
-                                                              "./outputs/saebench/taxon_sae"))
+                                                              "./outputs/saebench/topk_multi_taxon_sae"))
     parser.add_argument("--total-steps",          type=int,   default=t.get("total_steps", 0),
                         help="Total training steps (0 = auto from n_tokens / batch_size)")
     parser.add_argument("--learning-rate",        type=float, default=t.get("learning_rate", 3e-4))
     parser.add_argument("--weight-decay",         type=float, default=t.get("weight_decay", 0.0))
     parser.add_argument("--warmup-steps",         type=int,   default=t.get("warmup_steps", 1000))
-    parser.add_argument("--dkl-weight",           type=float, default=t.get("dkl_weight", 1e-2))
-    parser.add_argument("--entropy-weight",       type=float, default=t.get("entropy_weight", 0.0))
+    parser.add_argument("--auxk-weight",          type=float, default=t.get("auxk_weight", 1.0/32))
     parser.add_argument("--save-every",           type=int,   default=t.get("save_every", 5000))
     parser.add_argument("--log-every",            type=int,   default=t.get("log_every", 100))
     parser.add_argument("--seed",                 type=int,   default=t.get("seed", 42))
@@ -239,16 +222,14 @@ def main() -> None:
     dtype = getattr(torch, args.dtype)
     use_cache = bool(args.cached_activations_path)
 
-    # Auto-calculate total_steps from n_tokens / batch_size if not set
     if args.total_steps <= 0:
         args.total_steps = args.n_tokens // args.batch_size
         print(f"Auto total_steps = {args.n_tokens} / {args.batch_size} = {args.total_steps}")
 
     # ── Output directory ────────────────────────────────────────────────
-    dkl_suffix = f"_dkl{args.dkl_weight:.0e}"
     temp_str = f"{args.temperature:g}".replace(".", "p")
     hard_str = "_hard" if args.hard else ""
-    suffix = f"_L{args.n_taxonomy_layers}{dkl_suffix}_t{temp_str}{hard_str}"
+    suffix = f"_L{args.n_taxonomy_layers}_K{args.n_hierarchies}_gk{args.gate_k}_t{temp_str}{hard_str}"
     output_dir = Path(args.output_dir + suffix)
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -272,9 +253,11 @@ def main() -> None:
         print(f"  Model loaded in {time.time() - t0:.1f}s  (d_model={d_model})")
 
     # ── Build SAE ───────────────────────────────────────────────────────
-    sae = TaxonSAE(
+    k_aux_val = args.k_aux if args.k_aux > 0 else None
+    sae = TopKMultiTaxonSAE(
         d_in=d_model,
         n_taxonomy_layers=args.n_taxonomy_layers,
+        n_hierarchies=args.n_hierarchies,
         model_name=args.model_name,
         hook_layer=args.hook_layer,
         device=device,
@@ -282,6 +265,9 @@ def main() -> None:
         temperature=args.temperature,
         hard=args.hard,
         depth_decay=args.depth_decay,
+        gate_k=args.gate_k,
+        k_aux=k_aux_val,
+        dead_steps=args.dead_steps,
         hook_name=hook_name,
     )
 
@@ -327,7 +313,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in sae.parameters() if p.requires_grad)
     print(
         f"\n{'='*60}\n"
-        f"  Training TaxonSAE\n"
+        f"  Training TopKMultiTaxonSAE\n"
         f"{'='*60}\n"
         f"  device      = {device}\n"
         f"  dtype       = {args.dtype}\n"
@@ -335,9 +321,11 @@ def main() -> None:
         f"  d_model     = {d_model}\n"
         f"  d_sae       = {sae.cfg.d_sae}\n"
         f"  n_tax_layers= {args.n_taxonomy_layers}\n"
+        f"  n_hierarchs = {args.n_hierarchies}\n"
+        f"  gate_k      = {args.gate_k}\n"
         f"  temperature = {args.temperature}\n"
-        f"  dkl_weight  = {args.dkl_weight}\n"
-        f"  ent_weight  = {args.entropy_weight}\n"
+        f"  auxk_weight = {args.auxk_weight}\n"
+        f"  dead_steps  = {args.dead_steps}\n"
         f"  total_steps = {args.total_steps}\n"
         f"  batch_size  = {args.batch_size}\n"
         f"  data_source = {'CACHED' if use_cache else 'streaming'}\n"
@@ -345,12 +333,12 @@ def main() -> None:
         f"{'='*60}"
     )
 
-    keys = ["step", "loss", "recon", "dkl", "entropy", "l0", "alive_pct"]
+    keys = ["step", "loss", "recon", "auxk", "dead_frac", "l0", "alive_pct"]
     history: dict = {k: [] for k in keys}
     ckpt_args = sae.get_checkpoint_args()
 
     sae.train()
-    running = {"loss": 0.0, "recon": 0.0, "dkl": 0.0, "entropy": 0.0, "l0": 0.0}
+    running = {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0, "l0": 0.0}
     alive_tracker = torch.zeros(sae.cfg.d_sae, device=device)
     n_avg = 0
     t_start = time.time()
@@ -360,7 +348,6 @@ def main() -> None:
                 file=sys.stdout, mininterval=30)
 
     for step in pbar:
-        # ── Get batch ───────────────────────────────────────────────
         if use_cache:
             x = loader.next_batch()
         else:
@@ -370,16 +357,14 @@ def main() -> None:
 
         x_hat, info = sae.forward_with_loss(x)
         recon_loss = F.mse_loss(x_hat, x)
-        dkl = info["dkl"]
-        entropy = info["entropy"]
-        loss = recon_loss + args.dkl_weight * dkl + args.entropy_weight * entropy
+        dead_frac = info["dead_frac"]
+
+        auxk_loss = sae.compute_auxk_loss(x, x_hat)
+        loss = recon_loss + args.auxk_weight * auxk_loss
 
         loss.backward()
 
-        # Gradient projection: remove component parallel to decoder rows
         remove_gradient_parallel_to_decoder_directions(sae.W_dec)
-
-        # Gradient clipping (matches SAEBench / dictionary_learning)
         torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
 
         optimizer.step()
@@ -388,7 +373,6 @@ def main() -> None:
         if args.normalize_decoder:
             sae.normalize_decoder()
 
-        # ── Track metrics ───────────────────────────────────────────
         with torch.no_grad():
             z = sae.encode(x)
             l0 = (z > 0).float().sum(dim=-1).mean().item()
@@ -396,19 +380,17 @@ def main() -> None:
 
         running["loss"] += loss.item()
         running["recon"] += recon_loss.item()
-        running["dkl"] += dkl.item()
-        running["entropy"] += entropy.item()
+        running["auxk"] += auxk_loss.item()
+        running["dead_frac"] += dead_frac.item()
         running["l0"] += l0
         n_avg += 1
 
-        # ── Progress bar update ─────────────────────────────────────
         pbar.set_postfix_str(
             f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
-            f"dkl={dkl.item():.4f} L0={l0:.0f}",
+            f"auxk={auxk_loss.item():.4f} dead={dead_frac.item():.3f} L0={l0:.0f}",
             refresh=False,
         )
 
-        # ── Periodic logging ────────────────────────────────────────
         if (step + 1) % args.log_every == 0:
             avg = {k: v / max(1, n_avg) for k, v in running.items()}
             alive_pct = (alive_tracker > 0).float().mean().item() * 100
@@ -422,17 +404,17 @@ def main() -> None:
                 tqdm.write(
                     f"[step {step+1:>6d}/{args.total_steps}] "
                     f"lr={lr:.2e}  loss={avg['loss']:.5f}  "
-                    f"recon={avg['recon']:.5f}  dkl={avg['dkl']:.5f}  "
-                    f"ent={avg['entropy']:.5f}  L0={avg['l0']:.1f}  "
+                    f"recon={avg['recon']:.5f}  auxk={avg['auxk']:.5f}  "
+                    f"dead={avg['dead_frac']:.3f}  L0={avg['l0']:.1f}  "
                     f"alive={alive_pct:.1f}%  "
                     f"speed={steps_per_sec:.1f} step/s  "
                     f"ETA={eta_sec/60:.0f}min",
                     file=sys.stdout,
                 )
             except OSError:
-                pass  # stale NFS file handle
+                pass
 
-            for k in ["loss", "recon", "dkl", "entropy", "l0"]:
+            for k in ["loss", "recon", "auxk", "dead_frac", "l0"]:
                 history[k].append(avg[k])
             history["alive_pct"].append(alive_pct)
             history["step"].append(step + 1)
@@ -453,7 +435,6 @@ def main() -> None:
             alive_tracker.zero_()
             n_avg = 0
 
-        # ── Periodic checkpoint ─────────────────────────────────────
         if (step + 1) % args.save_every == 0:
             torch.save({
                 "global_step": step + 1,
@@ -475,7 +456,6 @@ def main() -> None:
 
     pbar.close()
 
-    # ── Final save ──────────────────────────────────────────────────────
     torch.save({
         "global_step": args.total_steps,
         "model_state": sae.state_dict(),
@@ -485,7 +465,7 @@ def main() -> None:
         "args": ckpt_args,
     }, ckpt_dir / "final.pt")
 
-    save_training_curves(history, output_dir, "TaxonSAE")
+    save_training_curves(history, output_dir, "TopKMultiTaxonSAE")
     total_time = time.time() - t_start
     print(
         f"\n{'='*60}\n"
