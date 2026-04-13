@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=compare_cifar10
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/compare_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/compare_cifar10_%j.err
 #SBATCH --partition=overcap
@@ -8,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --time=1:00:00
 #SBATCH --qos=short
 

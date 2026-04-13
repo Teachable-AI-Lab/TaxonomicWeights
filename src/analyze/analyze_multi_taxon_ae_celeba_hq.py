@@ -63,7 +63,7 @@ from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
 from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
 from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
 from src.model.cnn.taxon.encoder import TaxonResNetStage
-from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader, ImageNet1kHFLoader
 
 
 def _detect_multi_taxon_variant(state_dict: dict) -> str:
@@ -1920,6 +1920,12 @@ def _is_cifar(cfg: dict) -> bool:
     """Infer dataset type from the config (image_size==32 -> CIFAR-10)."""
     return cfg.get("data", {}).get("image_size", 256) == 32
 
+
+def _is_imagenet(cfg: dict) -> bool:
+    """Infer ImageNet from config (image_size==224 and data_root contains 'imagenet')."""
+    dc = cfg.get("data", {})
+    return dc.get("image_size", 256) == 224 or "imagenet" in dc.get("data_root", "")
+
 def parse_args() -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
@@ -1933,7 +1939,7 @@ def parse_args() -> argparse.Namespace:
     o = cfg.get("output", {})
     a = cfg.get("analysis", {})
     parser = argparse.ArgumentParser(description="Analyze MultiTaxon AE on CelebA-HQ")
-    parser.add_argument("--config", type=str, default="configs/multi_taxon_ae_celeba_hq.json")
+    parser.add_argument("--config", type=str, default="")
     parser.add_argument("--checkpoint", type=str, default="",
                         help="Override checkpoint path; derived from output_dir+run_suffix if omitted")
     parser.add_argument("--output-dir", type=str,
@@ -1964,6 +1970,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-split-images",      type=int, default=a.get("num_split_map_images", 4))
     parser.add_argument("--max-split-pairs",     type=int, default=a.get("max_split_pairs", 8))
     parser.add_argument("--seed", type=int, default=t.get("seed", 42))
+    parser.add_argument("--skip-partonomy", action="store_true",
+                        help="Skip the partonomy sparsity suite (section B5).")
     return parser.parse_args()
 
 
@@ -2015,6 +2023,21 @@ def main() -> None:
 
     if _is_cifar(config):
         data_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
+        _, val_loader = data_loader.get_loaders()
+    elif _is_imagenet(config) or args.image_size == 224 or "imagenet" in str(args.data_root):
+        tf = transforms.Compose([
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        data_loader = ImageNet1kHFLoader(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            image_size=args.image_size,
+            pin_memory=(device.type == "cuda"),
+            transform=tf,
+            max_train_samples=1,
+        )
         _, val_loader = data_loader.get_loaders()
     else:
         tf = transforms.Compose([
@@ -2091,7 +2114,10 @@ def main() -> None:
                             num_batches=args.n_latent_batches)
 
     print("\n[B5] Partonomy sparsity suite")
-    analyze_partonomy_sparsity(model, val_loader, device, save_dir)
+    if args.skip_partonomy:
+        print("  Skipped (--skip-partonomy).")
+    else:
+        analyze_partonomy_sparsity(model, val_loader, device, save_dir)
 
     if vanilla:
         print("\n[C1] Gate distributions")

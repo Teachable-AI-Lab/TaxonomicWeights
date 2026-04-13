@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
 from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
 from src.model.cnn.taxon.topk_taxon_ae import TopKTaxonAutoencoder
 from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
-from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader, ImageNet1kHFLoader
 from torchvision import transforms
 
 
@@ -60,6 +60,12 @@ def _has_vanilla_taxonomy(model) -> bool:
 def _is_cifar(cfg: dict) -> bool:
     """Infer dataset type from the config (image_size==32 -> CIFAR-10)."""
     return cfg.get("data", {}).get("image_size", 256) == 32
+
+
+def _is_imagenet(cfg: dict) -> bool:
+    """Infer ImageNet from config (image_size==224 and data_root contains 'imagenet')."""
+    dc = cfg.get("data", {})
+    return dc.get("image_size", 256) == 224 or "imagenet" in dc.get("data_root", "")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -1910,6 +1916,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--skip-partonomy", action="store_true",
+                        help="Skip the partonomy sparsity suite (section 6).")
     return parser.parse_args()
 
 
@@ -1961,10 +1969,15 @@ def main() -> None:
                 else os.path.join(save_dir_prefix, datetime.now().strftime("%Y%m%d_%H%M%S")))
     os.makedirs(save_dir, exist_ok=True)
 
-    # If checkpoint_path contains the base output_dir, patch in the dkl suffix too.
-    checkpoint_path = args.checkpoint or analysis_cfg.get("checkpoint_path")
-    if checkpoint_path and run_suffix and out_base and checkpoint_path.startswith(out_base):
-        checkpoint_path = out_base + run_suffix + checkpoint_path[len(out_base):]
+    # If checkpoint_path comes from the config (not explicitly provided), patch
+    # in the dkl/temp/etc. suffix so it points at the correct run sub-directory.
+    checkpoint_path = args.checkpoint or None
+    if checkpoint_path is None:
+        cfg_ckpt = analysis_cfg.get("checkpoint_path")
+        if cfg_ckpt and run_suffix and out_base and cfg_ckpt.startswith(out_base):
+            checkpoint_path = out_base + run_suffix + cfg_ckpt[len(out_base):]
+        else:
+            checkpoint_path = cfg_ckpt
     if not checkpoint_path:
         raise ValueError(
             "Provide checkpoint_path via --checkpoint or config['analysis']['checkpoint_path']"
@@ -1987,6 +2000,22 @@ def main() -> None:
             root=data_root,
         )
         _, eval_loader = loader.get_loaders()
+    elif _is_imagenet(config) or image_size == 224 or "imagenet" in str(data_root):
+        tf = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        loader = ImageNet1kHFLoader(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            image_size=image_size,
+            pin_memory=(device.type == "cuda"),
+            transform=tf,
+            max_train_samples=1,
+        )
+        _, val_loader = loader.get_loaders()
+        eval_loader = val_loader
     else:
         normalize = data_cfg.get("normalize", True)   # default: same normalization as training
         if normalize:
@@ -2065,7 +2094,10 @@ def main() -> None:
                                        normalized=normalize)
 
     print("\n" + "=" * 80 + "\n6. Partonomy Sparsity Suite\n" + "=" * 80)
-    analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
+    if args.skip_partonomy:
+        print("  Skipped (--skip-partonomy).")
+    else:
+        analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
 
     print("\n" + "=" * 80 + "\n7. Encoder Stage Activation Maps\n" + "=" * 80)
     visualize_stage_activations(model, eval_loader, device, save_dir, num_images=num_act_images,

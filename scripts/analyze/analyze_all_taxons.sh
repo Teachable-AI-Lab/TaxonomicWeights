@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=analyze_all_taxons
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/analyze_all_taxons_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_all_taxons_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=1-00:00:00
@@ -38,6 +39,6 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_all_taxons (job ${SLURM_JOB_ID:-local})"
 
-python src/analyze/analyze_all.py --taxon-only --skip-existing $EXTRA_ARGS
+python src/analyze/analyze_all.py --taxon-only --skip-existing --skip-partonomy $EXTRA_ARGS
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished analyze_all_taxons (job ${SLURM_JOB_ID:-local})"

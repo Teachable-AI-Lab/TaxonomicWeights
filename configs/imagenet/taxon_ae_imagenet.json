@@ -1,0 +1,53 @@
+{
+  "experiment_name": "taxon_ae_imagenet_r18",
+  "data": {
+    "data_root": "./data/imagenet",
+    "image_size": 224,
+    "batch_size": 32,
+    "num_workers": 8,
+    "val_split": 0.0,
+    "max_train_samples": 100000,
+    "max_val_samples": 10000
+  },
+  "model": {
+    "in_channels": 3,
+    "resnet_variant": "18",
+    "stage_taxonomy_layers": [
+      5,
+      6,
+      7,
+      8
+    ],
+    "stage_strides": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "stage_blocks": null,
+    "temperature": 0.5,
+    "hard": false,
+    "kernel_size": 3,
+    "use_stem": true,
+    "stem_channels": 64,
+    "stem_stride": 2,
+    "use_stem_maxpool": true,
+    "output_activation": "none",
+    "depth_decay": 0.5
+  },
+  "training": {
+    "epochs": 90,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "warmup_epochs": 3,
+    "dkl_weight": 0.01,
+    "entropy_weight": 0.0,
+    "save_every": 5,
+    "seed": 42,
+    "max_train_steps": 0
+  },
+  "output": {
+    "output_dir": "./outputs/imagenet/taxon_ae_imagenet_r18",
+    "analysis_save_dir": "./outputs/imagenet/taxon_ae_imagenet_r18/analysis"
+  }
+}

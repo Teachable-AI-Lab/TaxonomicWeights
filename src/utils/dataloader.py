@@ -1,3 +1,4 @@
+import os
 import torch
 import random
 import numpy as np
@@ -359,6 +360,110 @@ class CelebAHQLoader:
                 pin_memory=self.pin_memory,
                 drop_last=False,
             )
+
+    def get_loaders(self):
+        return self.train_loader, self.val_loader
+
+
+class ImageNet1kHFLoader:
+    """
+    DataLoader wrapper for ImageNet-1k using HuggingFace ``datasets``.
+
+    Downloads/caches the ``imagenet-1k`` dataset via HF hub and wraps it
+    in standard PyTorch DataLoaders with [-1,1] normalisation (consistent
+    with the rest of the autoencoder training pipeline).
+
+    Requires ``pip install datasets`` and a valid HF token with ImageNet
+    access (set ``HF_TOKEN`` env-var or ``huggingface-cli login``).
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 32,
+        num_workers: int = 8,
+        image_size: int = 224,
+        pin_memory: bool = True,
+        cache_dir: str | None = None,
+        transform=None,
+        max_train_samples: int | None = None,
+        max_val_samples: int | None = None,
+    ):
+        from datasets import load_dataset
+        from PIL import Image
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ])
+
+        kwargs = {}
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        else:
+            # Default: cache inside the repo's data/ directory
+            kwargs["cache_dir"] = str(Path(__file__).parent.parent.parent / "data" / "imagenet")
+
+        # Point HuggingFace hub download cache to the same location so raw
+        # parquet shards don't land in ~/.cache/huggingface/hub.
+        # setdefault preserves any user-supplied override via env var.
+        _hub_cache = str(Path(kwargs["cache_dir"]) / "hub")
+        os.environ.setdefault("HF_HUB_CACHE", _hub_cache)
+        os.environ.setdefault("HF_DATASETS_CACHE", kwargs["cache_dir"])
+
+        token = os.environ.get("HF_TOKEN")
+        if token is None:
+            _token_file = Path(__file__).parent.parent.parent / "hf_token"
+            if _token_file.exists():
+                token = _token_file.read_text().strip()
+        if token is None:
+            token = True  # fall back to huggingface-cli login credentials
+
+        # Use split-slicing to avoid downloading more data than needed.
+        train_split = f"train[:{max_train_samples}]" if max_train_samples else "train"
+        val_split = f"validation[:{max_val_samples}]" if max_val_samples else "validation"
+        ds = load_dataset("imagenet-1k", split=[train_split, val_split], token=token, **kwargs)
+        train_ds, val_ds = ds
+
+        class _HFImageDataset(Dataset):
+            def __init__(self, hf_split, tfm):
+                self.hf = hf_split
+                self.tfm = tfm
+            def __len__(self):
+                return len(self.hf)
+            def __getitem__(self, idx):
+                item = self.hf[idx]
+                img = item["image"]
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                return self.tfm(img), item["label"]
+
+        self.trainset = _HFImageDataset(train_ds, self.transform)
+        self.valset = _HFImageDataset(val_ds, self.transform)
+
+        self.train_loader = DataLoader(
+            self.trainset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+        self.val_loader = DataLoader(
+            self.valset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
 
     def get_loaders(self):
         return self.train_loader, self.val_loader

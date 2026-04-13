@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=cache_pythia160m
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/cache_pythia160m_%j.out
 #SBATCH --error=slurm/slurm_errors/cache_pythia160m_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=0-12:00:00

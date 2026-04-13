@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=analyze_multi_taxon_ae_celeba_hq
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/analyze_multi_taxon_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_multi_taxon_ae_celeba_hq_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=long
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=0-02:00:00

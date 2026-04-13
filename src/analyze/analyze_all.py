@@ -82,6 +82,8 @@ def _infer_data_params(run_name: str, a: dict) -> dict:
     directory-name heuristics."""
     if "cifar10" in run_name.lower():
         default_root, default_size = "./data", 32
+    elif "imagenet" in run_name.lower():
+        default_root, default_size = "./data/imagenet", 224
     else:
         default_root, default_size = "./data/celeba_hq", 256
 
@@ -178,7 +180,8 @@ def _cleanup_temp(cmd: List[str]) -> None:
                 pass
 
 
-def run_one(run_dir: Path, model_type: str, dry_run: bool = False) -> bool:
+def run_one(run_dir: Path, model_type: str, dry_run: bool = False,
+            skip_partonomy: bool = False) -> bool:
     """Build the subprocess command for one run directory and optionally execute it.
 
     Returns True on success or dry-run, False on checkpoint-not-found or
@@ -203,7 +206,8 @@ def run_one(run_dir: Path, model_type: str, dry_run: bool = False) -> bool:
         cmd = [
             sys.executable,
             str(ROOT / "src" / "analyze" / "analyze_celeba_hq_ae.py"),
-            "--config", cfg_path,
+            "--config",     cfg_path,
+            "--checkpoint", str(ckpt_path),
         ]
 
     elif model_type == "multi_taxon":
@@ -264,7 +268,8 @@ def run_one(run_dir: Path, model_type: str, dry_run: bool = False) -> bool:
         cmd = [
             sys.executable,
             str(ROOT / "src" / "analyze" / "analyze_topk_taxon_ae_celeba_hq.py"),
-            "--config", cfg_path,
+            "--config",     cfg_path,
+            "--checkpoint", str(ckpt_path),
             "--output-dir", cfg["output"]["output_dir"],
             "--k", str(a.get("k", "")),
             "--auxk-weight", str(a.get("auxk_weight", 0.0)),
@@ -285,7 +290,8 @@ def run_one(run_dir: Path, model_type: str, dry_run: bool = False) -> bool:
         cmd = [
             sys.executable,
             str(ROOT / "src" / "analyze" / "analyze_bias_taxon_ae_celeba_hq.py"),
-            "--config", cfg_path,
+            "--config",     cfg_path,
+            "--checkpoint", str(ckpt_path),
             "--output-dir", cfg["output"]["output_dir"],
             "--bias-update-rate", str(a.get("bias_update_rate", 0.001)),
         ]
@@ -363,6 +369,9 @@ def run_one(run_dir: Path, model_type: str, dry_run: bool = False) -> bool:
         print(f"  SKIP: unrecognised model type '{model_type}'.")
         return False
 
+    if skip_partonomy:
+        cmd.append("--skip-partonomy")
+
     print(f"  Command: {' '.join(cmd)}")
     if dry_run:
         print("  DRY RUN — not executing.")
@@ -396,6 +405,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dry-run", action="store_true",
         help="Print commands without executing them.",
+    )
+    p.add_argument(
+        "--skip-partonomy", action="store_true",
+        help="Pass --skip-partonomy to every taxon analyze script.",
     )
     return p.parse_args()
 
@@ -453,7 +466,8 @@ def main() -> None:
             skipped.append(run_dir.name)
             continue
 
-        ok = run_one(run_dir, model_type, dry_run=args.dry_run)
+        ok = run_one(run_dir, model_type, dry_run=args.dry_run,
+                     skip_partonomy=args.skip_partonomy)
         (successes if ok else failures).append(run_dir.name)
 
     print(f"\n{'=' * 72}")

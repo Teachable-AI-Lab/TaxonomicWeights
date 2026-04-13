@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader, ImageNet1kHFLoader
 
 # Reuse all analysis functions from the vanilla script
 from src.analyze.analyze_celeba_hq_ae import (
@@ -47,6 +47,12 @@ from src.analyze.analyze_celeba_hq_ae import (
 def _is_cifar(cfg: dict) -> bool:
     """Infer dataset type from the config (image_size==32 -> CIFAR-10)."""
     return cfg.get("data", {}).get("image_size", 256) == 32
+
+
+def _is_imagenet(cfg: dict) -> bool:
+    """Infer ImageNet from config (image_size==224 and data_root contains 'imagenet')."""
+    dc = cfg.get("data", {})
+    return dc.get("image_size", 256) == 224 or "imagenet" in dc.get("data_root", "")
 
 def parse_args() -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
@@ -86,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-hier-depth", type=int, default=a.get("max_hier_act_depth", 4))
     parser.add_argument("--n-split-images", type=int, default=a.get("num_split_map_images", 4))
     parser.add_argument("--max-split-pairs", type=int, default=a.get("max_split_pairs", 8))
+    parser.add_argument("--skip-partonomy", action="store_true",
+                        help="Skip the partonomy sparsity suite (section 6).")
     return parser.parse_args()
 
 
@@ -120,6 +128,22 @@ def main() -> None:
     if _is_cifar(config):
         loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
         _, eval_loader = loader.get_loaders()
+    elif _is_imagenet(config) or args.image_size == 224 or "imagenet" in str(args.data_root):
+        tf = transforms.Compose([
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        loader = ImageNet1kHFLoader(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            image_size=args.image_size,
+            pin_memory=(device.type == "cuda"),
+            transform=tf,
+            max_train_samples=1,
+        )
+        _, val_loader = loader.get_loaders()
+        eval_loader = val_loader
     else:
         tf = transforms.Compose([
             transforms.Resize((args.image_size, args.image_size)),
@@ -186,7 +210,10 @@ def main() -> None:
                                        num_sets=args.n_recon_sets)
 
     print("\n[6] Partonomy sparsity suite")
-    analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
+    if args.skip_partonomy:
+        print("  Skipped (--skip-partonomy).")
+    else:
+        analyze_partonomy_sparsity(model, eval_loader, device, save_dir)
 
     print("\n[7] Stage activation maps")
     visualize_stage_activations(model, eval_loader, device, save_dir,

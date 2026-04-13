@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=train_baseline_celeba_hq
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/train_baseline_ae_celeba_hq_%j.out
 #SBATCH --error=slurm/slurm_errors/train_baseline_ae_celeba_hq_%j.err
 #SBATCH --partition=overcap
@@ -8,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --qos=short
 

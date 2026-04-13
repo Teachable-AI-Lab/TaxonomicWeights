@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=train_gated_sae_cifar10
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/train_gated_sae_cifar10_%j.out
 #SBATCH --error=slurm/slurm_errors/train_gated_sae_cifar10_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=12:00:00

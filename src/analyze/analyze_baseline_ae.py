@@ -43,7 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
-from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader
+from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader, ImageNet1kHFLoader
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +163,12 @@ def _is_cifar(cfg: dict) -> bool:
     return cfg.get("data", {}).get("image_size", 256) == 32
 
 
+def _is_imagenet(cfg: dict) -> bool:
+    """Infer ImageNet from config (image_size==224 and data_root contains 'imagenet')."""
+    dc = cfg.get("data", {})
+    return dc.get("image_size", 256) == 224 or "imagenet" in dc.get("data_root", "")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analyze a trained BaselineConvAutoencoder")
     p.add_argument("--config",      type=str, required=True,
@@ -197,7 +203,17 @@ def main() -> None:
     model = load_model(ckpt_path, device)
 
     dc = cfg.get("data", {})
-    if not _is_cifar(cfg):
+    if _is_imagenet(cfg):
+        image_size = dc.get("image_size", 224)
+        loader_obj = ImageNet1kHFLoader(
+            batch_size=dc.get("batch_size", 32),
+            num_workers=dc.get("num_workers", 8),
+            image_size=image_size,
+            pin_memory=(device.type == "cuda"),
+        )
+        _, eval_loader = loader_obj.get_loaders()
+        dataset_name = "imagenet"
+    elif not _is_cifar(cfg):
         image_size = dc.get("image_size", 256)
         tf = transforms.Compose([
             transforms.Resize((image_size, image_size)),

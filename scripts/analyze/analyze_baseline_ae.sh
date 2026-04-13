@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=analyze_baseline_ae
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/analyze_baseline_ae_%j.out
 #SBATCH --error=slurm/slurm_errors/analyze_baseline_ae_%j.err
 #SBATCH --partition=overcap
@@ -8,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:a40:1
+#SBATCH --gres=gpu:1
 #SBATCH --time=2:00:00
 #SBATCH --qos=short
 
