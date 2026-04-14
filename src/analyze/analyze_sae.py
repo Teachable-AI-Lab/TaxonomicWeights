@@ -58,6 +58,8 @@ from src.model.cnn.baseline.sae import SparseConvAutoencoder
 from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
 from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
 from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
+from src.model.cnn.baseline.matryoshka_batch_topk_sae import MatryoshkaBatchTopKSparseConvAutoencoder
+from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
 from src.utils.dataloader import CelebAHQLoader, CIFAR10Loader, ImageNet1kHFLoader
 
 
@@ -83,6 +85,17 @@ def _training_output_dir_suffix(cfg: dict) -> str:
     variant = mc.get("model_variant", "l1")
     sw  = tc.get("sparsity_weight", 1e-3)
 
+    if variant == "matryoshka_batch_topk":
+        k_vals = sorted(mc.get("k_values", [64, 32, 16]), reverse=True)
+        k_str = "-".join(str(k) for k in k_vals)
+        return f"_k{k_str}_sw{sw:.0e}"
+    if variant == "softmax_sae":
+        dw = float(mc.get("dkl_weight", tc.get("dkl_weight", 1e-2)))
+        temperature = float(mc.get("temperature", 1.0))
+        temp_str = f"{temperature:g}".replace(".", "p")
+        ew = float(mc.get("entropy_weight", tc.get("entropy_weight", 0.0)))
+        ew_suffix = f"_ew_{ew:.0e}" if ew else ""
+        return f"_dkl_{dw:.0e}_temp_{temp_str}{ew_suffix}"
     if variant == "topk":
         k = mc.get("topk_k", 64)
         return f"_k{k}_sw{sw:.0e}"
@@ -137,7 +150,24 @@ def load_model(ckpt_path: Path, device: torch.device) -> nn.Module:
         output_activation=a.get("output_activation", "none"),
     )
 
-    if variant == "topk":
+    if variant == "matryoshka_batch_topk":
+        k_vals = sorted(a.get("k_values", [64, 32, 16]), reverse=True)
+        model = MatryoshkaBatchTopKSparseConvAutoencoder(
+            **common,
+            k_values=k_vals,
+            k_aux=a.get("k_aux", None),
+            use_aux_loss=False,
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+        k_str = "-".join(str(k) for k in k_vals)
+        print(f"  variant=matryoshka_batch_topk  k_values={k_vals}")
+    elif variant == "softmax_sae":
+        model = SoftmaxSparseConvAutoencoder(
+            **common,
+            temperature=a.get("temperature", 1.0),
+        )
+        print(f"  variant=softmax_sae  temperature={a.get('temperature', 1.0)}")
+    elif variant == "topk":
         model = TopKSparseConvAutoencoder(
             **common,
             topk_k=a.get("topk_k", 64),
@@ -206,7 +236,8 @@ def compute_metrics(
             break
         imgs = imgs.to(device)
 
-        recon, sp_loss = model(imgs)
+        out = model(imgs)
+        recon, sp_loss = out[0], out[1]
         z, _           = model.encode(imgs)
 
         # Reconstruction metrics (per sample)
@@ -353,7 +384,8 @@ def analyze_latent_sparsity(
             break
         imgs = imgs.to(device)
         z, _ = model.encode(imgs)
-        _, sp = model(imgs)
+        _out = model(imgs)
+        sp = _out[1]
         all_latents.append(z.detach().cpu().numpy().reshape(z.shape[0], -1))
         all_sp_loss.append(float(sp.detach().cpu()))
 
@@ -487,7 +519,7 @@ def analyze_reconstruction_quality(
         if b_idx >= num_batches:
             break
         imgs = imgs.to(device)
-        recon, _ = model(imgs)
+        recon = model(imgs)[0]
         all_mse.extend(((imgs - recon) ** 2).mean(dim=(1, 2, 3)).cpu().numpy())
         all_mae.extend(torch.abs(imgs - recon).mean(dim=(1, 2, 3)).cpu().numpy())
 
@@ -550,7 +582,7 @@ def visualize_multiple_reconstructions(
         except StopIteration:
             break
         imgs  = imgs[:num_images].to(device)
-        recon, _ = model(imgs)
+        recon = model(imgs)[0]
         recon = recon.clamp(-1, 1)
         n = imgs.shape[0]
 
@@ -949,7 +981,7 @@ def visualize_stage_activations(
 
         # ── reconstruction ───────────────────────────────────────────────
         with torch.no_grad():
-            recon, _ = model(img_t)
+            recon = model(img_t)[0]
         recon_np = denorm(recon[0])
 
         # ── composite summary figure ─────────────────────────────────────

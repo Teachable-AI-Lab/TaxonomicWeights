@@ -5,13 +5,13 @@
 #SBATCH --error=slurm/slurm_errors/compare_imagenet_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
+#SBATCH --qos=short
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a40:1
 #SBATCH --time=1:00:00
-#SBATCH --qos=short
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

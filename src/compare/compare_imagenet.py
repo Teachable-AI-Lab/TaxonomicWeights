@@ -60,6 +60,8 @@ from src.model.cnn.baseline.sae import SparseConvAutoencoder
 from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
 from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
 from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
+from src.model.cnn.baseline.matryoshka_batch_topk_sae import MatryoshkaBatchTopKSparseConvAutoencoder
+from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
 from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
 from src.utils.dataloader import ImageNet1kHFLoader
 
@@ -131,6 +133,12 @@ def model_colour(model_type: str, idx: int) -> str:
         return _GATED_SAE_PALETTE[idx % len(_GATED_SAE_PALETTE)]
     if model_type == "jumprelu_sae":
         return _JUMPRELU_SAE_PALETTE[idx % len(_JUMPRELU_SAE_PALETTE)]
+    if model_type == "matryoshka_batch_topk_sae":
+        _MAT_PALETTE = ["#1a9850", "#66c2a5", "#abdda4"]
+        return _MAT_PALETTE[idx % len(_MAT_PALETTE)]
+    if model_type == "softmax_sae":
+        _SOFTMAX_PALETTE = ["#f4a261", "#e76f51", "#e9c46a"]
+        return _SOFTMAX_PALETTE[idx % len(_SOFTMAX_PALETTE)]
     return _BASELINE_PALETTE[idx % len(_BASELINE_PALETTE)]
 
 
@@ -143,6 +151,8 @@ def _short_name(run_dir: str) -> str:
                    "multi_taxon_ae_imagenet_r18_",
                    "topk_taxon_ae_imagenet_r18_", "bias_taxon_ae_imagenet_r18_",
                    "taxon_ae_imagenet_r18_", "sae_jumprelu_imagenet_r18_",
+                   "sae_matryoshka_batch_topk_imagenet_r18_",
+                   "sae_softmax_imagenet_r18_",
                    "sae_topk_imagenet_r18_", "sae_gated_imagenet_r18_",
                    "sae_imagenet_r18_",       "taxon_ae_imagenet_r18_",   "sae_imagenet_r18_",
                    "baseline_ae_imagenet_r18", "baseline_ae_imagenet",
@@ -164,6 +174,10 @@ def _model_type(run_dir: str) -> str:
         return "topk_taxon"
     if run_dir.startswith("bias_taxon_"):
         return "bias_taxon"
+    if run_dir.startswith("sae_matryoshka_batch_topk_"):
+        return "matryoshka_batch_topk_sae"
+    if run_dir.startswith("sae_softmax_"):
+        return "softmax_sae"
     if run_dir.startswith("sae_jumprelu_"):
         return "jumprelu_sae"
     if run_dir.startswith("sae_topk_"):
@@ -205,7 +219,7 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
             "history":   run_path / "training_history.json",
             "analysis":  run_path / "analysis",
         })
-    runs.sort(key=lambda r: ({"taxon": 0, "multi_taxon": 1, "topk_taxon": 2, "topk_multi_taxon": 3, "bias_taxon": 4, "bias_multi_taxon": 5, "sae": 6, "topk_sae": 7, "gated_sae": 8, "jumprelu_sae": 9, "baseline": 10}.get(r["type"], 99), r["name"]))
+    runs.sort(key=lambda r: ({"taxon": 0, "multi_taxon": 1, "topk_taxon": 2, "topk_multi_taxon": 3, "bias_taxon": 4, "bias_multi_taxon": 5, "sae": 6, "topk_sae": 7, "gated_sae": 8, "jumprelu_sae": 9, "matryoshka_batch_topk_sae": 10, "softmax_sae": 11, "baseline": 12}.get(r["type"], 99), r["name"]))
     type_counters: Dict[str, int] = {}
     for r in runs:
         idx = type_counters.get(r["type"], 0)
@@ -366,7 +380,21 @@ def load_sae_model(ckpt_path: Path, device: torch.device):
         output_activation=a.get("output_activation", "none"),
     )
 
-    if variant == "topk":
+    if variant == "matryoshka_batch_topk":
+        k_vals = sorted(a.get("k_values", [64, 32, 16]), reverse=True)
+        model = MatryoshkaBatchTopKSparseConvAutoencoder(
+            **common,
+            k_values=k_vals,
+            k_aux=a.get("k_aux", None),
+            use_aux_loss=False,
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+    elif variant == "softmax_sae":
+        model = SoftmaxSparseConvAutoencoder(
+            **common,
+            temperature=a.get("temperature", 1.0),
+        )
+    elif variant == "topk":
         model = TopKSparseConvAutoencoder(
             **common,
             topk_k=a.get("topk_k", 64),
@@ -432,7 +460,7 @@ def load_model(run: Dict, device: torch.device):
         return load_bias_multi_taxon_model(run["best_ckpt"], device)
     if run["type"] == "taxon":
         return load_taxon_model(run["best_ckpt"], device)
-    if run["type"] in {"sae", "topk_sae", "gated_sae", "jumprelu_sae"}:
+    if run["type"] in {"sae", "topk_sae", "gated_sae", "jumprelu_sae", "matryoshka_batch_topk_sae", "softmax_sae"}:
         return load_sae_model(run["best_ckpt"], device)
     return load_baseline_model(run["best_ckpt"], device)
 
@@ -466,6 +494,8 @@ def compute_live_metrics(
             recon, _ = model(imgs)
         elif run["type"] == "bias_multi_taxon":
             (recon,) = model(imgs)
+        elif run["type"] == "softmax_sae":
+            recon, _, _ = model(imgs)
         else:
             recon, _    = model(imgs)
         z, _ = model.encode(imgs)
@@ -600,6 +630,8 @@ def collect_reconstructions(
             recon, _ = model(imgs)
         elif run["type"] == "bias_multi_taxon":
             (recon,) = model(imgs)
+        elif run["type"] == "softmax_sae":
+            recon, _, _ = model(imgs)
         else:
             recon, _ = model(imgs)
     origs  = np.stack([_to_display(imgs[i: i+1])  for i in range(n_images)])

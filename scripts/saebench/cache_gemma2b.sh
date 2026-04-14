@@ -6,7 +6,7 @@
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
 #SBATCH --qos=short
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=0-24:00:00

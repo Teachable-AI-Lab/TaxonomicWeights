@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Train TaxonAutoencoder on CIFAR-10 with a ResNet-18 stage layout.
+"""Train SoftmaxSparseConvAutoencoder on ImageNet-1k with a ResNet-18 stage layout.
 
-Same structure as src/train/train_taxon_ae_celeba_hq.py but uses CIFAR10Loader
-and defaults suited to 32×32 images (stem_stride=1, no max-pool, larger batches).
+Uses the same softmax gating + DKL/entropy regularization as TaxonAutoencoder
+but without any hierarchical tree structure.  This is the direct ablation to
+test whether the taxonomic inductive bias adds value beyond the penalty alone.
 
-Loss:
+Loss::
+
     total = MSE(recon, x) + dkl_weight * dkl + entropy_weight * entropy
 """
 
@@ -25,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
 
 import sys
@@ -34,8 +36,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
-from src.utils.dataloader import CIFAR10Loader
+from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
+from src.utils.dataloader import ImageNet1kHFLoader
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +74,6 @@ def run_validation(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    hard: bool,
     dkl_weight: float,
     entropy_weight: float,
 ) -> dict:
@@ -82,7 +83,7 @@ def run_validation(
 
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        recon, dkl, entropy = model(images, hard=hard)
+        recon, dkl, entropy = model(images)
         recon_loss = F.mse_loss(recon, images)
         loss = recon_loss + dkl_weight * dkl + entropy_weight * entropy
 
@@ -108,7 +109,6 @@ def save_recon_preview(
     loader: DataLoader,
     device: torch.device,
     save_path: Path,
-    hard: bool,
     num_images: int = 8,
 ) -> None:
     model.eval()
@@ -116,9 +116,9 @@ def save_recon_preview(
     images = images[:num_images].to(device)
 
     with torch.no_grad():
-        recon, _, _ = model(images, hard=hard)
+        recon, _, _ = model(images)
 
-    # CIFAR10Loader normalises to [-1, 1] — undo here.
+    # ImageNet1kHFLoader normalises to [-1, 1] — undo here.
     vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
     vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
 
@@ -128,7 +128,6 @@ def save_recon_preview(
 
 
 def save_training_curves(history: dict, output_dir: Path) -> None:
-    """Save loss/DKL/entropy training curves and raw JSON history."""
     epochs = history["epochs"]
     if not epochs:
         return
@@ -159,7 +158,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
                        label=f"best val (ep {best_ep})")
             ax.legend(fontsize=8)
 
-    plt.suptitle("Taxon AE CIFAR-10 training curves", fontsize=13, fontweight="bold")
+    plt.suptitle("Softmax SAE ImageNet-1k training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
     out_path = output_dir / "training_curves.png"
@@ -187,35 +186,43 @@ def parse_args() -> argparse.Namespace:
     t = cfg.get("training", {})
     o = cfg.get("output", {})
 
-    parser = argparse.ArgumentParser(description="Train Taxon ResNet-18 AE on CIFAR-10")
+    parser = argparse.ArgumentParser(description="Train Softmax SAE on ImageNet-1k")
     parser.add_argument("--config", type=str, default="")
     # data
-    parser.add_argument("--data-root",   type=str,   default=d.get("data_root",   "./data"))
-    parser.add_argument("--output-dir",  type=str,   default=o.get("output_dir",  "./outputs/taxon_ae_cifar10"))
-    parser.add_argument("--image-size",  type=int,   default=d.get("image_size",  32))
-    parser.add_argument("--batch-size",  type=int,   default=d.get("batch_size",  128))
-    parser.add_argument("--num-workers", type=int,   default=d.get("num_workers", 4))
-    parser.add_argument("--val-split",   type=float, default=d.get("val_split",   0.1))
+    parser.add_argument("--data-root",   type=str,   default=d.get("data_root", "./data/imagenet"))
+    parser.add_argument("--output-dir",  type=str,   default=o.get("output_dir", "./outputs/imagenet/sae_softmax_imagenet_r18"))
+    parser.add_argument("--image-size",  type=int,   default=d.get("image_size", 224))
+    parser.add_argument("--batch-size",  type=int,   default=d.get("batch_size", 32))
+    parser.add_argument("--num-workers", type=int,   default=d.get("num_workers", 8))
+    parser.add_argument("--val-split",   type=float, default=d.get("val_split", 0.0))
+    parser.add_argument("--max-train-samples", type=int, default=d.get("max_train_samples"),
+                        help="Limit training set size (None = full dataset)")
+    parser.add_argument("--max-val-samples",   type=int, default=d.get("max_val_samples"),
+                        help="Limit validation set size (None = full dataset)")
     # model
     parser.add_argument("--resnet-variant", type=str, default=m.get("resnet_variant", "18"))
-    parser.add_argument("--stage-taxonomy-layers", type=int, nargs=4,
-                        default=m.get("stage_taxonomy_layers", [5, 6, 7, 8]))
-    parser.add_argument("--stage-strides", type=int, nargs=4,
-                        default=m.get("stage_strides", [1, 2, 2, 2]))
-    parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
-    parser.add_argument("--hard", action="store_true", default=m.get("hard", False),
-                        help="Use hard straight-through routing in taxonomy softmax")
+    parser.add_argument("--stage-channels", type=int, nargs=4,
+                        default=m.get("stage_channels", [64, 128, 256, 512]))
+    parser.add_argument("--stage-strides",  type=int, nargs=4,
+                        default=m.get("stage_strides", [2, 2, 2, 2]))
+    parser.add_argument("--temperature",    type=float, default=m.get("temperature", 1.0),
+                        help="Softmax temperature (lower = sparser latent)")
+    parser.add_argument("--stem-stride",    type=int,   default=m.get("stem_stride", 2))
+    parser.add_argument("--use-stem-maxpool", action="store_true",
+                        default=m.get("use_stem_maxpool", True))
     # training
     parser.add_argument("--epochs",          type=int,   default=t.get("epochs",          90))
     parser.add_argument("--learning-rate",   type=float, default=t.get("learning_rate",   3e-4))
     parser.add_argument("--weight-decay",    type=float, default=t.get("weight_decay",    1e-4))
     parser.add_argument("--warmup-epochs",   type=int,   default=t.get("warmup_epochs",   3))
-    parser.add_argument("--dkl-weight",      type=float, default=t.get("dkl_weight",      1e-2))
-    parser.add_argument("--entropy-weight",  type=float, default=t.get("entropy_weight",  0.0))
+    parser.add_argument("--dkl-weight",      type=float, default=t.get("dkl_weight",      1e-2),
+                        help="Weight for the coverage KL penalty")
+    parser.add_argument("--entropy-weight",  type=float, default=t.get("entropy_weight",  0.0),
+                        help="Weight for the entropy penalty (positive = sparser)")
     parser.add_argument("--save-every",      type=int,   default=t.get("save_every",      5))
     parser.add_argument("--seed",            type=int,   default=t.get("seed",            42))
     parser.add_argument("--max-train-steps", type=int,   default=t.get("max_train_steps", 0))
-    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--resume",          type=str,   default="")
     return parser.parse_args()
 
 
@@ -230,9 +237,8 @@ def main() -> None:
     dkl_suffix     = f"_dkl_{args.dkl_weight:.0e}"
     temp_str       = f"{args.temperature:g}".replace(".", "p")
     temp_suffix    = f"_temp_{temp_str}"
-    hard_suffix    = "_hard" if args.hard else ""
     entropy_suffix = f"_ew_{args.entropy_weight:.0e}" if args.entropy_weight else ""
-    run_suffix     = dkl_suffix + temp_suffix + hard_suffix + entropy_suffix
+    run_suffix     = dkl_suffix + temp_suffix + entropy_suffix
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -241,54 +247,34 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # CIFAR10Loader applies its own normalisation (mean/std=0.5); no extra tf needed.
-    cifar_loader = CIFAR10Loader(batch_size=args.batch_size, root=args.data_root)
-    full_train_loader, _ = cifar_loader.get_loaders()
-
-    # Carve a proper validation split out of the training set.
-    trainset  = cifar_loader.trainset
-    val_size  = int(len(trainset) * args.val_split)
-    train_size = len(trainset) - val_size
-    generator = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset = random_split(trainset, [train_size, val_size],
-                                            generator=generator)
-
-    train_loader = DataLoader(
-        train_subset,
+    imagenet_loader = ImageNet1kHFLoader(
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
+        image_size=args.image_size,
         pin_memory=(device.type == "cuda"),
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
     )
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+    train_loader, val_loader = imagenet_loader.get_loaders()
 
-    # Read model params that are not exposed as CLI flags from config.
     _mc: dict = {}
     if args.config:
         with open(args.config) as _f:
             _mc = json.load(_f).get("model", {})
 
-    model = TaxonAutoencoder(
+    model = SoftmaxSparseConvAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         resnet_variant=args.resnet_variant,
-        stage_taxonomy_layers=tuple(args.stage_taxonomy_layers),
+        stage_channels=tuple(args.stage_channels),
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
         temperature=args.temperature,
-        hard=args.hard,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
         stem_channels=_mc.get("stem_channels", 64),
-        stem_stride=_mc.get("stem_stride", 1),
-        use_stem_maxpool=_mc.get("use_stem_maxpool", False),
+        stem_stride=args.stem_stride,
+        use_stem_maxpool=args.use_stem_maxpool,
         output_activation=_mc.get("output_activation", "none"),
-        depth_decay=_mc.get("depth_decay", 0.5),
     ).to(device)
 
     optimizer = AdamW(
@@ -317,15 +303,34 @@ def main() -> None:
         best_val     = float(state.get("best_val", float("inf")))
         print(f"Resumed from {args.resume} at epoch={start_epoch}")
 
+    # Build the args dict that goes into every checkpoint (used by load_model)
+    _args_dict = {
+        "model_variant":    "softmax_sae",
+        "in_channels":      3,
+        "resnet_variant":   args.resnet_variant,
+        "stage_channels":   list(args.stage_channels),
+        "stage_strides":    list(args.stage_strides),
+        "stage_blocks":     _mc.get("stage_blocks", None),
+        "temperature":      args.temperature,
+        "dkl_weight":       args.dkl_weight,
+        "entropy_weight":   args.entropy_weight,
+        "kernel_size":      _mc.get("kernel_size", 3),
+        "use_stem":         _mc.get("use_stem", True),
+        "stem_channels":    _mc.get("stem_channels", 64),
+        "stem_stride":      args.stem_stride,
+        "use_stem_maxpool": args.use_stem_maxpool,
+        "output_activation":_mc.get("output_activation", "none"),
+    }
+
     print(
-        "Training setup (Taxon AE CIFAR-10):\n"
+        "Training setup (Softmax SAE ImageNet-1k):\n"
         f"  device={device}\n"
-        f"  hard={args.hard}\n"
-        f"  dkl_weight={args.dkl_weight}  entropy_weight={args.entropy_weight}\n"
-        f"  train_size={train_size}  val_size={val_size}\n"
+        f"  temperature={args.temperature}  dkl_weight={args.dkl_weight}"
+        f"  entropy_weight={args.entropy_weight}\n"
+        f"  train_size={len(imagenet_loader.trainset)}  val_size={len(imagenet_loader.valset)}\n"
         f"  batch_size={args.batch_size}  epochs={args.epochs}\n"
         f"  lr={args.learning_rate}  wd={args.weight_decay}\n"
-        f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
+        f"  output_dir={output_dir}"
     )
 
     history: dict = {
@@ -353,7 +358,7 @@ def main() -> None:
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            recon, dkl, entropy = model(images, hard=args.hard)
+            recon, dkl, entropy = model(images)
             recon_loss = F.mse_loss(recon, images)
             loss = recon_loss + args.dkl_weight * dkl + args.entropy_weight * entropy
 
@@ -373,7 +378,7 @@ def main() -> None:
                 avg_recon   = running_recon   / num_batches
                 avg_dkl     = running_dkl     / num_batches
                 avg_entropy = running_entropy / num_batches
-                lr = optimizer.param_groups[0]["lr"]
+                lr          = optimizer.param_groups[0]["lr"]
                 print(
                     f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                     f"lr={lr:.3e} loss={avg_loss:.5f} recon={avg_recon:.5f} "
@@ -394,7 +399,6 @@ def main() -> None:
             model=model,
             loader=val_loader,
             device=device,
-            hard=args.hard,
             dkl_weight=args.dkl_weight,
             entropy_weight=args.entropy_weight,
         )
@@ -425,7 +429,7 @@ def main() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "best_val":        best_val,
-                "args":            vars(args),
+                "args":            _args_dict,
                 "train_stats":     train_stats,
                 "val_stats":       val_stats,
             }
@@ -441,7 +445,7 @@ def main() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "best_val":        best_val,
-                "args":            vars(args),
+                "args":            _args_dict,
                 "train_stats":     train_stats,
                 "val_stats":       val_stats,
             }
@@ -452,7 +456,6 @@ def main() -> None:
             loader=val_loader,
             device=device,
             save_path=preview_dir / f"epoch_{epoch:03d}.png",
-            hard=args.hard,
             num_images=8,
         )
 

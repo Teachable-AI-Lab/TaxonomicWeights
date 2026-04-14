@@ -26,7 +26,7 @@
     ],
     "stage_blocks": null,
     "n_hierarchies": 3,
-    "temperature": 0.5,
+    "temperature": 1.0,
     "hard": false,
     "kernel_size": 3,
     "use_stem": true,
