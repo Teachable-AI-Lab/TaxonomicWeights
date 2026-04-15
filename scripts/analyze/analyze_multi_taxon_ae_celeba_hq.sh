@@ -19,7 +19,7 @@ conda activate taxon-weights
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG="${1:-configs/multi_taxon_ae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/multi_taxon_ae_celeba_hq.json}"
 
 # ── Run analysis ──────────────────────────────────────────────────────────────
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting analyze_multi_taxon_ae_celeba_hq (job $SLURM_JOB_ID) config=$CONFIG"

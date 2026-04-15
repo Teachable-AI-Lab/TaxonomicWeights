@@ -13,7 +13,7 @@
 
 # Usage: sbatch scripts/analyze/analyze_topk_sae.sh configs/topk_sae_celeba_hq.json
 #        sbatch scripts/analyze/analyze_topk_sae.sh configs/topk_sae_cifar10.json
-CONFIG="${1:-configs/topk_sae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/topk_sae_celeba_hq.json}"
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

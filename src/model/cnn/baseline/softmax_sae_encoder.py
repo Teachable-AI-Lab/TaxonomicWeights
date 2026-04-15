@@ -201,20 +201,23 @@ class SoftmaxSAEEncoder(nn.Module):
         if return_details:
             details["shape_trace"].append(("stem", tuple(x.shape)))  # type: ignore[attr-defined]
 
+        total_dkl = x.new_zeros(())
+        total_entropy = x.new_zeros(())
+
         for idx, stage in enumerate(self.stages, start=1):
             x = stage(x)
+            prob = torch.softmax(x / self.temperature, dim=1)   # [B, C, H, W]
+            x = x * prob                                         # soft gating
+            entropy_i, dkl_i = self._regularization_terms(prob)
+            total_entropy = total_entropy + entropy_i
+            total_dkl = total_dkl + dkl_i
             if return_details:
                 details["shape_trace"].append((f"stage{idx}", tuple(x.shape)))  # type: ignore[attr-defined]
 
-        # Flat softmax gating — same output formula as TaxonResNetStage per depth
-        prob = torch.softmax(x / self.temperature, dim=1)   # [B, C, H, W]
-        latent = x * prob                                     # soft gating
-
-        entropy, dkl = self._regularization_terms(prob)
-
+        latent = x
         details["latent_shape"] = tuple(latent.shape)
-        details["dkl"] = dkl
-        details["entropy"] = entropy
+        details["dkl"] = total_dkl
+        details["entropy"] = total_entropy
 
         return latent, details
 

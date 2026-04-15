@@ -13,7 +13,7 @@
 
 # Usage: sbatch scripts/analyze/analyze_sae.sh configs/sae_celeba_hq.json
 #        sbatch scripts/analyze/analyze_sae.sh configs/sae_cifar10.json
-CONFIG="${1:-configs/sae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/sae_celeba_hq.json}"
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

@@ -688,7 +688,8 @@ def make_page1_reconstruction(
     for r in runs_with_history:
         with open(r["history"]) as f:
             h = json.load(f)
-        ys = np.array(h["val_recon"], dtype=float)
+        recon_key = "val_recon" if "val_recon" in h else "val_recon_k0"
+        ys = np.array(h[recon_key], dtype=float)
         xs = np.array(h["epochs"])
         curve_data.append((r, xs, ys))
 

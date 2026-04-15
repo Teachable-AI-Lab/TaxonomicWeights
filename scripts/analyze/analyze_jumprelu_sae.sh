@@ -13,7 +13,7 @@
 
 # Usage: sbatch scripts/analyze/analyze_jumprelu_sae.sh configs/jumprelu_sae_celeba_hq.json
 #        sbatch scripts/analyze/analyze_jumprelu_sae.sh configs/jumprelu_sae_cifar10.json
-CONFIG="${1:-configs/jumprelu_sae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/jumprelu_sae_celeba_hq.json}"
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

@@ -13,7 +13,7 @@
 
 # Usage: sbatch scripts/analyze/analyze_gated_sae.sh configs/gated_sae_celeba_hq.json
 #        sbatch scripts/analyze/analyze_gated_sae.sh configs/gated_sae_cifar10.json
-CONFIG="${1:-configs/gated_sae_celeba_hq.json}"
+CONFIG="${1:-configs/celeba_hq/gated_sae_celeba_hq.json}"
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

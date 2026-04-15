@@ -220,7 +220,7 @@ def compute_metrics(
     loader,
     device: torch.device,
     max_batches: int = 0,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ):
     """Compute latent, reconstruction, and sparsity metrics over a data loader.
 
@@ -373,7 +373,7 @@ def analyze_latent_sparsity(
     device: torch.device,
     save_dir: Path,
     num_batches: int = 50,
-    threshold: float = 0.1,
+    threshold: float = 1e-6,
 ) -> None:
     """Six-panel latent sparsity analysis plot."""
     all_latents: List[np.ndarray] = []
@@ -616,7 +616,7 @@ def analyze_sparsity_suite(
     device: torch.device,
     save_dir: Path,
     num_batches: int = 30,
-    threshold: float = 0.1,
+    threshold: float = 1e-6,
     n_jaccard_dims: int = 64,
     n_clusters: int = 8,
 ) -> None:
