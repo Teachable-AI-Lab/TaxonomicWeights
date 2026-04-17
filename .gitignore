@@ -3,6 +3,8 @@ intuitions.pdf
 *.pt
 __pycache__
 slurm
+slurm_errors
+slurm_outputs
 *.npz
 outputs
 archive_outputs
