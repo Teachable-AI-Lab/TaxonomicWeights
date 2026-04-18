@@ -178,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     # Bias-specific
     parser.add_argument("--n-hierarchies", type=int, default=m.get("n_hierarchies", 3))
     parser.add_argument("--bias-update-rate", type=float, default=m.get("bias_update_rate", 0.001))
+    parser.add_argument("--bias-ema-decay", type=float, default=m.get("bias_ema_decay", 0.99))
     # Analysis knobs
     parser.add_argument("--n-latent-batches", type=int, default=a.get("num_latent_batches", 50))
     parser.add_argument("--n-recon-batches", type=int, default=a.get("num_reconstruction_batches", 20))
@@ -202,7 +203,8 @@ def main() -> None:
     # ── run suffix (must match training script) ──
     hier_str = f"_K{args.n_hierarchies}"
     bur_str = f"_bur_{args.bias_update_rate:.0e}"
-    run_suffix = hier_str + bur_str
+    ema_str = f"_ema_{args.bias_ema_decay:g}".replace(".", "p")
+    run_suffix = hier_str + bur_str + ema_str
 
     output_dir = Path(args.output_dir + run_suffix)
     analysis_dir = Path(args.analysis_save_dir or str(output_dir / "analysis"))

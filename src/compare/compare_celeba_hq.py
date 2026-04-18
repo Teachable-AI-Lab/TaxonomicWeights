@@ -1062,18 +1062,25 @@ def _deconflict_labels(
     n_iter: int = 800,
     expand: float = 1.05,
     step_px: float = 2.0,
+    max_drift: float = 70.0,
 ) -> None:
     """Iteratively push overlapping Annotation objects apart.
 
     Works for annotations created with ``textcoords="offset points"``.
     Modifies ``annot.xyann`` in-place (the (dx, dy) offset in points from
     the annotated data point).
+
+    max_drift: maximum displacement in points from each label's starting
+    xyann.  Prevents labels from drifting off the axes edge.
     """
     if not annots:
         return
     fig.canvas.draw()                    # materialise bounding boxes
     renderer   = fig.canvas.get_renderer()
     pts_per_px = 72.0 / fig.dpi         # display pixels → offset-points
+
+    # Record where each label started so we can cap total drift
+    init_offsets = [np.array(a.xyann, dtype=float) for a in annots]
 
     for _ in range(n_iter):
         bboxes = [
@@ -1093,11 +1100,15 @@ def _deconflict_labels(
                 n  = np.linalg.norm(d)
                 if n < 1e-6:
                     d, n = np.array([1.0, 0.5]), np.linalg.norm([1.0, 0.5])
-                push    = d / n * step_px * pts_per_px  # in offset-points
-                ai      = annots[i].xyann
-                aj      = annots[j].xyann
-                annots[i].xyann = (ai[0] + push[0], ai[1] + push[1])
-                annots[j].xyann = (aj[0] - push[0], aj[1] - push[1])
+                push = d / n * step_px * pts_per_px  # in offset-points
+                for idx, sign in ((i, +1.0), (j, -1.0)):
+                    cur   = np.array(annots[idx].xyann, dtype=float)
+                    new   = cur + sign * push
+                    delta = new - init_offsets[idx]
+                    dist  = np.linalg.norm(delta)
+                    if dist > max_drift:
+                        new = init_offsets[idx] + delta * (max_drift / dist)
+                    annots[idx].xyann = (float(new[0]), float(new[1]))
         if not moved:
             break
 
@@ -1257,7 +1268,11 @@ def make_page4_sparsity_tradeoff(
     # ══════════════════════════════════════════════════════════════════════════
     # Figure 2 — Dense-cluster zoom (separate graphic)
     # ══════════════════════════════════════════════════════════════════════════
-    fig2 = plt.figure(figsize=(18, 11))
+    n_cluster_pts = sum(
+        1 for pts in groups.values() for p in pts if _in_cluster(p[0], p[1])
+    )
+    zoom_height = max(13, n_cluster_pts * 0.45)
+    fig2 = plt.figure(figsize=(18, zoom_height))
     ax2  = fig2.add_axes([0.07, LH + 0.07, 0.90, 0.90 - LH - 0.07])
     ax2.set_xlim(x_zoom_lo, x_zoom_hi)
     ax2.set_ylim(y_zoom_lo, y_zoom_hi * 1.08)
@@ -1314,7 +1329,7 @@ def make_page4_sparsity_tradeoff(
     )
     ax2.grid(alpha=0.3)
 
-    _deconflict_labels(ax2, fig2, zoom_annots, n_iter=1200, step_px=1.6)
+    _deconflict_labels(ax2, fig2, zoom_annots, n_iter=1200, step_px=1.0, max_drift=55.0)
     _add_legend_strip(fig2, leg_h2, leg_l2)
 
     fig2.savefig(
@@ -1322,6 +1337,109 @@ def make_page4_sparsity_tradeoff(
     )
     plt.close(fig2)
     print("  L0–reconstruction trade-off (zoomed cluster) saved.")
+
+
+_TAXON_FAMILY_ORDER = [
+    "taxon", "topk_taxon", "bias_taxon",
+    "multi_taxon", "topk_multi_taxon", "bias_multi_taxon",
+]
+_TAXON_FAMILY_DISPLAY = {
+    "taxon":             "Taxon",
+    "topk_taxon":        "TopK-Taxon",
+    "bias_taxon":        "Bias-Taxon",
+    "multi_taxon":       "Multi-Taxon",
+    "topk_multi_taxon":  "TopK Multi-Taxon",
+    "bias_multi_taxon":  "Bias Multi-Taxon",
+}
+
+
+def make_page5_taxon_ablation_bars(
+    runs: List[Dict],
+    all_metrics: List[Dict],
+    save_dir: Path,
+) -> None:
+    """Page 5: per-category bar charts of Val MSE and L0 norm.
+
+    Produces one row per taxon family that has at least one run.  Each row
+    contains two bar charts side-by-side:
+      left  — Val MSE (lower is better)
+      right — Mean L0 norm / active feature count (lower = sparser)
+    """
+    # Group runs by taxon family
+    by_type: Dict[str, List[tuple]] = {t: [] for t in _TAXON_FAMILY_ORDER}
+    for r, m in zip(runs, all_metrics):
+        if r["type"] in by_type:
+            by_type[r["type"]].append((r, m))
+
+    categories = [
+        (t, by_type[t]) for t in _TAXON_FAMILY_ORDER if by_type[t]
+    ]
+    if not categories:
+        print("  No taxon-family runs found — skipping ablation bars.")
+        return
+
+    n_cats = len(categories)
+    row_h  = 4.0  # inches per category row
+    fig, axes = plt.subplots(
+        n_cats, 2,
+        figsize=(16, row_h * n_cats),
+        squeeze=False,
+    )
+
+    for row, (cat_type, pairs) in enumerate(categories):
+        cat_runs    = [p[0] for p in pairs]
+        cat_metrics = [p[1] for p in pairs]
+        display     = _TAXON_FAMILY_DISPLAY.get(cat_type, cat_type)
+
+        # Shorter per-category labels: strip the model-type prefix from short name
+        # e.g. "taxon (dkl 1e-02 temp 0p001)" → "dkl 1e-02 temp 0p001"
+        short_labels = []
+        type_prefix  = cat_type + " "
+        for r in cat_runs:
+            lbl = r["short"]
+            if lbl.startswith(type_prefix):
+                lbl = lbl[len(type_prefix):].strip("()")
+            short_labels.append(lbl or r["short"])
+
+        colours = [r["colour"] for r in cat_runs]
+        mses    = [m.get("mean_mse") for m in cat_metrics]
+        l0s     = [m.get("mean_l0")  for m in cat_metrics]
+
+        # ── left: Val MSE ────────────────────────────────────────────────
+        ax_mse = axes[row, 0]
+        _bar_chart(
+            ax_mse, mses, short_labels, colours,
+            f"{display} — Val MSE  (↓ better)",
+            "Val MSE",
+            lower_better=True,
+        )
+        # Draw a light horizontal line at the minimum so the winner stands out
+        valid_mses = [v for v in mses if v is not None]
+        if valid_mses:
+            ax_mse.axhline(min(valid_mses), color="red", linewidth=0.8,
+                           linestyle="--", alpha=0.5)
+
+        # ── right: L0 norm ───────────────────────────────────────────────
+        ax_l0 = axes[row, 1]
+        _bar_chart(
+            ax_l0, l0s, short_labels, colours,
+            f"{display} — Mean L0 Norm  (active features; ↓ = sparser)",
+            "Active features (L0)",
+            lower_better=True,
+        )
+        valid_l0s = [v for v in l0s if v is not None]
+        if valid_l0s:
+            ax_l0.axhline(min(valid_l0s), color="red", linewidth=0.8,
+                          linestyle="--", alpha=0.5)
+
+    fig.suptitle(
+        "Taxon Ablation Comparison — Val MSE & L0 Sparsity  |  CelebA-HQ",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(save_dir / "p5_taxon_ablation_bars.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  Taxon ablation bar charts saved.")
 
 
 def make_summary_csv(
@@ -1445,6 +1563,7 @@ def main() -> None:
     make_page2_sparsity(runs, all_metrics, save_dir)
     make_page3_feature_quality(runs, all_metrics, save_dir)
     make_page4_sparsity_tradeoff(runs, all_metrics, save_dir)
+    make_page5_taxon_ablation_bars(runs, all_metrics, save_dir)
     make_summary_csv(runs, all_metrics, save_dir)
 
     # ── combined 3-page overview ───────────────────────────────────────────
@@ -1457,6 +1576,7 @@ def main() -> None:
         save_dir / "p3_feature_quality.png",
         save_dir / "p4_sparsity_recon_tradeoff.png",
         save_dir / "p4_sparsity_recon_tradeoff_zoom.png",
+        save_dir / "p5_taxon_ablation_bars.png",
     ]
     existing = [p for p in pages if p.exists()]
     if existing:

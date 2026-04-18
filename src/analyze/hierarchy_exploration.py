@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob as _glob
 import json
 import math
 from pathlib import Path
@@ -90,7 +91,16 @@ def resolve_checkpoint(config: dict, override: Optional[str]) -> str:
     output_dir = config.get("output", {}).get("output_dir", "")
     exp_name   = config.get("experiment_name", "")
     if output_dir and exp_name:
-        return str(Path(output_dir).parent / exp_name / "checkpoints" / "best.pt")
+        parent = Path(output_dir).parent
+        # Glob for any directory that starts with exp_name (handles training
+        # suffixes like _ema_0p99, _K3_, etc. that vary by variant).
+        candidates = sorted(_glob.glob(str(parent / (exp_name + "*"))))
+        for cand in candidates:
+            p = Path(cand) / "checkpoints" / "best.pt"
+            if p.exists():
+                return str(p)
+        # Fall back to exact path (will give a clear FileNotFoundError)
+        return str(parent / exp_name / "checkpoints" / "best.pt")
     raise ValueError(
         "Cannot resolve checkpoint. Pass --checkpoint or set "
         "config['analysis']['checkpoint_path']."
@@ -104,7 +114,12 @@ def resolve_save_dir(config: dict) -> Path:
     output_dir = config.get("output", {}).get("output_dir", "")
     exp_name   = config.get("experiment_name", "")
     if output_dir and exp_name:
-        return Path(output_dir).parent / exp_name / "analysis" / "hierarchy_exploration"
+        parent = Path(output_dir).parent
+        candidates = sorted(_glob.glob(str(parent / (exp_name + "*"))))
+        for cand in candidates:
+            if Path(cand).is_dir():
+                return Path(cand) / "analysis" / "hierarchy_exploration"
+        return parent / exp_name / "analysis" / "hierarchy_exploration"
     raise ValueError("Cannot resolve save dir from config.")
 
 
@@ -311,7 +326,7 @@ def _collect_single(model, val_loader, device, num_batches):
 # ─── multi-taxon ──────────────────────────────────────────────────────────────
 
 def _collect_multi(model, val_loader, device, num_batches):
-    taxon_stages = model.encoder.taxon_stages
+    taxon_stages = model.encoder.multi_taxon_stages
     n_stages     = len(taxon_stages)
 
     # hier_accum[s][k][d] = {"sum": tensor, "n": int}
@@ -371,7 +386,7 @@ def _collect_multi(model, val_loader, device, num_batches):
         h.remove()
 
     stages_out = []
-    for si, stage in enumerate(taxon_stages):
+    for si, stage in enumerate(model.encoder.multi_taxon_stages):
         K = stage.n_hierarchies
         hierarchies_out = []
         for ki in range(K):
