@@ -1,0 +1,59 @@
+{
+    "experiment_name": "bias_multi_taxon_ae_celeba_hq_r18_ema_0p999",
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "model": {
+        "in_channels": 3,
+        "resnet_variant": "18",
+        "stage_taxonomy_layers": [
+            3,
+            4,
+            5,
+            6
+        ],
+        "stage_strides": [
+            1,
+            2,
+            2,
+            2
+        ],
+        "stage_blocks": null,
+        "n_hierarchies": 3,
+        "bias_update_rate": 0.001,
+        "bias_ema_decay": 0.999,
+        "gate_k": 1,
+        "kernel_size": 3,
+        "use_stem": true,
+        "stem_channels": 64,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none",
+        "temperature": 0.5,
+        "depth_decay": 0.5
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "analysis": {
+        "num_latent_batches": 50,
+        "num_reconstruction_batches": 20,
+        "num_multiple_recon_images": 8,
+        "num_reconstructions_per_image": 8,
+        "num_activation_images": 3,
+        "num_taxonomy_batches": 10
+    },
+    "output": {
+        "output_dir": "outputs/celeba_hq/ablations/bias_multi_taxon/bias_multi_taxon_ae_celeba_hq_r18"
+    }
+}

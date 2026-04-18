@@ -1464,7 +1464,7 @@ def analyze_latent_sparsity(
     device: torch.device,
     save_dir: str,
     num_batches: int = 50,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ) -> None:
     model.eval()
     all_latents: List[np.ndarray] = []
@@ -1526,7 +1526,7 @@ def analyze_partonomy_sparsity(
     device: torch.device,
     save_dir: str,
     num_batches: int = 30,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
     ablation_images: int = 16,
     n_clusters: int = 8,
 ) -> None:

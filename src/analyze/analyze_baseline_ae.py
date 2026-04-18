@@ -82,7 +82,7 @@ def compute_metrics(
     loader,
     device: torch.device,
     max_batches: int = 0,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ):
     """Compute latent and reconstruction metrics over a data loader.
 

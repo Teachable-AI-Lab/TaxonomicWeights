@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sae_bench.custom_saes.base_sae import BaseSAE
 
 
 # ── Taxonomy routing stage ───────────────────────────────────────────────
@@ -187,7 +186,7 @@ class LinearTaxonStage(nn.Module):
 
 # ── SAEBench wrapper ─────────────────────────────────────────────────────
 
-class TaxonSAE(BaseSAE):
+class TaxonSAE(nn.Module):
     """SAEBench-compatible linear taxonomy SAE.
 
     Internally uses a LinearTaxonStage encoder (binary-tree pairwise softmax
@@ -210,7 +209,7 @@ class TaxonSAE(BaseSAE):
         d_sae = LinearTaxonStage.output_channels(n_taxonomy_layers)
 
         hook_name = hook_name or f"blocks.{hook_layer}.hook_resid_post"
-        super().__init__(d_in, d_sae, model_name, hook_layer, device, dtype, hook_name)
+        super().__init__()
 
         self.n_taxonomy_layers = n_taxonomy_layers
         self.temperature = temperature

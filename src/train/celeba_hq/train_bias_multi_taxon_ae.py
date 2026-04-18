@@ -199,7 +199,8 @@ def main() -> None:
 
     hier_str = f"_K{args.n_hierarchies}"
     bur_str = f"_bur_{args.bias_update_rate:.0e}"
-    run_suffix = hier_str + bur_str
+    ema_str = f"_ema_{args.bias_ema_decay:g}".replace(".", "p")
+    run_suffix = hier_str + bur_str + ema_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"

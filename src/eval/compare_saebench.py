@@ -40,8 +40,6 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import sae_bench.sae_bench_utils.general_utils as general_utils
-
 from src.eval.run_saebench_evals import (
     load_custom_sae,
     load_baselines,

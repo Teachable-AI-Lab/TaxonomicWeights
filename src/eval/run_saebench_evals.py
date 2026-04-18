@@ -27,17 +27,6 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import sae_bench.evals.absorption.main as absorption
-import sae_bench.evals.core.main as core
-import sae_bench.evals.scr_and_tpp.main as scr_and_tpp
-import sae_bench.evals.sparse_probing.main as sparse_probing
-import sae_bench.evals.sparse_probing_sae_probes.main as sparse_probing_sae_probes
-import sae_bench.sae_bench_utils.general_utils as general_utils
-from sae_bench.custom_saes.run_all_evals_dictionary_learning_saes import (
-    get_all_hf_repo_autoencoders,
-    load_dictionary_learning_sae,
-)
-
 from src.model.saebench.taxon_sae import TaxonSAE
 from src.model.saebench.multi_taxon_sae import MultiTaxonSAE
 from src.model.saebench.topk_taxon_sae import TopKTaxonSAE

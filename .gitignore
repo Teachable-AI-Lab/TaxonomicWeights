@@ -7,6 +7,7 @@ slurm_errors
 slurm_outputs
 *.npz
 outputs
+old_outputs
 archive_outputs
 hf_token
 cached_activations

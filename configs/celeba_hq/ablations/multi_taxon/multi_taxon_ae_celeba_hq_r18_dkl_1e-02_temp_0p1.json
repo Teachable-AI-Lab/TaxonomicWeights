@@ -1,0 +1,63 @@
+{
+    "experiment_name": "multi_taxon_ae_celeba_hq_r18_dkl_1e-02_temp_0p1",
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "model": {
+        "in_channels": 3,
+        "resnet_variant": "18",
+        "stage_taxonomy_layers": [
+            3,
+            4,
+            5,
+            6
+        ],
+        "stage_strides": [
+            1,
+            2,
+            2,
+            2
+        ],
+        "stage_blocks": null,
+        "n_hierarchies": 3,
+        "temperature": 0.1,
+        "hard": false,
+        "kernel_size": 3,
+        "use_stem": true,
+        "stem_channels": 64,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none",
+        "depth_decay": 0.5
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "dkl_weight": 0.01,
+        "entropy_weight": 0.0,
+        "gate_dkl_weight": 0.01,
+        "gate_entropy_weight": 0.0,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "analysis": {
+        "checkpoint_path": "./outputs/celeba_hq/ablations/multi_taxon/multi_taxon_ae_celeba_hq_r18_dkl_1e-02_temp_0p1_K3_gdkl_1e-02/checkpoints/best.pt",
+        "num_latent_batches": 50,
+        "num_reconstruction_batches": 20,
+        "num_multiple_recon_images": 8,
+        "num_reconstructions_per_image": 8,
+        "num_activation_images": 3,
+        "num_taxonomy_batches": 10
+    },
+    "output": {
+        "output_dir": "./outputs/celeba_hq/ablations/multi_taxon/multi_taxon_ae_celeba_hq_r18",
+        "analysis_save_dir": "./outputs/celeba_hq/ablations/multi_taxon/multi_taxon_ae_celeba_hq_r18_dkl_1e-02_temp_0p1_K3_gdkl_1e-02/analysis"
+    }
+}

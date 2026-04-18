@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sae_bench.custom_saes.base_sae import BaseSAE
 
 
 # ── TopK taxonomy routing stage ──────────────────────────────────────────
@@ -159,7 +158,7 @@ class TopKLinearTaxonStage(nn.Module):
 
 # ── SAEBench wrapper ─────────────────────────────────────────────────────
 
-class TopKTaxonSAE(BaseSAE):
+class TopKTaxonSAE(nn.Module):
     """SAEBench-compatible linear taxonomy SAE with TopK sparsity + AuxK loss."""
 
     def __init__(
@@ -179,7 +178,7 @@ class TopKTaxonSAE(BaseSAE):
     ):
         d_sae = TopKLinearTaxonStage.output_channels(n_taxonomy_layers)
         hook_name = hook_name or f"blocks.{hook_layer}.hook_resid_post"
-        super().__init__(d_in, d_sae, model_name, hook_layer, device, dtype, hook_name)
+        super().__init__()
 
         self.n_taxonomy_layers = n_taxonomy_layers
         self.temperature = temperature

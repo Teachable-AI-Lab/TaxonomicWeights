@@ -1,0 +1,44 @@
+{
+    "experiment_name": "sae_softmax_celeba_hq_r18_temp_2p0",
+    "model": {
+        "model_variant": "softmax_sae",
+        "resnet_variant": "18",
+        "stage_channels": [
+            62,
+            126,
+            254,
+            510
+        ],
+        "stage_strides": [
+            1,
+            2,
+            2,
+            2
+        ],
+        "temperature": 2.0,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none"
+    },
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "dkl_weight": 0.01,
+        "entropy_weight": 0.0,
+        "save_every": 5,
+        "seed": 42
+    },
+    "output": {
+        "output_dir": "./outputs/celeba_hq/ablations/softmax_sae/sae_softmax_celeba_hq_r18",
+        "analysis_save_dir": "./outputs/celeba_hq/ablations/softmax_sae/sae_softmax_celeba_hq_r18_dkl_1e-02_temp_2/analysis"
+    }
+}

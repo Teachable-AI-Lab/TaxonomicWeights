@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sae_bench.custom_saes.base_sae import BaseSAE
 
 from .topk_taxon_sae import TopKLinearTaxonStage
 
@@ -125,7 +124,7 @@ class TopKLinearMultiTaxonStage(nn.Module):
 
 # ── SAEBench wrapper ─────────────────────────────────────────────────────
 
-class TopKMultiTaxonSAE(BaseSAE):
+class TopKMultiTaxonSAE(nn.Module):
     """SAEBench-compatible multi-taxonomy SAE with TopK sparsity + AuxK loss."""
 
     def __init__(
@@ -149,7 +148,7 @@ class TopKMultiTaxonSAE(BaseSAE):
         d_sae = n_hierarchies * per_hierarchy
 
         hook_name = hook_name or f"blocks.{hook_layer}.hook_resid_post"
-        super().__init__(d_in, d_sae, model_name, hook_layer, device, dtype, hook_name)
+        super().__init__()
 
         self.n_taxonomy_layers = n_taxonomy_layers
         self.n_hierarchies = n_hierarchies

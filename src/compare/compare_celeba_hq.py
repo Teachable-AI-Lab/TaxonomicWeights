@@ -206,16 +206,18 @@ def _to_display(t: torch.Tensor) -> np.ndarray:
 # ─── discovery ────────────────────────────────────────────────────────────────
 
 def discover_runs(outputs_dir: Path) -> List[Dict]:
-    """Return a list of run-info dicts, sorted by type then name."""
+    """Return a list of run-info dicts, sorted by type then name.
+
+    Recursively searches all subdirectories under outputs_dir for any
+    directory containing checkpoints/best.pt whose name contains 'celeba'.
+    This allows ablation runs stored under outputs_dir/ablations/**/ to be
+    discovered alongside top-level runs.
+    """
     runs = []
-    for name in sorted(os.listdir(outputs_dir)):
+    for best_ckpt in sorted(outputs_dir.rglob("checkpoints/best.pt")):
+        run_path = best_ckpt.parent.parent  # parent of checkpoints/
+        name = run_path.name
         if "celeba" not in name.lower():
-            continue
-        run_path = outputs_dir / name
-        if not run_path.is_dir():
-            continue
-        best_ckpt = run_path / "checkpoints" / "best.pt"
-        if not best_ckpt.exists():
             continue
         runs.append({
             "name":       name,
@@ -712,14 +714,26 @@ def _bar_chart(
 
 
 def _add_legend(fig, runs: List[Dict]) -> None:
+    """Append a dedicated axes row at the bottom of *fig* containing only the legend."""
     handles = [
         plt.Rectangle((0, 0), 1, 1, fc=r["colour"], edgecolor="black", linewidth=0.5)
         for r in runs
     ]
     labels = [r["short"] for r in runs]
-    fig.legend(handles, labels, loc="lower center",
-               ncol=min(len(runs), 4), fontsize=7,
-               bbox_to_anchor=(0.5, -0.02), framealpha=0.9)
+    # Reserve the bottom fraction of the figure as a pure legend axes.
+    ncol = min(len(runs), 6)
+    legend_height = max(0.06, 0.04 * ((len(runs) - 1) // ncol + 1))
+    fig.subplots_adjust(bottom=legend_height + 0.02)
+    ax_leg = fig.add_axes([0.0, 0.0, 1.0, legend_height])
+    ax_leg.axis("off")
+    ax_leg.legend(
+        handles, labels,
+        loc="center",
+        ncol=ncol,
+        fontsize=7,
+        framealpha=0.9,
+        borderpad=0.6,
+    )
 
 
 # ─── per-page figures ──────────────────────────────────────────────────────────
@@ -802,8 +816,7 @@ def make_page1_reconstruction(
     _bar_chart(axes[2], best_maes, labels, colours,
                "Val MAE (computed on val set)", "MAE", lower_better=True)
     plt.suptitle("Reconstruction Quality — CelebA-HQ", fontsize=13, fontweight="bold")
-    _add_legend(fig_bar, runs)
-    fig_bar.tight_layout(rect=[0, 0.08, 1, 1])
+    fig_bar.tight_layout()
     fig_bar.savefig(save_dir / "p1_reconstruction_bars.png", dpi=150, bbox_inches="tight")
     plt.close(fig_bar)
     print("  Reconstruction bar charts saved.")
@@ -950,11 +963,10 @@ def make_page2_sparsity(
     ax_h.set_title("Latent Feature Activation Rate\n(histogram across all dims)", fontsize=9)
     ax_h.set_xlabel("Fraction of samples where feature is active")
     ax_h.set_ylabel("Density")
-    ax_h.legend(fontsize=6, ncol=1); ax_h.grid(alpha=0.3)
+    ax_h.grid(alpha=0.3)
 
     plt.suptitle("Sparsity Analysis — CelebA-HQ", fontsize=13, fontweight="bold")
-    _add_legend(fig, runs)
-    fig.tight_layout(rect=[0, 0.10, 1, 1])
+    fig.tight_layout()
     fig.savefig(save_dir / "p2_sparsity_analysis.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     print("  Sparsity analysis saved.")
@@ -1038,10 +1050,278 @@ def make_page3_feature_quality(
     plt.suptitle("Feature Quality & Sparsity–Reconstruction Trade-off — CelebA-HQ",
                  fontsize=12, fontweight="bold")
     _add_legend(fig, runs)
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
     fig.savefig(save_dir / "p3_feature_quality.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     print("  Feature quality saved.")
+
+
+def _deconflict_labels(
+    ax,
+    fig,
+    annots: list,
+    n_iter: int = 800,
+    expand: float = 1.05,
+    step_px: float = 2.0,
+) -> None:
+    """Iteratively push overlapping Annotation objects apart.
+
+    Works for annotations created with ``textcoords="offset points"``.
+    Modifies ``annot.xyann`` in-place (the (dx, dy) offset in points from
+    the annotated data point).
+    """
+    if not annots:
+        return
+    fig.canvas.draw()                    # materialise bounding boxes
+    renderer   = fig.canvas.get_renderer()
+    pts_per_px = 72.0 / fig.dpi         # display pixels → offset-points
+
+    for _ in range(n_iter):
+        bboxes = [
+            a.get_window_extent(renderer).expanded(expand, expand)
+            for a in annots
+        ]
+        moved = False
+        for i in range(len(annots)):
+            for j in range(i + 1, len(annots)):
+                bi, bj = bboxes[i], bboxes[j]
+                if not bi.overlaps(bj):
+                    continue
+                moved = True
+                ci = bi.get_points().mean(0)
+                cj = bj.get_points().mean(0)
+                d  = ci - cj
+                n  = np.linalg.norm(d)
+                if n < 1e-6:
+                    d, n = np.array([1.0, 0.5]), np.linalg.norm([1.0, 0.5])
+                push    = d / n * step_px * pts_per_px  # in offset-points
+                ai      = annots[i].xyann
+                aj      = annots[j].xyann
+                annots[i].xyann = (ai[0] + push[0], ai[1] + push[1])
+                annots[j].xyann = (aj[0] - push[0], aj[1] - push[1])
+        if not moved:
+            break
+
+
+def make_page4_sparsity_tradeoff(
+    runs: List[Dict],
+    all_metrics: List[Dict],
+    save_dir: Path,
+) -> None:
+    """Page 4: L0 norm vs reconstruction trade-off.
+
+    Produces TWO separate files:
+      p4_sparsity_recon_tradeoff.png      — full overview (cluster region boxed)
+      p4_sparsity_recon_tradeoff_zoom.png — dense-cluster zoom with all labels
+
+    In both figures annotation overlap is resolved via iterative bounding-box
+    deconfliction (_deconflict_labels).
+    """
+    from collections import defaultdict
+
+    # ── type metadata: (marker, display-label, base colour) ─────────────────
+    TYPE_META: Dict[str, tuple] = {
+        "taxon":                     ("o",  "Taxon (vanilla)",             "#1f77b4"),
+        "multi_taxon":               ("D",  "Multi-Taxon",                 "#9467bd"),
+        "topk_taxon":                ("v",  "TopK-Taxon",                  "#0096c7"),
+        "topk_multi_taxon":          ("^",  "TopK Multi-Taxon",            "#7209b7"),
+        "bias_taxon":                ("s",  "Bias-Taxon",                  "#06d6a0"),
+        "bias_multi_taxon":          ("p",  "Bias Multi-Taxon",            "#e63946"),
+        "sae":                       ("*",  "L1-SAE",                      "#ff7f0e"),
+        "topk_sae":                  ("X",  "TopK-SAE",                    "#d62728"),
+        "gated_sae":                 ("h",  "Gated-SAE",                   "#17becf"),
+        "jumprelu_sae":              ("d",  "JumpReLU-SAE",                "#8c564b"),
+        "matryoshka_batch_topk_sae": ("8",  "Matryoshka Batch-TopK SAE",   "#1a9850"),
+        "softmax_sae":               ("P",  "Softmax-SAE",                 "#f4a261"),
+        "baseline":                  (">",  "Baseline AE",                 "#2ca02c"),
+    }
+    TYPE_ORDER = [
+        "taxon", "multi_taxon", "topk_taxon", "topk_multi_taxon",
+        "bias_taxon", "bias_multi_taxon",
+        "sae", "topk_sae", "gated_sae", "jumprelu_sae",
+        "matryoshka_batch_topk_sae", "softmax_sae", "baseline",
+    ]
+
+    # ── build data groups (L0 on x-axis) ────────────────────────────────────
+    groups: Dict[str, List[tuple]] = defaultdict(list)
+    for r, m in zip(runs, all_metrics):
+        l0  = m.get("mean_l0")
+        mse = m.get("mean_mse")
+        if l0 is not None and mse is not None:
+            groups[r["type"]].append((float(l0), float(mse), r["colour"], r["short"]))
+
+    if not groups:
+        print("  No L0/MSE data — skipping trade-off plot.")
+        return
+
+    # ── zoom-region bounds (75th-percentile of data) ─────────────────────────
+    all_xs = np.array([p[0] for pts in groups.values() for p in pts])
+    all_ys = np.array([p[1] for pts in groups.values() for p in pts])
+    x_zoom_hi = float(np.percentile(all_xs, 75)) * 1.15 + 1.0
+    y_zoom_hi = float(np.percentile(all_ys, 75)) * 1.20 + 1e-5
+    x_zoom_lo = max(float(all_xs.min()) - 0.5, 0.0)
+    y_zoom_lo = 0.0
+
+    def _in_cluster(x, y):
+        return x_zoom_lo <= x <= x_zoom_hi and y_zoom_lo <= y <= y_zoom_hi
+
+    # ── shared legend-strip builder ───────────────────────────────────────────
+    def _add_legend_strip(fig, handles, labels):
+        lh = 0.22
+        ax_leg = fig.add_axes([0.01, 0.0, 0.98, lh - 0.01])
+        ax_leg.axis("off")
+        ax_leg.legend(
+            handles, labels,
+            loc="center", ncol=min(len(handles), 4),
+            fontsize=9.5, framealpha=0.9,
+            markerscale=1.4, handletextpad=0.6,
+            columnspacing=1.4, borderpad=0.8,
+        )
+
+    LH = 0.22   # legend-height fraction
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Figure 1 — Full overview
+    # ══════════════════════════════════════════════════════════════════════════
+    fig1 = plt.figure(figsize=(15, 9))
+    ax1  = fig1.add_axes([0.07, LH + 0.07, 0.90, 0.90 - LH - 0.07])
+
+    leg_h1: list = []
+    leg_l1: list = []
+    outer_annots: list = []
+
+    for mtype in TYPE_ORDER:
+        pts = groups.get(mtype, [])
+        if not pts:
+            continue
+        marker, label, base_col = TYPE_META.get(mtype, ("o", mtype, "#888888"))
+        pts_s = sorted(pts, key=lambda p: p[0])
+
+        ax1.plot(
+            [p[0] for p in pts_s], [p[1] for p in pts_s],
+            color=base_col, linewidth=1.4, alpha=0.55, zorder=2,
+        )
+        for x, y, c, sname in pts_s:
+            ax1.scatter(x, y, color=c, marker=marker, s=110,
+                        edgecolors="black", linewidths=0.8, zorder=4)
+            # Only annotate outliers on the overview; cluster gets its own figure
+            if not _in_cluster(x, y):
+                a = ax1.annotate(
+                    sname, (x, y),
+                    textcoords="offset points", xytext=(6, 4),
+                    fontsize=8, ha="left", va="bottom", color="black", zorder=6,
+                    arrowprops=dict(
+                        arrowstyle="-", color="0.6", lw=0.5, shrinkA=0, shrinkB=3
+                    ),
+                )
+                outer_annots.append(a)
+
+        h = ax1.scatter([], [], color=base_col, marker=marker, s=90,
+                        edgecolors="black", linewidths=0.8)
+        leg_h1.append(h)
+        leg_l1.append(label)
+
+    # Dashed rectangle around the cluster region
+    ax1.add_patch(plt.Rectangle(
+        (x_zoom_lo, y_zoom_lo),
+        x_zoom_hi - x_zoom_lo, y_zoom_hi - y_zoom_lo,
+        linewidth=1.5, edgecolor="#333", facecolor="#f5f5f5",
+        linestyle="--", alpha=0.55, zorder=1,
+    ))
+    ax1.text(
+        x_zoom_lo + (x_zoom_hi - x_zoom_lo) * 0.02, y_zoom_hi * 0.94,
+        "→ see zoom figure (p4_zoom)",
+        fontsize=8.5, color="#333", va="top", ha="left",
+        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
+        zorder=8,
+    )
+
+    ax1.set_xlabel(
+        "Mean L0 Norm  (number of active latent features; fewer → sparser)", fontsize=11
+    )
+    ax1.set_ylabel("Val MSE  (lower = better reconstruction)", fontsize=11)
+    ax1.set_title(
+        "L0 – Reconstruction Trade-off  —  CelebA-HQ\n"
+        "Lines connect runs of the same model family (sorted by L0); "
+        "marker shape indicates family  |  dashed box = zoom region",
+        fontsize=11, fontweight="bold",
+    )
+    ax1.grid(alpha=0.3)
+
+    _deconflict_labels(ax1, fig1, outer_annots, n_iter=800, step_px=2.0)
+    _add_legend_strip(fig1, leg_h1, leg_l1)
+
+    fig1.savefig(save_dir / "p4_sparsity_recon_tradeoff.png", dpi=150, bbox_inches="tight")
+    plt.close(fig1)
+    print("  L0–reconstruction trade-off (overview) saved.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Figure 2 — Dense-cluster zoom (separate graphic)
+    # ══════════════════════════════════════════════════════════════════════════
+    fig2 = plt.figure(figsize=(18, 11))
+    ax2  = fig2.add_axes([0.07, LH + 0.07, 0.90, 0.90 - LH - 0.07])
+    ax2.set_xlim(x_zoom_lo, x_zoom_hi)
+    ax2.set_ylim(y_zoom_lo, y_zoom_hi * 1.08)
+
+    leg_h2: list = []
+    leg_l2: list = []
+    zoom_annots: list = []
+
+    for mtype in TYPE_ORDER:
+        pts = groups.get(mtype, [])
+        if not pts:
+            continue
+        marker, label, base_col = TYPE_META.get(mtype, ("o", mtype, "#888888"))
+        pts_s    = sorted(pts, key=lambda p: p[0])
+        pts_in   = [p for p in pts_s if _in_cluster(p[0], p[1])]
+        if not pts_in:
+            continue
+
+        xs     = [p[0] for p in pts_in]
+        ys     = [p[1] for p in pts_in]
+        cols   = [p[2] for p in pts_in]
+        shorts = [p[3] for p in pts_in]
+
+        if len(xs) > 1:
+            ax2.plot(xs, ys, color=base_col, linewidth=1.6, alpha=0.55, zorder=2)
+
+        for x, y, c, sname in zip(xs, ys, cols, shorts):
+            ax2.scatter(x, y, color=c, marker=marker, s=140,
+                        edgecolors="black", linewidths=0.9, zorder=4)
+            a = ax2.annotate(
+                sname, (x, y),
+                textcoords="offset points", xytext=(6, 4),
+                fontsize=8, ha="left", va="bottom", color="black", zorder=6,
+                arrowprops=dict(
+                    arrowstyle="-", color="0.6", lw=0.5, shrinkA=0, shrinkB=3
+                ),
+            )
+            zoom_annots.append(a)
+
+        h = ax2.scatter([], [], color=base_col, marker=marker, s=100,
+                        edgecolors="black", linewidths=0.8)
+        leg_h2.append(h)
+        leg_l2.append(label)
+
+    ax2.set_xlabel(
+        "Mean L0 Norm  (number of active latent features; fewer → sparser)", fontsize=12
+    )
+    ax2.set_ylabel("Val MSE  (lower = better reconstruction)", fontsize=12)
+    ax2.set_title(
+        "L0 – Reconstruction Trade-off  —  CelebA-HQ  [Dense Cluster Zoom]\n"
+        "Lines connect runs of the same model family (sorted by L0); "
+        "marker shape indicates family",
+        fontsize=12, fontweight="bold",
+    )
+    ax2.grid(alpha=0.3)
+
+    _deconflict_labels(ax2, fig2, zoom_annots, n_iter=1200, step_px=1.6)
+    _add_legend_strip(fig2, leg_h2, leg_l2)
+
+    fig2.savefig(
+        save_dir / "p4_sparsity_recon_tradeoff_zoom.png", dpi=150, bbox_inches="tight"
+    )
+    plt.close(fig2)
+    print("  L0–reconstruction trade-off (zoomed cluster) saved.")
 
 
 def make_summary_csv(
@@ -1164,6 +1444,7 @@ def main() -> None:
     )
     make_page2_sparsity(runs, all_metrics, save_dir)
     make_page3_feature_quality(runs, all_metrics, save_dir)
+    make_page4_sparsity_tradeoff(runs, all_metrics, save_dir)
     make_summary_csv(runs, all_metrics, save_dir)
 
     # ── combined 3-page overview ───────────────────────────────────────────
@@ -1174,6 +1455,8 @@ def main() -> None:
         save_dir / "p1_sample_reconstructions.png",
         save_dir / "p2_sparsity_analysis.png",
         save_dir / "p3_feature_quality.png",
+        save_dir / "p4_sparsity_recon_tradeoff.png",
+        save_dir / "p4_sparsity_recon_tradeoff_zoom.png",
     ]
     existing = [p for p in pages if p.exists()]
     if existing:

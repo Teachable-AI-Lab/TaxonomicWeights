@@ -1393,7 +1393,7 @@ def analyze_latent_sparsity(
     device: torch.device,
     save_dir: str,
     num_batches: int = 50,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ) -> None:
     """Sparsity and norm statistics of the latent space."""
     model.eval()
@@ -1575,7 +1575,7 @@ def analyze_partonomy_sparsity(
     device: torch.device,
     save_dir: str,
     num_batches: int = 30,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
     ablation_images: int = 16,
     n_clusters: int = 8,
 ) -> None:
@@ -1960,8 +1960,15 @@ def main() -> None:
     out_base = config.get("output", {}).get("output_dir", "")
     # Insert the dkl suffix right after the output_dir prefix so the analysis
     # directory lives inside the same dkl-tagged run folder as the checkpoints.
+    # Guard against double-insertion when the config already contains the
+    # fully-resolved path (e.g. ablation configs baked the suffix in).
     if out_base and run_suffix and save_dir_base.startswith(out_base):
-        save_dir_prefix = out_base + run_suffix + save_dir_base[len(out_base):]
+        remainder = save_dir_base[len(out_base):]
+        if remainder.startswith(run_suffix):
+            # Already resolved — use as-is.
+            save_dir_prefix = save_dir_base
+        else:
+            save_dir_prefix = out_base + run_suffix + remainder
     else:
         save_dir_prefix = save_dir_base.rstrip("/").rstrip("\\") + run_suffix
     experiment_name = config.get("experiment_name", "")
@@ -1975,7 +1982,12 @@ def main() -> None:
     if checkpoint_path is None:
         cfg_ckpt = analysis_cfg.get("checkpoint_path")
         if cfg_ckpt and run_suffix and out_base and cfg_ckpt.startswith(out_base):
-            checkpoint_path = out_base + run_suffix + cfg_ckpt[len(out_base):]
+            remainder = cfg_ckpt[len(out_base):]
+            if remainder.startswith(run_suffix):
+                # Already resolved — use as-is.
+                checkpoint_path = cfg_ckpt
+            else:
+                checkpoint_path = out_base + run_suffix + remainder
         else:
             checkpoint_path = cfg_ckpt
     if not checkpoint_path:

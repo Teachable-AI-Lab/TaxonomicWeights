@@ -3,7 +3,6 @@
 Subpackages:
     cnn/taxon     — CNN autoencoders with taxonomy routing
     cnn/baseline  — CNN sparse autoencoders (L1, TopK, Gated, JumpReLU)
-    saebench      — SAEBench-compatible linear SAEs for LLM residual streams
 """
 
 # ── CNN taxon models ──────────────────────────────────────────────────────
@@ -39,10 +38,6 @@ from .cnn.baseline import (
     JumpReLUSparseConvAutoencoder,
 )
 
-# ── SAEBench linear SAE models ───────────────────────────────────────────
-from .saebench.taxon_sae import TaxonSAE
-from .saebench.multi_taxon_sae import MultiTaxonSAE
-
 __all__ = [
     # CNN taxon
     "TaxonAutoencoder",
@@ -71,7 +66,4 @@ __all__ = [
     "GatedSparseConvAutoencoder",
     "JumpReLUSAEEncoder",
     "JumpReLUSparseConvAutoencoder",
-    # SAEBench linear
-    "TaxonSAE",
-    "MultiTaxonSAE",
 ]
