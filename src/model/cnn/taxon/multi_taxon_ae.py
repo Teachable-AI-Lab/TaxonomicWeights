@@ -14,10 +14,11 @@ inter-hierarchy gate.  Forward output exposes four regularization scalars:
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .decoder import TaxonResNetDecoder
 from .encoder import MultiTaxonResNetEncoder
@@ -43,12 +44,15 @@ class MultiTaxonAutoencoder(nn.Module):
         use_stem_maxpool: bool = True,
         output_activation: str = "none",
         depth_decay: float = 0.5,
+        skip_rank: int = 0,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
 
         self.default_hard = bool(hard)
         self.n_hierarchies = int(n_hierarchies)
         self.output_activation = output_activation.lower()
+        self.skip_rank = int(skip_rank)
 
         self.encoder = MultiTaxonResNetEncoder(
             in_channels=in_channels,
@@ -65,6 +69,7 @@ class MultiTaxonAutoencoder(nn.Module):
             stem_stride=stem_stride,
             use_stem_maxpool=use_stem_maxpool,
             depth_decay=depth_decay,
+            k_leaves=k_leaves,
         )
 
         self.decoder = TaxonResNetDecoder(
@@ -77,6 +82,16 @@ class MultiTaxonAutoencoder(nn.Module):
             stem_total_stride=self.encoder.stem_total_stride,
             kernel_size=kernel_size,
         )
+
+        # Low-rank skip connection (bypasses encoder + decoder).
+        if self.skip_rank > 0:
+            self.skip_down = nn.Conv2d(in_channels, skip_rank, kernel_size=1, bias=False)
+            self.skip_up = nn.Conv2d(skip_rank, in_channels, kernel_size=1, bias=True)
+            nn.init.kaiming_normal_(self.skip_down.weight, mode="fan_in")
+            self.skip_down.weight.data.mul_(0.01)
+            nn.init.kaiming_normal_(self.skip_up.weight, mode="fan_in")
+            self.skip_up.weight.data.mul_(0.01)
+            nn.init.zeros_(self.skip_up.bias)
 
     def encode(
         self,
@@ -131,6 +146,8 @@ class MultiTaxonAutoencoder(nn.Module):
         recon, dec_details = self.decoder(
             z, output_size=x.shape[-2:], return_details=return_details
         )
+        if self.skip_rank > 0:
+            recon = recon + self.skip_up(self.skip_down(x))
         recon = self._apply_output_activation(recon)
 
         dkl          = enc_details["dkl"]
@@ -144,3 +161,42 @@ class MultiTaxonAutoencoder(nn.Module):
                 "decoder": dec_details,
             }
         return recon, dkl, entropy, gate_dkl, gate_entropy
+
+    def forward_matryoshka(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+    ) -> Tuple[List[torch.Tensor], dict]:
+        """Forward pass returning one reconstruction per depth prefix.
+
+        Returns:
+            - ``prefix_recons`` — list of ``n_layers`` reconstructions, one per
+              depth prefix (index ``-1`` is the full-depth reconstruction).
+            - ``enc_details``   — encoder details dict with reg scalars.
+        """
+        if hard is None:
+            hard = self.default_hard
+        z, enc_details = self.encoder(x, hard=hard)
+
+        last_stage = self.encoder.multi_taxon_stages[-1]
+        n_layers = last_stage.n_taxonomy_layers
+        layer_ch = last_stage.layer_channels           # [2, 4, …, 2^L]
+        hier_ch = last_stage.hierarchy_out_channels     # sum(layer_ch)
+        K = self.n_hierarchies
+
+        skip_out = self.skip_up(self.skip_down(x)) if self.skip_rank > 0 else None
+
+        prefix_recons: List[torch.Tensor] = []
+        for d in range(n_layers):
+            prefix_ch = sum(layer_ch[: d + 1])
+            mask = torch.zeros(1, K * hier_ch, 1, 1, device=z.device)
+            for k in range(K):
+                start = k * hier_ch
+                mask[:, start : start + prefix_ch] = 1.0
+            z_prefix = z * mask
+            recon_d, _ = self.decoder(z_prefix, output_size=x.shape[-2:])
+            if skip_out is not None:
+                recon_d = recon_d + skip_out
+            prefix_recons.append(self._apply_output_activation(recon_d))
+
+        return prefix_recons, enc_details

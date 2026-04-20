@@ -49,6 +49,8 @@ class TopKTaxonAutoencoder(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
     ) -> None:
         super().__init__()
 
@@ -72,6 +74,9 @@ class TopKTaxonAutoencoder(nn.Module):
             temperature=temperature,
             hard=hard,
             depth_decay=depth_decay,
+            use_batch_topk=use_batch_topk,
+            warmup_steps=warmup_steps,
+            out_channels=in_channels,
         )
 
         self.decoder = TaxonResNetDecoder(

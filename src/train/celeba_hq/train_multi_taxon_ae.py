@@ -248,6 +248,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-steps", type=int,
                         default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
+    # v3 additions
+    parser.add_argument("--skip-rank", type=int,
+                        default=m.get("skip_rank", 0))
+    parser.add_argument("--k-leaves", type=int,
+                        default=m.get("k_leaves", 0))
+    parser.add_argument("--matryoshka", action="store_true",
+                        default=t.get("matryoshka", False))
     return parser.parse_args()
 
 
@@ -319,6 +326,8 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
+        skip_rank=args.skip_rank,
+        k_leaves=args.k_leaves,
     ).to(device)
 
     optimizer = AdamW(
@@ -391,8 +400,24 @@ def main() -> None:
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            recon, dkl, entropy, gate_dkl, gate_entropy = model(images, hard=args.hard)
-            recon_loss = F.mse_loss(recon, images)
+            if args.matryoshka:
+                prefix_recons, enc_details = model.forward_matryoshka(
+                    images, hard=args.hard
+                )
+                recon = prefix_recons[-1]  # full-depth for logging
+                recon_loss = sum(
+                    F.mse_loss(r, images) for r in prefix_recons
+                ) / len(prefix_recons)
+                dkl = enc_details["dkl"]
+                entropy = enc_details["entropy"]
+                gate_dkl = enc_details["gate_dkl"]
+                gate_entropy = enc_details["gate_entropy"]
+            else:
+                recon, dkl, entropy, gate_dkl, gate_entropy = model(
+                    images, hard=args.hard
+                )
+                recon_loss = F.mse_loss(recon, images)
+
             loss = (recon_loss
                     + args.dkl_weight          * dkl
                     + args.entropy_weight      * entropy

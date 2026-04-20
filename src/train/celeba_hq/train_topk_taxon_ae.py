@@ -198,12 +198,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dead-steps", type=int, default=m.get("dead_steps", 2000))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
+    parser.add_argument("--use-batch-topk", action="store_true", default=m.get("use_batch_topk", True))
+    parser.add_argument("--no-batch-topk", dest="use_batch_topk", action="store_false")
+    parser.add_argument("--warmup-steps", type=int, default=m.get("warmup_steps", 0))
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
     parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
     parser.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
     parser.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
     parser.add_argument("--auxk-weight", type=float, default=t.get("auxk_weight", 1.0 / 32))
+    parser.add_argument("--decoder-max-norm", type=float, default=t.get("decoder_max_norm", 1.0))
     parser.add_argument("--save-every", type=int, default=t.get("save_every", 5))
     parser.add_argument("--seed", type=int, default=t.get("seed", 42))
     parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
@@ -269,6 +273,8 @@ def main() -> None:
         temperature=args.temperature,
         hard=args.hard,
         depth_decay=_mc.get("depth_decay", 0.5),
+        use_batch_topk=args.use_batch_topk,
+        warmup_steps=args.warmup_steps,
     ).to(device)
 
     optimizer = AdamW(
@@ -306,6 +312,9 @@ def main() -> None:
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
         f"  k_aux={args.k_aux} dead_steps={args.dead_steps}\n"
         f"  auxk_weight={args.auxk_weight}\n"
+        f"  use_batch_topk={args.use_batch_topk}\n"
+        f"  warmup_steps={args.warmup_steps}\n"
+        f"  decoder_max_norm={args.decoder_max_norm}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 
@@ -340,6 +349,16 @@ def main() -> None:
             loss.backward()
             optimizer.step()
             scheduler.step()
+
+            # Change H: constrain decoder conv weights to max-norm 1.
+            if args.decoder_max_norm > 0:
+                with torch.no_grad():
+                    for module in model.decoder.modules():
+                        if isinstance(module, nn.Conv2d) and module.weight.requires_grad:
+                            w = module.weight
+                            norms = w.flatten(1).norm(dim=1, keepdim=True).clamp(min=1e-8)
+                            scale = norms.clamp(min=args.decoder_max_norm) / args.decoder_max_norm
+                            module.weight.div_(scale.view(-1, 1, 1, 1))
 
             running["loss"]  += float(loss.item())
             running["recon"] += float(recon_loss.item())

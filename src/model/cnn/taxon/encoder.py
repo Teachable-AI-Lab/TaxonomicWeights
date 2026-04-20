@@ -79,6 +79,47 @@ class ResidualConvBlock(nn.Module):
         return self.main(x) + self.skip(x)
 
 
+def _select_leaf_paths(
+    outputs: List[torch.Tensor],
+    all_probs: List[torch.Tensor],
+    k_leaves: int,
+) -> List[torch.Tensor]:
+    """Select top-*k_leaves* leaf paths per spatial position and zero the rest.
+
+    For each spatial position, the *k_leaves* leaf nodes (deepest depth) with
+    the highest cascaded probability are selected.  All ancestor nodes along
+    each selected path are kept; every other node is zeroed out.
+
+    Args:
+        outputs: Per-depth gated activations ``[B, 2^(d+1), H, W]``.
+        all_probs: Per-depth cascaded probabilities (same shapes).
+        k_leaves: Number of leaves to keep per spatial position.
+
+    Returns:
+        Masked outputs list (same shapes as *outputs*).
+    """
+    n_depths = len(outputs)
+    leaf_probs = all_probs[-1]                        # [B, 2^L, H, W]
+    B, n_leaves, H, W = leaf_probs.shape
+    k = min(k_leaves, n_leaves)
+    if k >= n_leaves:
+        return outputs
+
+    flat = leaf_probs.permute(0, 2, 3, 1).reshape(-1, n_leaves)
+    _, topk_idx = flat.topk(k, dim=-1)                # [B*H*W, k]
+
+    masked: List[torch.Tensor] = []
+    for d, out in enumerate(outputs):
+        n_ch = out.shape[1]                            # 2^(d+1)
+        shift = n_depths - 1 - d
+        anc = topk_idx >> shift                        # leaf→ancestor index
+        mask = torch.zeros(flat.shape[0], n_ch, device=out.device)
+        mask.scatter_(1, anc, 1.0)
+        mask = mask.reshape(B, H, W, n_ch).permute(0, 3, 1, 2)
+        masked.append(out * mask)
+    return masked
+
+
 class TaxonResNetStage(nn.Module):
     """One ResNet stage with taxonomy-constrained hierarchical routing.
 
@@ -96,6 +137,7 @@ class TaxonResNetStage(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -108,6 +150,7 @@ class TaxonResNetStage(nn.Module):
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
+        self.k_leaves = int(k_leaves)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -207,6 +250,7 @@ class TaxonResNetStage(nn.Module):
         """
         outputs: List[torch.Tensor] = []
         logps: List[torch.Tensor] = []
+        all_probs: List[torch.Tensor] = []
         prev: Optional[torch.Tensor] = None
 
         total_entropy = x.new_zeros(())
@@ -223,9 +267,14 @@ class TaxonResNetStage(nn.Module):
             total_entropy = total_entropy + depth_weight * entropy_i
             total_dkl = total_dkl + depth_weight * dkl_i
 
+            all_probs.append(prob)
             outputs.append(out)
             logps.append(logp)
             prev = logp
+
+        # Multi-leaf path selection: keep only the top-k_leaves paths.
+        if self.k_leaves > 0:
+            outputs = _select_leaf_paths(outputs, all_probs, self.k_leaves)
 
         return (
             torch.cat(outputs, dim=1),
@@ -475,6 +524,7 @@ class MultiTaxonResNetStage(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
         if n_hierarchies < 1:
@@ -490,6 +540,7 @@ class MultiTaxonResNetStage(nn.Module):
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
+        self.k_leaves = int(k_leaves)
 
         # K independent taxonomy stages — each has its own residual blocks and routing.
         self.hierarchies = nn.ModuleList([
@@ -502,6 +553,7 @@ class MultiTaxonResNetStage(nn.Module):
                 temperature=temperature,
                 hard=hard,
                 depth_decay=depth_decay,
+                k_leaves=k_leaves,
             )
             for _ in range(n_hierarchies)
         ])
@@ -639,6 +691,7 @@ class MultiTaxonResNetEncoder(nn.Module):
         stem_stride: int = 2,
         use_stem_maxpool: bool = True,
         depth_decay: float = 0.5,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
 
@@ -664,6 +717,7 @@ class MultiTaxonResNetEncoder(nn.Module):
         self.use_stem = bool(use_stem)
         self.stem_stride = int(stem_stride)
         self.use_stem_maxpool = bool(use_stem_maxpool)
+        self.k_leaves = int(k_leaves)
 
         # ── stem ──────────────────────────────────────────────────────────────
         if self.use_stem:
@@ -701,6 +755,7 @@ class MultiTaxonResNetEncoder(nn.Module):
                 temperature=self.temperature,
                 hard=self.default_hard,
                 depth_decay=depth_decay,
+                k_leaves=self.k_leaves,
             )
             self.multi_taxon_stages.append(stage)
             current_channels = stage.total_out_channels   # K * hierarchy_out_ch
@@ -796,6 +851,10 @@ class TopKTaxonResNetStage(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -808,6 +867,9 @@ class TopKTaxonResNetStage(nn.Module):
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
+        self.use_batch_topk = bool(use_batch_topk)
+        self.warmup_steps = int(warmup_steps)
+        self.k_leaves = int(k_leaves)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -815,6 +877,9 @@ class TopKTaxonResNetStage(nn.Module):
         self.topk_k = max(1, int(self.n_taxonomy_layers * self.topk_k_multiplier))
         self.k_aux = k_aux if k_aux is not None else self.n_taxonomy_layers
         self.dead_steps = int(dead_steps)
+
+        # Change E: learnable per-depth magnitude scales.
+        self.depth_scales = nn.Parameter(torch.ones(n_taxonomy_layers))
 
         blocks: List[nn.Module] = []
         for idx in range(self.n_blocks):
@@ -830,11 +895,16 @@ class TopKTaxonResNetStage(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
 
+        # Change D: lightweight projection for AuxK loss (dead features → pixel error).
+        self.auxk_proj = nn.Conv2d(self.total_out_channels, out_channels, kernel_size=1, bias=True)
+
         # Dead-node tracking: one counter per channel across all depths.
         self.register_buffer(
             "_steps_since_active",
             torch.zeros(self.total_out_channels, dtype=torch.long),
         )
+        # Change G: progressive warm-up step counter.
+        self.register_buffer("_warmup_step", torch.zeros(1, dtype=torch.long))
 
     @staticmethod
     def output_channels(n_taxonomy_layers: int) -> int:
@@ -922,7 +992,8 @@ class TopKTaxonResNetStage(nn.Module):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
-            out = logits * prob
+            # Change E: per-depth learnable scale before concatenation.
+            out = logits * prob * self.depth_scales[depth_idx]
 
             entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
@@ -934,17 +1005,43 @@ class TopKTaxonResNetStage(nn.Module):
             logps.append(logp)
             prev = logp
 
-        # ── TopK activation (ReLU + hard top-k per spatial location) ────
+        # Multi-leaf path selection: keep only the top-k_leaves paths.
+        if self.k_leaves > 0:
+            outputs = _select_leaf_paths(outputs, all_probs, self.k_leaves)
+
+        # ── TopK activation ────────────────────────────────────────────
         cat_output = torch.cat(outputs, dim=1)
         B, C, H, W = cat_output.shape
         k_eff = min(self.topk_k, C)
+
+        # Change G: progressive warm-up — start with all channels active,
+        # linearly anneal to target k over warmup_steps.
+        if self.training and self.warmup_steps > 0:
+            step = int(self._warmup_step.item())
+            progress = min(1.0, step / self.warmup_steps)
+            k_current = max(k_eff, int(C * (1.0 - progress) + k_eff * progress))
+            self._warmup_step += 1
+        else:
+            k_current = k_eff
+
         flat = cat_output.permute(0, 2, 3, 1).reshape(-1, C)
         flat_relu = F.relu(flat)
-        if k_eff < C:
-            _, topk_idx = flat_relu.topk(k_eff, dim=1)
-            mask = torch.zeros_like(flat_relu)
-            mask.scatter_(1, topk_idx, 1.0)
-            flat_relu = flat_relu * mask
+        if k_current < C:
+            if self.use_batch_topk:
+                # Change C: batch-level TopK — global threshold across all
+                # positions, allowing non-uniform activation counts.
+                flat_all = flat_relu.reshape(-1)              # [B*H*W*C]
+                total_keep = k_current * flat_relu.shape[0]   # k * (B*H*W)
+                if total_keep < flat_all.numel():
+                    threshold = flat_all.topk(total_keep).values[-1]
+                    mask = (flat_relu >= threshold).float()
+                    flat_relu = flat_relu * mask
+            else:
+                # Per-position TopK (original behaviour).
+                _, topk_idx = flat_relu.topk(k_current, dim=1)
+                mask = torch.zeros_like(flat_relu)
+                mask.scatter_(1, topk_idx, 1.0)
+                flat_relu = flat_relu * mask
         cat_output = flat_relu.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         # Track dead nodes: a channel is active if it survives TopK
@@ -992,15 +1089,16 @@ class TopKTaxonResNetStage(nn.Module):
         aux_mask.scatter_(1, aux_idx, 1.0)
         aux_mask = aux_mask.reshape(bsz, h, w, c).permute(0, 3, 1, 2)
 
-        error = (x_original - x_recon).detach()
-        dead_signal = (dead_vals * aux_mask).sum(dim=1, keepdim=True)
-        error_mean = error.mean(dim=1, keepdim=True)
-        if error_mean.shape[-2:] != dead_signal.shape[-2:]:
-            error_mean = torch.nn.functional.interpolate(
-                error_mean, size=dead_signal.shape[-2:],
+        # Change D: project dead features to pixel-space error (3-ch) instead of
+        # collapsing to a single scalar.  Provides a much stronger gradient signal.
+        error = (x_original - x_recon).detach()                   # [B, 3, H_img, W_img]
+        dead_signal = self.auxk_proj(dead_vals * aux_mask)         # [B, 3, H_stage, W_stage]
+        if error.shape[-2:] != dead_signal.shape[-2:]:
+            error = F.interpolate(
+                error, size=dead_signal.shape[-2:],
                 mode="bilinear", align_corners=False,
             )
-        return torch.nn.functional.mse_loss(dead_signal, error_mean)
+        return F.mse_loss(dead_signal, error)
 
 
 class TopKTaxonResNetEncoder(nn.Module):
@@ -1028,6 +1126,10 @@ class TopKTaxonResNetEncoder(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
 
@@ -1052,6 +1154,9 @@ class TopKTaxonResNetEncoder(nn.Module):
         self.use_stem = bool(use_stem)
         self.stem_stride = int(stem_stride)
         self.use_stem_maxpool = bool(use_stem_maxpool)
+        self.use_batch_topk = bool(use_batch_topk)
+        self.warmup_steps = int(warmup_steps)
+        self.k_leaves = int(k_leaves)
 
         if self.use_stem:
             stem_ops: List[nn.Module] = [
@@ -1087,6 +1192,10 @@ class TopKTaxonResNetEncoder(nn.Module):
                 temperature=self.temperature,
                 hard=self.default_hard,
                 depth_decay=depth_decay,
+                use_batch_topk=self.use_batch_topk,
+                warmup_steps=self.warmup_steps,
+                out_channels=out_channels,
+                k_leaves=self.k_leaves,
             )
             self.taxon_stages.append(stage)
             current_channels = stage.total_out_channels
@@ -1153,8 +1262,8 @@ class TopKMultiTaxonResNetStage(nn.Module):
     """Multi-hierarchy stage with hierarchical-routing + AuxK per hierarchy.
 
     K independent :class:`TopKTaxonResNetStage` hierarchies with a lightweight
-    inter-hierarchy gate.  The gate uses TopK (k=1 by default) to select a
-    single hierarchy per spatial location.
+    inter-hierarchy gate.  The gate uses TopK (k=2 by default) to select
+    hierarchies per spatial location.
     """
 
     def __init__(
@@ -1168,10 +1277,14 @@ class TopKMultiTaxonResNetStage(nn.Module):
         topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
-        gate_k: int = 1,
+        gate_k: int = 2,
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
         if n_hierarchies < 1:
@@ -1186,6 +1299,7 @@ class TopKMultiTaxonResNetStage(nn.Module):
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
+        self.k_leaves = int(k_leaves)
 
         self.hierarchies = nn.ModuleList([
             TopKTaxonResNetStage(
@@ -1200,6 +1314,10 @@ class TopKMultiTaxonResNetStage(nn.Module):
                 temperature=temperature,
                 hard=hard,
                 depth_decay=depth_decay,
+                use_batch_topk=use_batch_topk,
+                warmup_steps=warmup_steps,
+                out_channels=out_channels,
+                k_leaves=k_leaves,
             )
             for _ in range(n_hierarchies)
         ])
@@ -1285,7 +1403,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
-        gate_k: int = 1,
+        gate_k: int = 2,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -1294,6 +1412,10 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 0,
     ) -> None:
         super().__init__()
 
@@ -1316,6 +1438,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         self.use_stem = bool(use_stem)
         self.stem_stride = int(stem_stride)
         self.use_stem_maxpool = bool(use_stem_maxpool)
+        self.k_leaves = int(k_leaves)
 
         if self.use_stem:
             stem_ops: List[nn.Module] = [
@@ -1355,6 +1478,10 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
                 temperature=self.temperature,
                 hard=self.default_hard,
                 depth_decay=depth_decay,
+                use_batch_topk=use_batch_topk,
+                warmup_steps=warmup_steps,
+                out_channels=out_channels,
+                k_leaves=self.k_leaves,
             )
             self.multi_taxon_stages.append(stage)
             current_channels = stage.total_out_channels

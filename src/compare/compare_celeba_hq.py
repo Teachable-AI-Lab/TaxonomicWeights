@@ -149,7 +149,20 @@ def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
 
 # ─── helpers ───────────────────────────────────────────────────────────────────
 
-def _short_name(run_dir: str) -> str:
+import re as _re
+
+def _detect_version(run_path: Path) -> str:
+    """Detect version tag (e.g. 'v2', 'v3') from parent directory name.
+
+    Parent dirs like ``topk_multi_taxon_v2`` yield ``'v2'``.  Returns ``''``
+    for unversioned (v1) directories.
+    """
+    parent = run_path.parent.name
+    m = _re.search(r'_v(\d+)$', parent)
+    return f"v{m.group(1)}" if m else ""
+
+
+def _short_name(run_dir: str, version: str = "") -> str:
     """Make a readable short name for plot labels."""
     mtype = _model_type(run_dir)
     n = run_dir
@@ -164,7 +177,12 @@ def _short_name(run_dir: str) -> str:
                    "baseline_ae_celeba_hq"):
         n = n.replace(prefix, "").strip("_")
     n = n.replace("_", " ").strip()
-    suffix = f" ({n})" if n else ""
+    parts = []
+    if version:
+        parts.append(version)
+    if n:
+        parts.append(n)
+    suffix = f" ({', '.join(parts)})" if parts else ""
     return f"{mtype}{suffix}"
 
 
@@ -219,9 +237,11 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
         name = run_path.name
         if "celeba" not in name.lower():
             continue
+        version = _detect_version(run_path)
         runs.append({
             "name":       name,
-            "short":      _short_name(name),
+            "short":      _short_name(name, version=version),
+            "version":    version,
             "type":       _model_type(name),
             "path":       run_path,
             "best_ckpt":  best_ckpt,
@@ -265,7 +285,7 @@ def load_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TaxonAutoen
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
     )
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
     return model, ckpt
 
@@ -289,8 +309,10 @@ def load_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[Multi
         use_stem_maxpool=a.get("use_stem_maxpool", True),
         output_activation=a.get("output_activation", "none"),
         depth_decay=a.get("depth_decay", 0.5),
+        skip_rank=a.get("skip_rank", 0),
+        k_leaves=a.get("k_leaves", 0),
     )
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
     return model, ckpt
 
@@ -316,8 +338,10 @@ def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTa
         depth_decay=a.get("depth_decay", 0.5),
         temperature=a.get("temperature", 1.0),
         hard=a.get("hard", False),
+        use_batch_topk=a.get("use_batch_topk", True),
+        warmup_steps=a.get("warmup_steps", 0),
     )
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
     return model, ckpt
 
@@ -335,7 +359,7 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         k_aux=a.get("k_aux", None),
         topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
         dead_steps=a.get("dead_steps", 2000),
-        gate_k=a.get("gate_k", 1),
+        gate_k=a.get("gate_k", 2),
         kernel_size=a.get("kernel_size", 3),
         use_stem=a.get("use_stem", True),
         stem_channels=a.get("stem_channels", 64),
@@ -345,8 +369,12 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         depth_decay=a.get("depth_decay", 0.5),
         temperature=a.get("temperature", 1.0),
         hard=a.get("hard", False),
+        use_batch_topk=a.get("use_batch_topk", True),
+        warmup_steps=a.get("warmup_steps", 0),
+        skip_rank=a.get("skip_rank", 0),
+        k_leaves=a.get("k_leaves", 0),
     )
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
     return model, ckpt
 
