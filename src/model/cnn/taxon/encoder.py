@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def resolve_resnet_stage_blocks(
@@ -789,6 +790,7 @@ class TopKTaxonResNetStage(nn.Module):
         n_blocks: int,
         stride: int = 1,
         kernel_size: int = 3,
+        topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
         temperature: float = 1.0,
@@ -809,7 +811,9 @@ class TopKTaxonResNetStage(nn.Module):
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
-        self.k_aux = k_aux if k_aux is not None else max(1, self.total_out_channels // 2)
+        self.topk_k_multiplier = float(topk_k_multiplier)
+        self.topk_k = max(1, int(self.n_taxonomy_layers * self.topk_k_multiplier))
+        self.k_aux = k_aux if k_aux is not None else self.n_taxonomy_layers
         self.dead_steps = int(dead_steps)
 
         blocks: List[nn.Module] = []
@@ -930,18 +934,30 @@ class TopKTaxonResNetStage(nn.Module):
             logps.append(logp)
             prev = logp
 
-        # Track dead nodes: a node is "active" if it wins its sibling pair
-        # (prob > 0.5) in at least one spatial location for any sample.
+        # ── TopK activation (ReLU + hard top-k per spatial location) ────
+        cat_output = torch.cat(outputs, dim=1)
+        B, C, H, W = cat_output.shape
+        k_eff = min(self.topk_k, C)
+        flat = cat_output.permute(0, 2, 3, 1).reshape(-1, C)
+        flat_relu = F.relu(flat)
+        if k_eff < C:
+            _, topk_idx = flat_relu.topk(k_eff, dim=1)
+            mask = torch.zeros_like(flat_relu)
+            mask.scatter_(1, topk_idx, 1.0)
+            flat_relu = flat_relu * mask
+        cat_output = flat_relu.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+        # Track dead nodes: a channel is active if it survives TopK
+        # at any spatial location for any sample in the batch.
         if self.training:
-            all_prob = torch.cat(all_probs, dim=1)
-            any_active = all_prob.amax(dim=(0, 2, 3)) > 0.5
+            any_active = cat_output.amax(dim=(0, 2, 3)) > 0
             self._steps_since_active[any_active] = 0
             self._steps_since_active[~any_active] += 1
 
         dead_frac = (self._steps_since_active >= self.dead_steps).float().mean()
 
         return (
-            torch.cat(outputs, dim=1),
+            cat_output,
             torch.cat(logps, dim=1),
             {"entropy": total_entropy, "dkl": total_dkl, "dead_frac": dead_frac},
         )
@@ -1001,6 +1017,7 @@ class TopKTaxonResNetEncoder(nn.Module):
         stage_taxonomy_layers: Sequence[int] = (5, 6, 7, 8),
         stage_strides: Sequence[int] = (1, 2, 2, 2),
         stage_blocks: Optional[Sequence[int]] = None,
+        topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
         kernel_size: int = 3,
@@ -1027,6 +1044,7 @@ class TopKTaxonResNetEncoder(nn.Module):
         self.stage_blocks = tuple(int(v) for v in resolved_stage_blocks)
         self.stage_taxonomy_layers = tuple(int(v) for v in stage_taxonomy_layers)
         self.stage_strides = tuple(int(v) for v in stage_strides)
+        self.topk_k_multiplier = float(topk_k_multiplier)
         self.k_aux = k_aux
         self.dead_steps = int(dead_steps)
         self.temperature = float(temperature)
@@ -1063,6 +1081,7 @@ class TopKTaxonResNetEncoder(nn.Module):
                 n_blocks=blocks,
                 stride=stride,
                 kernel_size=kernel_size,
+                topk_k_multiplier=self.topk_k_multiplier,
                 k_aux=self.k_aux,
                 dead_steps=self.dead_steps,
                 temperature=self.temperature,
@@ -1146,6 +1165,7 @@ class TopKMultiTaxonResNetStage(nn.Module):
         n_hierarchies: int = 3,
         stride: int = 1,
         kernel_size: int = 3,
+        topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
         gate_k: int = 1,
@@ -1174,6 +1194,7 @@ class TopKMultiTaxonResNetStage(nn.Module):
                 n_blocks=n_blocks,
                 stride=stride,
                 kernel_size=kernel_size,
+                topk_k_multiplier=topk_k_multiplier,
                 k_aux=k_aux,
                 dead_steps=dead_steps,
                 temperature=temperature,
@@ -1261,6 +1282,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         stage_strides: Sequence[int] = (1, 2, 2, 2),
         stage_blocks: Optional[Sequence[int]] = None,
         n_hierarchies: int = 3,
+        topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
         gate_k: int = 1,
@@ -1326,6 +1348,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
                 n_hierarchies=self.n_hierarchies,
                 stride=stride,
                 kernel_size=kernel_size,
+                topk_k_multiplier=topk_k_multiplier,
                 k_aux=k_aux,
                 dead_steps=dead_steps,
                 gate_k=gate_k,

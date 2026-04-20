@@ -305,6 +305,7 @@ def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTa
         stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
         stage_blocks=a.get("stage_blocks", None),
         k_aux=a.get("k_aux", None),
+        topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
         dead_steps=a.get("dead_steps", 2000),
         kernel_size=a.get("kernel_size", 3),
         use_stem=a.get("use_stem", True),
@@ -332,6 +333,7 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         stage_blocks=a.get("stage_blocks", None),
         n_hierarchies=a.get("n_hierarchies", 3),
         k_aux=a.get("k_aux", None),
+        topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
         dead_steps=a.get("dead_steps", 2000),
         gate_k=a.get("gate_k", 1),
         kernel_size=a.get("kernel_size", 3),
@@ -516,7 +518,7 @@ def compute_live_metrics(
     val_loader,
     n_batches_latent: int = 20,
     n_batches_recon:  int = 10,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ) -> Dict:
     """Compute reconstruction MSE and latent sparsity from scratch."""
     model, ckpt = load_model(run, device)

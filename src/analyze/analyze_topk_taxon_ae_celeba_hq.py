@@ -80,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=cfg.get("training", {}).get("seed", 42))
     # TopK-specific
     parser.add_argument("--auxk-weight", type=float, default=cfg.get("training", {}).get("auxk_weight", 0.0))
+    parser.add_argument("--topk-k-multiplier", type=float, default=m.get("topk_k_multiplier", 1.0))
     # Analysis knobs
     parser.add_argument("--n-latent-batches", type=int, default=a.get("num_latent_batches", 50))
     parser.add_argument("--n-recon-batches", type=int, default=a.get("num_reconstruction_batches", 20))
@@ -103,7 +104,8 @@ def main() -> None:
 
     # ── run suffix (must match training script) ──
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = auxk_str
+    topk_mul_str = f"_topkmul_{args.topk_k_multiplier:.1f}" if args.topk_k_multiplier != 1.0 else ""
+    run_suffix = auxk_str + topk_mul_str
 
     output_dir = Path(args.output_dir + run_suffix)
     analysis_dir = Path(args.analysis_save_dir or str(output_dir / "analysis"))

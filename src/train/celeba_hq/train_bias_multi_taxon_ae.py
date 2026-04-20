@@ -68,9 +68,12 @@ def run_validation(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    sparsity_threshold: float = 0.1,
 ) -> dict:
     model.eval()
     total_loss = 0.0
+    total_l0 = 0.0
+    total_samples = 0
     num_batches = 0
 
     for images, _ in loader:
@@ -78,14 +81,21 @@ def run_validation(
         (recon,) = model(images)
         recon_loss = F.mse_loss(recon, images)
         total_loss += float(recon_loss.item())
+
+        z, _ = model.encode(images)
+        z_flat = z.detach().view(z.size(0), -1)
+        l0_batch = (z_flat.abs() > sparsity_threshold).float().sum(dim=1)
+        total_l0 += float(l0_batch.sum().item())
+        total_samples += z.size(0)
         num_batches += 1
 
     if num_batches == 0:
-        return {"loss": 0.0, "recon": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "mean_l0": 0.0}
 
     return {
         "loss":  total_loss / num_batches,
         "recon": total_loss / num_batches,
+        "mean_l0": total_l0 / max(1, total_samples),
     }
 
 
@@ -121,19 +131,29 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     with open(output_dir / "training_history.json", "w") as _f:
         _json.dump(history, _f, indent=2)
 
-    fig, ax = plt.subplots(1, 1, figsize=(7, 4))
-    ax.plot(epochs, history["train_loss"], label="train", linewidth=1.5)
-    ax.plot(epochs, history["val_loss"],   label="val",   linewidth=1.5, linestyle="--")
-    ax.set_title("Reconstruction Loss", fontsize=11)
+    has_l0 = "val_l0" in history and any(v is not None for v in history["val_l0"])
+    fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+    ax.plot(epochs, history["train_loss"], label="train MSE", linewidth=1.5)
+    ax.plot(epochs, history["val_loss"],   label="val MSE",   linewidth=1.5, linestyle="--")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MSE")
-    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     best_ep = epochs[int(min(range(len(history["val_loss"])),
                             key=lambda i: history["val_loss"][i]))]
     ax.axvline(best_ep, color="red", linestyle=":", linewidth=1.0,
                label=f"best val (ep {best_ep})")
-    ax.legend(fontsize=8)
+
+    if has_l0:
+        ax2 = ax.twinx()
+        ax2.plot(epochs, history["val_l0"], label="val L0",
+                 linewidth=1.5, linestyle="-.", color="tab:green")
+        ax2.set_ylabel("Mean L0 Norm (active features)", color="tab:green")
+        ax2.tick_params(axis="y", labelcolor="tab:green")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+    else:
+        ax.legend(fontsize=8)
 
     plt.suptitle("Training curves (Bias Multi-Taxon AE)", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -302,6 +322,7 @@ def main() -> None:
         "train_recon": [],
         "val_loss":    [],
         "val_recon":   [],
+        "val_l0":      [],
     }
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -348,7 +369,8 @@ def main() -> None:
         print(
             f"epoch={epoch:03d} time={elapsed:.1f}s "
             f"train_loss={train_stats['loss']:.5f} "
-            f"val_loss={val_stats['loss']:.5f}"
+            f"val_loss={val_stats['loss']:.5f} "
+            f"val_l0={val_stats.get('mean_l0', 0):.1f}"
         )
 
         # Print per-stage, per-hierarchy leaf bias and gate bias terms
@@ -373,6 +395,7 @@ def main() -> None:
         history["train_recon"].append(train_stats["recon"])
         history["val_loss"].append(val_stats["loss"])
         history["val_recon"].append(val_stats["recon"])
+        history["val_l0"].append(val_stats.get("mean_l0"))
 
         if epoch % args.save_every == 0:
             ckpt_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"

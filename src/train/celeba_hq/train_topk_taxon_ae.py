@@ -194,6 +194,7 @@ def parse_args() -> argparse.Namespace:
                         default=m.get("stage_strides", [1, 2, 2, 2]))
 
     parser.add_argument("--k-aux", type=int, default=m.get("k_aux", None))
+    parser.add_argument("--topk-k-multiplier", type=float, default=m.get("topk_k_multiplier", 1.0))
     parser.add_argument("--dead-steps", type=int, default=m.get("dead_steps", 2000))
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False))
@@ -215,7 +216,8 @@ def main() -> None:
     seed_everything(args.seed)
 
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
-    run_suffix = auxk_str
+    topk_mul_str = f"_topkmul_{args.topk_k_multiplier:.1f}" if args.topk_k_multiplier != 1.0 else ""
+    run_suffix = auxk_str + topk_mul_str
     output_dir  = Path(args.output_dir + run_suffix)
     ckpt_dir    = output_dir / "checkpoints"
     preview_dir = output_dir / "previews"
@@ -256,6 +258,7 @@ def main() -> None:
         stage_strides=tuple(args.stage_strides),
         stage_blocks=_mc.get("stage_blocks", None),
         k_aux=args.k_aux,
+        topk_k_multiplier=args.topk_k_multiplier,
         dead_steps=args.dead_steps,
         kernel_size=_mc.get("kernel_size", 3),
         use_stem=_mc.get("use_stem", True),
