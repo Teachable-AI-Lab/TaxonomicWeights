@@ -19,9 +19,11 @@ conda activate taxon-weights
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
 # ── Run training ───────────────────────────────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_matryoshka_batch_topk_sae_celeba_hq (job $SLURM_JOB_ID)"
+CONFIG="${1:-configs/celeba_hq/matryoshka_batch_topk_sae_celeba_hq.json}"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_matryoshka_batch_topk_sae_celeba_hq config=$CONFIG (job $SLURM_JOB_ID)"
 
 python src/train/celeba_hq/train_matryoshka_batch_topk_sae.py \
-    --config configs/celeba_hq/matryoshka_batch_topk_sae_celeba_hq.json
+    --config "$CONFIG"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_matryoshka_batch_topk_sae_celeba_hq (job $SLURM_JOB_ID)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_matryoshka_batch_topk_sae_celeba_hq config=$CONFIG (job $SLURM_JOB_ID)"

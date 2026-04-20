@@ -212,6 +212,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=t.get("seed", 42))
     parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
+    # v3 additions
+    parser.add_argument("--skip-rank", type=int, default=m.get("skip_rank", 0))
+    parser.add_argument("--k-leaves", type=int, default=m.get("k_leaves", 0))
+    parser.add_argument("--matryoshka", action="store_true", default=t.get("matryoshka", False))
     return parser.parse_args()
 
 
@@ -275,6 +279,8 @@ def main() -> None:
         depth_decay=_mc.get("depth_decay", 0.5),
         use_batch_topk=args.use_batch_topk,
         warmup_steps=args.warmup_steps,
+        skip_rank=args.skip_rank,
+        k_leaves=args.k_leaves,
     ).to(device)
 
     optimizer = AdamW(
@@ -341,9 +347,18 @@ def main() -> None:
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            recon, dead_frac = model(images)
-            recon_loss = F.mse_loss(recon, images)
-            auxk_loss = model.compute_auxk_loss(images, recon)
+            if args.matryoshka:
+                prefix_recons, enc_details = model.forward_matryoshka(images)
+                recon = prefix_recons[-1]
+                recon_loss = sum(
+                    F.mse_loss(r, images) for r in prefix_recons
+                ) / len(prefix_recons)
+                dead_frac = enc_details["dead_frac"]
+                auxk_loss = model.compute_auxk_loss(images, recon)
+            else:
+                recon, dead_frac = model(images)
+                recon_loss = F.mse_loss(recon, images)
+                auxk_loss = model.compute_auxk_loss(images, recon)
             loss = recon_loss + args.auxk_weight * auxk_loss
 
             loss.backward()
