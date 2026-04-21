@@ -874,7 +874,12 @@ class TopKTaxonResNetStage(nn.Module):
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
         self.topk_k_multiplier = float(topk_k_multiplier)
-        self.topk_k = max(1, int(self.n_taxonomy_layers * self.topk_k_multiplier))
+        # When k_leaves > 0, each of the k_leaves active paths contributes at most
+        # n_taxonomy_layers ancestor nodes, so scale topk_k accordingly.
+        if self.k_leaves > 0:
+            self.topk_k = max(1, int(self.k_leaves * self.n_taxonomy_layers * self.topk_k_multiplier))
+        else:
+            self.topk_k = max(1, int(self.n_taxonomy_layers * self.topk_k_multiplier))
         self.k_aux = k_aux if k_aux is not None else self.n_taxonomy_layers
         self.dead_steps = int(dead_steps)
 

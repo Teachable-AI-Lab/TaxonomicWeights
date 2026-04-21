@@ -61,6 +61,7 @@ class TopKMultiTaxonAutoencoder(nn.Module):
         self.output_activation = output_activation.lower()
         self.default_hard = hard
         self.skip_rank = int(skip_rank)
+        self.stem_channels = int(stem_channels)
 
         self.encoder = TopKMultiTaxonResNetEncoder(
             in_channels=in_channels,
@@ -98,15 +99,29 @@ class TopKMultiTaxonAutoencoder(nn.Module):
             kernel_size=kernel_size,
         )
 
-        # Low-rank skip connection (bypasses encoder + decoder).
+        # Low-rank skip connection operating in stem-feature space.
+        # skip_down/skip_up project through a rank-skip_rank bottleneck in the
+        # 64-channel stem space (r << stem_channels ensures genuine low rank).
+        # skip_proj then maps back to pixel space for the residual addition.
         if self.skip_rank > 0:
-            self.skip_down = nn.Conv2d(in_channels, skip_rank, kernel_size=1, bias=False)
-            self.skip_up = nn.Conv2d(skip_rank, in_channels, kernel_size=1, bias=True)
+            sc = int(stem_channels)
+            self.skip_down = nn.Conv2d(sc, skip_rank, kernel_size=1, bias=False)
+            self.skip_up   = nn.Conv2d(skip_rank, sc, kernel_size=1, bias=True)
+            self.skip_proj = nn.Conv2d(sc, in_channels, kernel_size=1, bias=True)
             nn.init.kaiming_normal_(self.skip_down.weight, mode="fan_in")
             self.skip_down.weight.data.mul_(0.01)
             nn.init.kaiming_normal_(self.skip_up.weight, mode="fan_in")
             self.skip_up.weight.data.mul_(0.01)
             nn.init.zeros_(self.skip_up.bias)
+            nn.init.zeros_(self.skip_proj.weight)  # skip inactive at init
+            nn.init.zeros_(self.skip_proj.bias)
+
+    def _compute_skip_recon(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the skip connection's additive contribution to reconstruction."""
+        s = self.encoder.stem(x)  # (B, stem_channels, H/s, W/s)
+        feat = self.skip_up(self.skip_down(s))  # low-rank in stem space
+        skip = self.skip_proj(feat)              # (B, in_channels, H/s, W/s)
+        return F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
     def encode(self, x, hard=None, return_details=False):
         return self.encoder(x, hard=hard, return_details=return_details)
@@ -154,7 +169,7 @@ class TopKMultiTaxonAutoencoder(nn.Module):
         z, enc_details = self.encode(x, hard=hard, return_details=return_details)
         recon, dec_details = self.decode(z, output_size=x.shape[-2:], return_details=return_details)
         if self.skip_rank > 0:
-            recon = recon + self.skip_up(self.skip_down(x))
+            recon = recon + self._compute_skip_recon(x)
         recon = self._apply_output_activation(recon)
 
         dead_frac = enc_details["dead_frac"]
@@ -192,7 +207,7 @@ class TopKMultiTaxonAutoencoder(nn.Module):
         hier_ch = last_stage.hierarchy_out_channels
         K = self.n_hierarchies
 
-        skip_out = self.skip_up(self.skip_down(x)) if self.skip_rank > 0 else None
+        skip_out = self._compute_skip_recon(x) if self.skip_rank > 0 else None
 
         prefix_recons: List[torch.Tensor] = []
         for d in range(n_layers):

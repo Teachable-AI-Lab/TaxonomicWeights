@@ -116,6 +116,12 @@ def load_model(
         mc["n_hierarchies"] = detected_n
 
     variant = mc.get("model_variant", _detect_multi_taxon_variant(state))
+    ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+
+    # Infer skip-rank from state when config does not specify it.
+    inferred_skip_rank = 0
+    if "skip_down.weight" in state and state["skip_down.weight"].ndim == 4:
+        inferred_skip_rank = int(state["skip_down.weight"].shape[0])
 
     common_kw = dict(
         in_channels=mc.get("in_channels", 3),
@@ -136,11 +142,16 @@ def load_model(
     if variant == 'topk':
         model = TopKMultiTaxonAutoencoder(
             **common_kw,
+            topk_k_multiplier=mc.get("topk_k_multiplier", 1.0),
             k_aux=mc.get("k_aux", None),
             dead_steps=mc.get("dead_steps", 2000),
-            gate_k=mc.get("gate_k", 1),
+            gate_k=mc.get("gate_k", 2),
             temperature=mc.get("temperature", 1.0),
             hard=mc.get("hard", False),
+            use_batch_topk=mc.get("use_batch_topk", ckpt_args.get("use_batch_topk", True)),
+            warmup_steps=mc.get("warmup_steps", ckpt_args.get("warmup_steps", 0)),
+            skip_rank=mc.get("skip_rank", ckpt_args.get("skip_rank", inferred_skip_rank)),
+            k_leaves=mc.get("k_leaves", ckpt_args.get("k_leaves", 0)),
         )
     elif variant == 'bias':
         model = BiasMultiTaxonAutoencoder(
@@ -158,7 +169,8 @@ def load_model(
             hard=mc.get("hard", False),
         )
 
-    model.load_state_dict(state, strict=True)
+    # Keep analysis backward/forward compatible across v1/v2/v3 checkpoints.
+    model.load_state_dict(state, strict=False)
     model.to(device)
     model.eval()
     print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
@@ -251,7 +263,9 @@ def save_training_curves(history: dict, save_dir: str) -> None:
             ax.plot(epochs, history[vk], label="val",   linewidth=1.5, linestyle="--")
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Epoch")
-        ax.legend(fontsize=7)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
     plt.suptitle("Training curves", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -1374,6 +1388,154 @@ def visualize_stage_activations(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# B1. Skip-connection decomposition (only runs when model has skip_rank > 0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def analyze_skip_decomposition(
+    model,
+    data_loader,
+    device: torch.device,
+    save_dir: str,
+    num_images: int = 8,
+    num_sets: int = 4,
+) -> None:
+    """Decompose reconstruction into tree (hierarchy) and skip contributions.
+
+    For each batch visualises:
+      row 0 — original
+      row 1 — tree-only reconstruction  (encoder + decoder, no skip)
+      row 2 — skip contribution         (the additive skip term)
+      row 3 — total reconstruction      (tree + skip, with output activation)
+
+    Also saves aggregate metrics:
+      - skip energy fraction  ||skip||² / ||total||²
+      - skip MSE              ||x - skip||²  (how well skip alone explains x)
+      - tree MSE              ||x - tree_only||²
+      - cosine similarity     cos(skip_vec, tree_vec)  per image
+    """
+    import torch.nn.functional as F
+
+    if not (hasattr(model, "skip_rank") and model.skip_rank > 0):
+        print("  Model has no skip connection — skipping B1.")
+        return
+
+    model.eval()
+    skip_dir = os.path.join(save_dir, "skip_decomposition")
+    os.makedirs(skip_dir, exist_ok=True)
+
+    skip_energy_fracs: List[float] = []
+    skip_mses:  List[float] = []
+    tree_mses:  List[float] = []
+    cos_sims:   List[float] = []
+
+    it = iter(data_loader)
+    for set_idx in range(num_sets):
+        try:
+            images, _ = next(it)
+        except StopIteration:
+            it = iter(data_loader)
+            images, _ = next(it)
+        images = images[:num_images].to(device)
+
+        # ── decomposed forward ─────────────────────────────────────────────
+        z, _        = model.encode(images)
+        tree_raw, _ = model.decode(z, output_size=images.shape[-2:])
+        skip_recon  = model._compute_skip_recon(images)           # additive skip term
+        total_recon = model._apply_output_activation(tree_raw + skip_recon)
+        tree_only   = model._apply_output_activation(tree_raw)    # tree alone
+
+        # ── aggregate metrics ──────────────────────────────────────────────
+        B = images.size(0)
+        skip_flat  = skip_recon.view(B, -1)
+        total_flat = total_recon.view(B, -1)
+        tree_flat  = tree_only.view(B, -1)
+        x_flat     = images.view(B, -1)
+
+        e_frac = (skip_flat.pow(2).sum(1) / (total_flat.pow(2).sum(1) + 1e-8)).cpu().tolist()
+        s_mse  = ((x_flat - skip_flat).pow(2).mean(1)).cpu().tolist()
+        t_mse  = ((x_flat - tree_flat).pow(2).mean(1)).cpu().tolist()
+        cos    = F.cosine_similarity(skip_flat, tree_flat, dim=1).cpu().tolist()
+
+        skip_energy_fracs.extend(e_frac)
+        skip_mses.extend(s_mse)
+        tree_mses.extend(t_mse)
+        cos_sims.extend(cos)
+
+        # ── visualise first set ────────────────────────────────────────────
+        if set_idx < num_sets:
+            rows = 4
+            fig, axes = plt.subplots(rows, num_images, figsize=(num_images * 2.5, rows * 2.5))
+            row_labels = ["Original", "Tree only", "Skip contribution", "Total recon"]
+            tensors    = [images, tree_only, skip_recon, total_recon]
+            for row, (label, t) in enumerate(zip(row_labels, tensors)):
+                # skip_recon may be negative — centre around 0 for display
+                norm = row != 2
+                for col in range(num_images):
+                    ax = axes[row, col]
+                    ax.imshow(_to_display(t[col:col+1], normalized=norm))
+                    ax.axis("off")
+                    if col == 0:
+                        ax.set_title(label, fontweight="bold", fontsize=9, loc="left")
+            plt.suptitle(
+                f"Skip decomposition — set {set_idx+1}  "
+                f"(skip_rank={model.skip_rank})",
+                fontsize=11,
+            )
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(skip_dir, f"decomp_set_{set_idx+1:02d}.png"),
+                dpi=150, bbox_inches="tight",
+            )
+            plt.close()
+
+    # ── aggregate stats ────────────────────────────────────────────────────
+    sef  = np.array(skip_energy_fracs)
+    smse = np.array(skip_mses)
+    tmse = np.array(tree_mses)
+    cs   = np.array(cos_sims)
+
+    stats = {
+        "skip_rank":             model.skip_rank,
+        "skip_energy_frac_mean": float(sef.mean()),
+        "skip_energy_frac_std":  float(sef.std()),
+        "skip_mse_mean":         float(smse.mean()),
+        "tree_mse_mean":         float(tmse.mean()),
+        "skip_tree_cos_sim_mean":float(cs.mean()),
+        "skip_tree_cos_sim_std": float(cs.std()),
+    }
+    with open(os.path.join(skip_dir, "skip_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"  skip_energy_frac  = {sef.mean():.3f} ± {sef.std():.3f}")
+    print(f"  tree MSE          = {tmse.mean():.6f}   skip MSE = {smse.mean():.6f}")
+    print(f"  skip⊥tree cos-sim = {cs.mean():.3f} ± {cs.std():.3f}  (≈0 means orthogonal)")
+    print(f"  Results saved to {skip_dir}")
+
+    # ── summary histogram ──────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].hist(sef, bins=40, edgecolor="black")
+    axes[0].axvline(sef.mean(), color="red", linestyle="--",
+                    label=f"mean={sef.mean():.3f}")
+    axes[0].set_title("Skip energy fraction"); axes[0].legend()
+
+    axes[1].hist(cs, bins=40, edgecolor="black")
+    axes[1].axvline(cs.mean(), color="red", linestyle="--",
+                    label=f"mean={cs.mean():.3f}")
+    axes[1].set_title("Skip ⊥ Tree cosine similarity"); axes[1].legend()
+
+    axes[2].bar(["Tree MSE", "Skip MSE"], [tmse.mean(), smse.mean()],
+                color=["steelblue", "darkorange"],
+                yerr=[tmse.std(), smse.std()], capsize=5)
+    axes[2].set_title("MSE: tree-only vs skip-only")
+
+    plt.suptitle(f"Skip decomposition summary (skip_rank={model.skip_rank})", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(skip_dir, "skip_summary.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # B2. Reconstruction quality
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2099,6 +2261,11 @@ def main() -> None:
     print("\n[A8] Stage activation maps")
     visualize_stage_activations(model, val_loader, device, save_dir,
                                 num_images=args.n_act_images)
+
+    print("\n[B1] Skip-connection decomposition")
+    analyze_skip_decomposition(model, val_loader, device, save_dir,
+                               num_images=args.n_recon_images,
+                               num_sets=args.n_recon_sets)
 
     print("\n[B2] Reconstruction quality")
     analyze_reconstruction_quality(model, val_loader, device, save_dir,

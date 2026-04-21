@@ -218,6 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-rank", type=int, default=m.get("skip_rank", 0))
     parser.add_argument("--k-leaves", type=int, default=m.get("k_leaves", 0))
     parser.add_argument("--matryoshka", action="store_true", default=t.get("matryoshka", False))
+    parser.add_argument("--matryoshka-weight", type=float, default=t.get("matryoshka_weight", 1.0))
     return parser.parse_args()
 
 
@@ -329,6 +330,7 @@ def main() -> None:
         f"  use_batch_topk={args.use_batch_topk}\n"
         f"  warmup_steps={args.warmup_steps}\n"
         f"  decoder_max_norm={args.decoder_max_norm}\n"
+        f"  matryoshka={args.matryoshka}  matryoshka_weight={args.matryoshka_weight}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}\n"
         f"  output_dir={output_dir}"
     )
@@ -353,9 +355,10 @@ def main() -> None:
             if args.matryoshka:
                 prefix_recons, enc_details = model.forward_matryoshka(images)
                 recon = prefix_recons[-1]
-                recon_loss = sum(
+                mat_loss = sum(
                     F.mse_loss(r, images) for r in prefix_recons
                 ) / len(prefix_recons)
+                recon_loss = args.matryoshka_weight * mat_loss
                 dead_frac = enc_details["dead_frac"]
                 auxk_loss = model.compute_auxk_loss(images, recon)
             else:

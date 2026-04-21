@@ -18,6 +18,8 @@ cd /nethome/ksingara3/flash/TaxonomicWeights
 source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights
 
+EXTRA_ARGS=("$@")
+
 python src/compare/compare_celeba_hq.py \
     --outputs-dir    ./outputs/celeba_hq \
     --save-dir       ./outputs/celeba_hq/comparison \
@@ -29,4 +31,5 @@ python src/compare/compare_celeba_hq.py \
     --n-latent-batches 25 \
     --n-recon-batches  10 \
     --n-recon-images   6 \
-    --device         cuda
+    --device         cuda \
+    "${EXTRA_ARGS[@]}"

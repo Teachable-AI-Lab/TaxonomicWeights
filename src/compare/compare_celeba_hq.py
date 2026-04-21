@@ -221,9 +221,37 @@ def _to_display(t: torch.Tensor) -> np.ndarray:
     return img.clamp(0, 1).numpy()
 
 
+def _is_ablation_run(run_path: Path, run_name: str) -> bool:
+    """Heuristic ablation detector based on directory path and run name.
+
+    Runs stored under a 'main' directory are never treated as ablations,
+    regardless of their name, so the full main suite is always included
+    in the default (no --ablations) comparison.
+    """
+    path_parts = {p.lower() for p in run_path.parts}
+    if "main" in path_parts:
+        return False
+    if "ablations" in path_parts:
+        return True
+
+    name = run_name.lower()
+    ablation_tokens = (
+        "ablation",
+        "abl_",
+        "_abl",
+        "_only",
+        "_no_",
+        "_minus_",
+        "noskip",
+        "nomatry",
+        "nokleaves",
+    )
+    return any(tok in name for tok in ablation_tokens)
+
+
 # ─── discovery ────────────────────────────────────────────────────────────────
 
-def discover_runs(outputs_dir: Path) -> List[Dict]:
+def discover_runs(outputs_dir: Path, include_ablations: bool = False) -> List[Dict]:
     """Return a list of run-info dicts, sorted by type then name.
 
     Recursively searches all subdirectories under outputs_dir for any
@@ -236,6 +264,8 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
         run_path = best_ckpt.parent.parent  # parent of checkpoints/
         name = run_path.name
         if "celeba" not in name.lower():
+            continue
+        if not include_ablations and _is_ablation_run(run_path, name):
             continue
         version = _detect_version(run_path)
         runs.append({
@@ -1194,13 +1224,11 @@ def make_page4_sparsity_tradeoff(
         print("  No L0/MSE data — skipping trade-off plot.")
         return
 
-    # ── zoom-region bounds (75th-percentile of data) ─────────────────────────
-    all_xs = np.array([p[0] for pts in groups.values() for p in pts])
-    all_ys = np.array([p[1] for pts in groups.values() for p in pts])
-    x_zoom_hi = float(np.percentile(all_xs, 75)) * 1.15 + 1.0
-    y_zoom_hi = float(np.percentile(all_ys, 75)) * 1.20 + 1e-5
-    x_zoom_lo = max(float(all_xs.min()) - 0.5, 0.0)
+    # ── zoom-region bounds (fixed: L0 < 1000, MSE < 0.02) ───────────────────
+    x_zoom_lo = 0.0
+    x_zoom_hi = 3000.0
     y_zoom_lo = 0.0
+    y_zoom_hi = 0.04
 
     def _in_cluster(x, y):
         return x_zoom_lo <= x <= x_zoom_hi and y_zoom_lo <= y <= y_zoom_hi
@@ -1529,6 +1557,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of images shown in the reconstruction panel.")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--ablations", action="store_true",
+                        help="Include ablation runs in comparisons. Default excludes ablations.")
     return parser.parse_args()
 
 
@@ -1540,7 +1570,7 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── discover runs ──────────────────────────────────────────────────────
-    runs = discover_runs(outputs_dir)
+    runs = discover_runs(outputs_dir, include_ablations=args.ablations)
     if not runs:
         print("No CelebA-HQ runs with a best.pt found under", outputs_dir)
         return
