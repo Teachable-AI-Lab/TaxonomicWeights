@@ -226,7 +226,8 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    hier_str = f"_K{args.n_hierarchies}"
+    _n_hier = args.n_hierarchies
+    hier_str = ("_K" + "-".join(str(h) for h in _n_hier)) if isinstance(_n_hier, list) else f"_K{_n_hier}"
     auxk_str = f"_auxk_{args.auxk_weight:.0e}" if args.auxk_weight else ""
     topk_mul_str = f"_topkmul_{args.topk_k_multiplier:.1f}" if args.topk_k_multiplier != 1.0 else ""
     run_suffix = hier_str + auxk_str + topk_mul_str

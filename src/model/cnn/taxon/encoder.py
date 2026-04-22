@@ -17,7 +17,7 @@ Regularization terms produced by each taxonomic stage:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1404,7 +1404,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         stage_taxonomy_layers: Sequence[int] = (5, 6, 7, 8),
         stage_strides: Sequence[int] = (1, 2, 2, 2),
         stage_blocks: Optional[Sequence[int]] = None,
-        n_hierarchies: int = 3,
+        n_hierarchies: Union[int, Sequence[int]] = 3,
         topk_k_multiplier: float = 1.0,
         k_aux: Optional[int] = None,
         dead_steps: int = 2000,
@@ -1437,7 +1437,21 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         self.stage_blocks = tuple(int(v) for v in resolved_stage_blocks)
         self.stage_taxonomy_layers = tuple(int(v) for v in stage_taxonomy_layers)
         self.stage_strides = tuple(int(v) for v in stage_strides)
-        self.n_hierarchies = int(n_hierarchies)
+
+        # Resolve per-stage hierarchy counts.
+        n_stages = len(self.stage_blocks)
+        if isinstance(n_hierarchies, (int, float)):
+            self.stage_n_hierarchies: List[int] = [int(n_hierarchies)] * n_stages
+        else:
+            self.stage_n_hierarchies = [int(h) for h in n_hierarchies]
+            if len(self.stage_n_hierarchies) != n_stages:
+                raise ValueError(
+                    f"n_hierarchies list length {len(self.stage_n_hierarchies)} "
+                    f"!= n_stages {n_stages}"
+                )
+        # Keep scalar for backward compat (last-stage value = widest stage).
+        self.n_hierarchies: int = self.stage_n_hierarchies[-1]
+
         self.temperature = float(temperature)
         self.default_hard = bool(hard)
         self.use_stem = bool(use_stem)
@@ -1465,15 +1479,15 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         self.stage_input_channels: List[int] = []
         self.multi_taxon_stages = nn.ModuleList()
 
-        for blocks, n_layers, stride in zip(
+        for stage_i, (blocks, n_layers, stride) in enumerate(zip(
             self.stage_blocks, self.stage_taxonomy_layers, self.stage_strides,
-        ):
+        )):
             self.stage_input_channels.append(current_channels)
             stage = TopKMultiTaxonResNetStage(
                 in_channels=current_channels,
                 n_taxonomy_layers=n_layers,
                 n_blocks=blocks,
-                n_hierarchies=self.n_hierarchies,
+                n_hierarchies=self.stage_n_hierarchies[stage_i],
                 stride=stride,
                 kernel_size=kernel_size,
                 topk_k_multiplier=topk_k_multiplier,
@@ -1510,7 +1524,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
             "stage_blocks": self.stage_blocks,
             "stage_taxonomy_layers": self.stage_taxonomy_layers,
             "stage_strides": self.stage_strides,
-            "n_hierarchies": self.n_hierarchies,
+            "n_hierarchies": self.stage_n_hierarchies,
         }
 
         x = self.stem(x)
@@ -1533,7 +1547,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
                     "output": x,
                     "logp": stage_logp,
                     "output_shape": tuple(x.shape),
-                    "n_hierarchies": self.n_hierarchies,
+                    "n_hierarchies": stage.n_hierarchies,
                     "hierarchy_out_channels": stage.hierarchy_out_channels,
                     "gate_probs": regs["gate_probs"],
                     "dead_frac": regs["dead_frac"],

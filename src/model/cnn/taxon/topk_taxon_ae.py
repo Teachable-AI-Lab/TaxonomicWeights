@@ -96,15 +96,18 @@ class TopKTaxonAutoencoder(nn.Module):
             kernel_size=kernel_size,
         )
 
-        # Low-rank skip connection operating in stem-feature space.
-        # skip_down/skip_up project through a rank-skip_rank bottleneck in the
-        # 64-channel stem space (r << stem_channels ensures genuine low rank).
+        # Low-rank skip connection branching from stage-0 output.
+        # By branching after the first encoder stage the skip sees the first
+        # level of learned sparse structure instead of raw stem features,
+        # making it a genuine complement to the tree rather than a shortcut.
+        # skip_down/skip_up project through a rank-r bottleneck in stage-0
+        # feature space (r << s0_channels ensures genuine low rank).
         # skip_proj then maps back to pixel space for the residual addition.
         if self.skip_rank > 0:
-            sc = int(stem_channels)
-            self.skip_down = nn.Conv2d(sc, skip_rank, kernel_size=1, bias=False)
-            self.skip_up   = nn.Conv2d(skip_rank, sc, kernel_size=1, bias=True)
-            self.skip_proj = nn.Conv2d(sc, in_channels, kernel_size=1, bias=True)
+            s0_channels = self.encoder.taxon_stages[0].total_out_channels
+            self.skip_down = nn.Conv2d(s0_channels, skip_rank, kernel_size=1, bias=False)
+            self.skip_up   = nn.Conv2d(skip_rank, s0_channels, kernel_size=1, bias=True)
+            self.skip_proj = nn.Conv2d(s0_channels, in_channels, kernel_size=1, bias=True)
             nn.init.kaiming_normal_(self.skip_down.weight, mode="fan_in")
             self.skip_down.weight.data.mul_(0.01)
             nn.init.kaiming_normal_(self.skip_up.weight, mode="fan_in")
@@ -114,10 +117,15 @@ class TopKTaxonAutoencoder(nn.Module):
             nn.init.zeros_(self.skip_proj.bias)
 
     def _compute_skip_recon(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the skip connection's additive contribution to reconstruction."""
-        s = self.encoder.stem(x)  # (B, stem_channels, H/s, W/s)
-        feat = self.skip_up(self.skip_down(s))  # low-rank in stem space
-        skip = self.skip_proj(feat)              # (B, in_channels, H/s, W/s)
+        """Return the skip connection's additive contribution to reconstruction.
+
+        Branches from stage-0 output so the skip operates on the first level
+        of learned sparse structure rather than raw stem features.
+        """
+        s = self.encoder.stem(x)                      # (B, stem_ch, H/s, W/s)
+        s0, _, _ = self.encoder.taxon_stages[0](s)    # (B, s0_ch, H1, W1)
+        feat = self.skip_up(self.skip_down(s0))        # low-rank bottleneck
+        skip = self.skip_proj(feat)                    # (B, in_channels, H1, W1)
         return F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
     def encode(

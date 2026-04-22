@@ -16,7 +16,7 @@
         "n_hierarchies": 3,
         "k_aux": null,
         "dead_steps": 2000,
-        "gate_k": 2,
+        "gate_k": 1,
         "kernel_size": 3,
         "use_stem": true,
         "stem_channels": 64,

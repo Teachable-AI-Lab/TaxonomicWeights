@@ -1,5 +1,6 @@
 {
-    "experiment_name": "topk_multi_taxon_ae_celeba_hq_r18_small_v3_abl_no_matryoshka",
+    "experiment_name": "topk_multi_taxon_ae_celeba_hq_r18_widen_d4_v3kleaves",
+    "description": "Widening multi-taxon: fixed depth L=4 per stage, hierarchies double [2,4,8,16] to achieve ~60/120/240/480-channel stages. k_leaves=2 per hierarchy, no skip or matryoshka.",
     "data": {
         "data_root": "./data/celeba_hq",
         "image_size": 256,
@@ -10,10 +11,10 @@
     "model": {
         "in_channels": 3,
         "resnet_variant": "18",
-        "stage_taxonomy_layers": [3, 4, 5, 6],
+        "stage_taxonomy_layers": [4, 4, 4, 4],
         "stage_strides": [1, 2, 2, 2],
         "stage_blocks": null,
-        "n_hierarchies": 3,
+        "n_hierarchies": [2, 4, 8, 16],
         "k_aux": null,
         "dead_steps": 2000,
         "gate_k": 1,
@@ -27,8 +28,8 @@
         "depth_decay": 0.5,
         "use_batch_topk": true,
         "warmup_steps": 5000,
-        "skip_rank": 8,
-        "k_leaves": 4
+        "skip_rank": 0,
+        "k_leaves": 2
     },
     "training": {
         "epochs": 90,
@@ -40,11 +41,11 @@
         "save_every": 5,
         "seed": 42,
         "max_train_steps": 0,
-        "matryoshka": false,
+        "matryoshka": true,
         "matryoshka_weight": 1.0
     },
     "analysis": {
-        "checkpoint_path": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_small_v3_abl_no_matryoshka_K3_auxk_1e-02/checkpoints/best.pt",
+        "checkpoint_path": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_widen_d4_v3kleaves_K2-4-8-16_auxk_1e-02/checkpoints/best.pt",
         "num_latent_batches": 50,
         "num_reconstruction_batches": 20,
         "num_multiple_recon_images": 8,
@@ -53,6 +54,6 @@
         "num_taxonomy_batches": 10
     },
     "output": {
-        "output_dir": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_small_v3_abl_no_matryoshka"
+        "output_dir": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_widen_d4_v3kleaves"
     }
 }

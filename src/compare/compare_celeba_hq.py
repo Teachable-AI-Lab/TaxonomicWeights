@@ -404,7 +404,11 @@ def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[
         skip_rank=a.get("skip_rank", 0),
         k_leaves=a.get("k_leaves", 0),
     )
-    model.load_state_dict(ckpt["model_state"], strict=False)
+    state = ckpt["model_state"]
+    model_state = model.state_dict()
+    filtered = {k: v for k, v in state.items()
+                if k not in model_state or v.shape == model_state[k].shape}
+    model.load_state_dict(filtered, strict=False)
     model.to(device).eval()
     return model, ckpt
 
@@ -1500,6 +1504,232 @@ def make_page5_taxon_ablation_bars(
     print("  Taxon ablation bar charts saved.")
 
 
+@torch.no_grad()
+def make_page6_skip_and_tree_quality(
+    runs: List[Dict],
+    save_dir: Path,
+    device: torch.device,
+    val_loader,
+    n_batches: int = 15,
+    sparsity_threshold: float = 1e-6,
+) -> None:
+    """Page 6: skip-connection memorisation + per-depth usable feature analysis.
+
+    Panel A — Skip memorisation (multi-taxon runs with skip_rank > 0):
+      • skip_energy_frac  = ||skip(x)||² / ||total_recon||²  (want ≈ low)
+      • skip_mse_frac     = MSE(x, skip_only) / MSE(x, tree_only)   (<1 = skip wins)
+      • tree_mse          = MSE(x, tree_only)   |  total_mse = MSE(x, tree+skip)
+
+    Panel B — Per-depth usable features (all topk_multi_taxon runs):
+      For each depth d, across all stages, the fraction of depth-d channels
+      that are ever active (non-dead) over n_batches.
+
+    Panel C — Depth utilisation heatmap: fraction active per (run × stage × depth).
+    """
+    multi_runs = [r for r in runs if r["type"] == "topk_multi_taxon"]
+    if not multi_runs:
+        print("  [p6] No topk_multi_taxon runs found — skipping.")
+        return
+
+    print(f"  [p6] Analysing {len(multi_runs)} topk_multi_taxon run(s)...")
+
+    skip_stats:  List[Dict] = []   # runs with skip_rank > 0
+    depth_stats: List[Dict] = []   # all multi-taxon runs
+
+    for run in multi_runs:
+        model, _ = load_model(run, device)
+        model.eval()
+        has_skip = hasattr(model, "skip_rank") and model.skip_rank > 0
+
+        stage_depth_active: Dict[Tuple[int, int], List[np.ndarray]] = {}
+        skip_energy_fracs, skip_mse_list, tree_mse_list, total_mse_list = [], [], [], []
+
+        for b_idx, (imgs, _) in enumerate(val_loader):
+            if b_idx >= n_batches:
+                break
+            imgs = imgs.to(device)
+
+            # ── skip decomposition ──────────────────────────────────────
+            if has_skip:
+                z, _ = model.encode(imgs)
+                tree_raw, _ = model.decode(z, output_size=imgs.shape[-2:])
+                skip_recon  = model._compute_skip_recon(imgs)
+                total_recon = model._apply_output_activation(tree_raw + skip_recon)
+                tree_only   = model._apply_output_activation(tree_raw)
+
+                B = imgs.size(0)
+                skip_flat  = skip_recon.reshape(B, -1)
+                total_flat = total_recon.reshape(B, -1)
+                tree_flat  = tree_only.reshape(B, -1)
+                x_flat     = imgs.reshape(B, -1)
+
+                skip_energy_fracs.extend(
+                    (skip_flat.pow(2).sum(1) / total_flat.pow(2).sum(1).clamp(min=1e-8))
+                    .cpu().tolist()
+                )
+                tree_mse_list.extend(((x_flat - tree_flat).pow(2).mean(1)).cpu().tolist())
+                skip_mse_list.extend(((x_flat - skip_flat).pow(2).mean(1)).cpu().tolist())
+                total_mse_list.extend(((x_flat - total_flat).pow(2).mean(1)).cpu().tolist())
+
+            # ── per-depth activity ──────────────────────────────────────
+            _, enc_details = model.encode(imgs, return_details=True)
+            for s_idx, stage_info in enumerate(enc_details.get("stages", [])):
+                out = stage_info["output"]          # [B, C_total, H, W]
+                K = stage_info.get("n_hierarchies", 1)
+                hier_out_ch = stage_info.get("hierarchy_out_channels", None)
+                if hier_out_ch is not None and K > 1:
+                    # Multi-taxon: output = [h0_channels | h1_channels | ... | hK-1_channels]
+                    # Split into K hierarchies, then per depth within each.
+                    hier_chunks = torch.split(out, hier_out_ch, dim=1)  # K tensors of [B, hier_out_ch, H, W]
+                    layer_channels = model.encoder.multi_taxon_stages[s_idx].layer_channels
+                    for d_idx, lc in enumerate(layer_channels):
+                        key = (s_idx, d_idx)
+                        # For each hierarchy, test which depth-d channels are active, then union across hierarchies
+                        d_offset = sum(layer_channels[:d_idx])
+                        d_active_any = np.zeros(lc, dtype=bool)
+                        for chunk in hier_chunks:
+                            d_slice = chunk[:, d_offset:d_offset + lc, :, :]
+                            active = (d_slice.abs().amax(dim=(0, 2, 3)) > sparsity_threshold).cpu().numpy()
+                            d_active_any |= active
+                        stage_depth_active.setdefault(key, []).append(d_active_any)
+                else:
+                    # Single-taxon or K=1: output channels directly split by layer_channels
+                    layer_channels = stage_info.get(
+                        "layer_channels",
+                        model.encoder.multi_taxon_stages[s_idx].layer_channels,
+                    )
+                    per_depth = torch.split(out, layer_channels, dim=1)
+                    for d_idx, d_out in enumerate(per_depth):
+                        key = (s_idx, d_idx)
+                        any_active = (
+                            d_out.abs().amax(dim=(0, 2, 3)) > sparsity_threshold
+                        ).cpu().numpy()
+                        stage_depth_active.setdefault(key, []).append(any_active)
+
+        # fraction of channels that were active in ≥1 batch
+        depth_act_frac: Dict[Tuple[int, int], float] = {
+            key: float(np.stack(batch_flags, axis=0).any(axis=0).mean())
+            for key, batch_flags in stage_depth_active.items()
+        }
+        depth_stats.append({"short": run["short"], "depth_act_frac": depth_act_frac})
+
+        if has_skip:
+            tree_mu  = float(np.mean(tree_mse_list))
+            skip_mu  = float(np.mean(skip_mse_list))
+            total_mu = float(np.mean(total_mse_list))
+            skip_stats.append({
+                "short":            run["short"],
+                "skip_rank":        model.skip_rank,
+                "skip_energy_frac": float(np.mean(skip_energy_fracs)),
+                "skip_energy_std":  float(np.std(skip_energy_fracs)),
+                "tree_mse_mean":    tree_mu,
+                "skip_mse_mean":    skip_mu,
+                "total_mse_mean":   total_mu,
+                # ratio < 1 → skip alone reconstructs better than tree alone (memorisation risk)
+                "skip_mse_frac":    skip_mu / max(tree_mu, 1e-12),
+            })
+        del model
+
+    with open(save_dir / "p6_skip_stats.json", "w") as f:
+        json.dump(skip_stats, f, indent=2)
+
+    # ── Panel A: skip memorisation bars ───────────────────────────────────
+    if skip_stats:
+        fig_a, axes_a = plt.subplots(1, 3, figsize=(max(8, len(skip_stats) * 1.6 + 2), 5))
+        labels = [s["short"] for s in skip_stats]
+        x = np.arange(len(labels))
+
+        axes_a[0].bar(x, [s["skip_energy_frac"] for s in skip_stats],
+                      yerr=[s["skip_energy_std"] for s in skip_stats],
+                      color="darkorange", capsize=4)
+        axes_a[0].set_xticks(x)
+        axes_a[0].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        axes_a[0].set_title("Skip energy fraction\n||skip||² / ||total||²  (lower = less dominant)")
+        axes_a[0].axhline(0.1, color="red", linestyle="--", linewidth=0.8, label="10%")
+        axes_a[0].legend(fontsize=7)
+
+        bar_w = 0.25
+        axes_a[1].bar(x - bar_w, [s["tree_mse_mean"]  for s in skip_stats], bar_w,
+                      label="tree only", color="steelblue")
+        axes_a[1].bar(x,         [s["skip_mse_mean"]  for s in skip_stats], bar_w,
+                      label="skip only", color="darkorange")
+        axes_a[1].bar(x + bar_w, [s["total_mse_mean"] for s in skip_stats], bar_w,
+                      label="tree+skip",  color="seagreen")
+        axes_a[1].set_xticks(x)
+        axes_a[1].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        axes_a[1].set_title("MSE decomposition\n(lower = better reconstruction)")
+        axes_a[1].legend(fontsize=7)
+
+        axes_a[2].bar(x, [s["skip_mse_frac"] for s in skip_stats], color="purple")
+        axes_a[2].axhline(1.0, color="red", linestyle="--", linewidth=0.8, label="skip=tree")
+        axes_a[2].set_xticks(x)
+        axes_a[2].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        axes_a[2].set_title("Skip MSE / Tree MSE\n(<1 = skip memorises better than tree → BAD)")
+        axes_a[2].legend(fontsize=7)
+
+        fig_a.suptitle("Panel A — Skip connection memorisation analysis",
+                       fontsize=12, fontweight="bold")
+        fig_a.tight_layout()
+        fig_a.savefig(save_dir / "p6a_skip_memorisation.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_a)
+        print("  [p6a] Skip memorisation saved.")
+
+    # ── Panel B: per-depth usable features (grouped bars) ─────────────────
+    all_keys: List[Tuple[int, int]] = sorted(
+        {k for ds in depth_stats for k in ds["depth_act_frac"]}
+    )
+    if depth_stats and all_keys:
+        n_depth_runs = len(depth_stats)
+        n_keys = len(all_keys)
+        fig_b, ax_b = plt.subplots(figsize=(max(10, n_keys * 0.6 + 2), 5))
+        bar_w = 0.8 / max(n_depth_runs, 1)
+        x = np.arange(n_keys)
+        for ri, ds in enumerate(depth_stats):
+            fracs = [ds["depth_act_frac"].get(k, 0.0) for k in all_keys]
+            offset = (ri - n_depth_runs / 2 + 0.5) * bar_w
+            ax_b.bar(x + offset, fracs, bar_w, label=ds["short"], alpha=0.85)
+        ax_b.set_xticks(x)
+        ax_b.set_xticklabels([f"s{s}d{d}" for (s, d) in all_keys],
+                              rotation=45, ha="right", fontsize=7)
+        ax_b.set_ylabel("Fraction of channels ever active")
+        ax_b.set_title(
+            "Panel B — Per-depth usable features\n"
+            "s=stage, d=depth  (d0=root, higher=deeper leaf)"
+        )
+        ax_b.axhline(1.0, color="gray", linestyle="--", linewidth=0.7)
+        handles, lbls = ax_b.get_legend_handles_labels()
+        if handles:
+            ax_b.legend(handles, lbls, fontsize=6, ncol=min(4, n_depth_runs), loc="upper right")
+        fig_b.tight_layout()
+        fig_b.savefig(save_dir / "p6b_depth_usable_features.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_b)
+        print("  [p6b] Per-depth usable features saved.")
+
+        # ── Panel C: depth utilisation heatmap ────────────────────────────
+        n_r = len(depth_stats)
+        n_k = len(all_keys)
+        mat = np.zeros((n_r, n_k))
+        for ri, ds in enumerate(depth_stats):
+            for ki, k in enumerate(all_keys):
+                mat[ri, ki] = ds["depth_act_frac"].get(k, 0.0)
+
+        fig_c, ax_c = plt.subplots(
+            figsize=(max(8, n_k * 0.55 + 1.5), max(3, n_r * 0.45 + 1.5))
+        )
+        im = ax_c.imshow(mat, aspect="auto", vmin=0, vmax=1, cmap="YlOrRd")
+        ax_c.set_xticks(np.arange(n_k))
+        ax_c.set_xticklabels([f"s{s}d{d}" for (s, d) in all_keys],
+                              rotation=45, ha="right", fontsize=7)
+        ax_c.set_yticks(np.arange(n_r))
+        ax_c.set_yticklabels([ds["short"] for ds in depth_stats], fontsize=7)
+        plt.colorbar(im, ax=ax_c, label="Fraction of channels ever active")
+        ax_c.set_title("Panel C — Depth utilisation heatmap  (1=fully used, 0=all dead)")
+        fig_c.tight_layout()
+        fig_c.savefig(save_dir / "p6c_depth_heatmap.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_c)
+        print("  [p6c] Depth utilisation heatmap saved.")
+
+
 def make_summary_csv(
     runs: List[Dict],
     all_metrics: List[Dict],
@@ -1624,6 +1854,9 @@ def main() -> None:
     make_page3_feature_quality(runs, all_metrics, save_dir)
     make_page4_sparsity_tradeoff(runs, all_metrics, save_dir)
     make_page5_taxon_ablation_bars(runs, all_metrics, save_dir)
+    make_page6_skip_and_tree_quality(
+        runs, save_dir, device, val_loader, n_batches=args.n_latent_batches
+    )
     make_summary_csv(runs, all_metrics, save_dir)
 
     # ── combined 3-page overview ───────────────────────────────────────────
@@ -1637,6 +1870,9 @@ def main() -> None:
         save_dir / "p4_sparsity_recon_tradeoff.png",
         save_dir / "p4_sparsity_recon_tradeoff_zoom.png",
         save_dir / "p5_taxon_ablation_bars.png",
+        save_dir / "p6a_skip_memorisation.png",
+        save_dir / "p6b_depth_usable_features.png",
+        save_dir / "p6c_depth_heatmap.png",
     ]
     existing = [p for p in pages if p.exists()]
     if existing:

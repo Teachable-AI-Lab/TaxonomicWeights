@@ -108,12 +108,20 @@ def load_model(
     print(f"Loading checkpoint: {checkpoint_path} ({os.path.getsize(checkpoint_path)/1e6:.1f} MB)")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     mc = dict(config.get("model", {}))
-    # Auto-detect n_hierarchies from state_dict to avoid mismatch with config defaults
+    # Auto-detect per-stage n_hierarchies from state_dict
     state = checkpoint.get("model_state", checkpoint)
-    hier_keys = [k for k in state if "multi_taxon_stages.0.hierarchies." in k]
-    if hier_keys:
-        detected_n = max(int(k.split(".hierarchies.")[1].split(".")[0]) for k in hier_keys) + 1
-        mc["n_hierarchies"] = detected_n
+    _stage_hier: dict = {}
+    for _k in state:
+        if "multi_taxon_stages." in _k and ".hierarchies." in _k:
+            try:
+                _si = int(_k.split("multi_taxon_stages.")[1].split(".")[0])
+                _hi = int(_k.split(".hierarchies.")[1].split(".")[0])
+                _stage_hier[_si] = max(_stage_hier.get(_si, 0), _hi + 1)
+            except (IndexError, ValueError):
+                pass
+    if _stage_hier:
+        _per_stage = [_stage_hier[i] for i in sorted(_stage_hier)]
+        mc["n_hierarchies"] = _per_stage if len(set(_per_stage)) > 1 else _per_stage[0]
 
     variant = mc.get("model_variant", _detect_multi_taxon_variant(state))
     ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
@@ -2144,7 +2152,8 @@ def main() -> None:
     temp_str       = f"{args.temperature:g}".replace(".", "p")
     temp_suffix    = f"_temp_{temp_str}"
     hard_suffix    = "_hard" if args.hard else ""
-    hier_suffix    = f"_K{args.n_hierarchies}"
+    _n_hier_val = args.n_hierarchies
+    hier_suffix    = ("_K" + "-".join(str(h) for h in _n_hier_val)) if isinstance(_n_hier_val, list) else f"_K{_n_hier_val}"
     entropy_suffix = f"_ew_{args.entropy_weight:.0e}"      if args.entropy_weight      else ""
     gdkl_suffix    = f"_gdkl_{args.gate_dkl_weight:.0e}"   if args.gate_dkl_weight     else ""
     gew_suffix     = f"_gew_{args.gate_entropy_weight:.0e}" if args.gate_entropy_weight else ""
