@@ -69,32 +69,40 @@ def run_validation(
     loader: DataLoader,
     device: torch.device,
     auxk_weight: float,
+    dkl_weight: float = 0.0,
 ) -> dict:
     model.eval()
-    total_loss = total_recon = total_auxk = total_dead = 0.0
+    total_loss = total_recon = total_auxk = total_dead = total_dkl = 0.0
     num_batches = 0
 
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        recon, dead_frac = model(images)
+        if dkl_weight > 0:
+            recon, dead_frac, details = model(images, return_details=True)
+            dkl = float(details["encoder"]["dkl"].item())
+        else:
+            recon, dead_frac = model(images)
+            dkl = 0.0
         recon_loss = F.mse_loss(recon, images)
         auxk_loss = model.compute_auxk_loss(images, recon)
-        loss = recon_loss + auxk_weight * auxk_loss
+        loss = recon_loss + auxk_weight * auxk_loss + dkl_weight * dkl
 
         total_loss  += float(loss.item())
         total_recon += float(recon_loss.item())
         total_auxk  += float(auxk_loss.item())
         total_dead  += float(dead_frac.item())
+        total_dkl   += dkl
         num_batches += 1
 
     if num_batches == 0:
-        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0, "dkl": 0.0}
 
     return {
         "loss":      total_loss  / num_batches,
         "recon":     total_recon / num_batches,
         "auxk":      total_auxk  / num_batches,
         "dead_frac": total_dead  / num_batches,
+        "dkl":       total_dkl   / num_batches,
     }
 
 
@@ -207,15 +215,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
     parser.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
     parser.add_argument("--auxk-weight", type=float, default=t.get("auxk_weight", 1.0 / 32))
+    parser.add_argument("--dkl-weight", type=float, default=t.get("dkl_weight", 0.0))
     parser.add_argument("--decoder-max-norm", type=float, default=t.get("decoder_max_norm", 1.0))
     parser.add_argument("--save-every", type=int, default=t.get("save_every", 5))
     parser.add_argument("--seed", type=int, default=t.get("seed", 42))
     parser.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
-    # v3 additions
-    parser.add_argument("--skip-rank", type=int, default=m.get("skip_rank", 0))
+    # v3/v4 additions
     parser.add_argument("--k-leaves", type=int, default=m.get("k_leaves", 0))
     parser.add_argument("--matryoshka", action="store_true", default=t.get("matryoshka", False))
+    parser.add_argument("--weighted-matryoshka", action="store_true", default=t.get("weighted_matryoshka", False))
+    parser.add_argument("--use-gate-value", action="store_true", default=m.get("use_gate_value", False))
     return parser.parse_args()
 
 
@@ -279,8 +289,8 @@ def main() -> None:
         depth_decay=_mc.get("depth_decay", 0.5),
         use_batch_topk=args.use_batch_topk,
         warmup_steps=args.warmup_steps,
-        skip_rank=args.skip_rank,
         k_leaves=args.k_leaves,
+        use_gate_value=args.use_gate_value,
     ).to(device)
 
     optimizer = AdamW(
@@ -317,10 +327,11 @@ def main() -> None:
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
         f"  k_aux={args.k_aux} dead_steps={args.dead_steps}\n"
-        f"  auxk_weight={args.auxk_weight}\n"
+        f"  auxk_weight={args.auxk_weight}  dkl_weight={args.dkl_weight}\n"
         f"  use_batch_topk={args.use_batch_topk}\n"
         f"  warmup_steps={args.warmup_steps}\n"
         f"  decoder_max_norm={args.decoder_max_norm}\n"
+        f"  use_gate_value={args.use_gate_value}  weighted_matryoshka={args.weighted_matryoshka}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 
@@ -350,16 +361,31 @@ def main() -> None:
             if args.matryoshka:
                 prefix_recons, enc_details = model.forward_matryoshka(images)
                 recon = prefix_recons[-1]
-                recon_loss = sum(
-                    F.mse_loss(r, images) for r in prefix_recons
-                ) / len(prefix_recons)
+                if args.weighted_matryoshka:
+                    n_d = len(prefix_recons)
+                    weights = [2 ** d for d in range(n_d)]
+                    w_sum = sum(weights)
+                    recon_loss = sum(
+                        w * F.mse_loss(r, images) / w_sum
+                        for w, r in zip(weights, prefix_recons)
+                    )
+                else:
+                    recon_loss = sum(
+                        F.mse_loss(r, images) for r in prefix_recons
+                    ) / len(prefix_recons)
                 dead_frac = enc_details["dead_frac"]
+                dkl = enc_details["dkl"] if args.dkl_weight > 0 else images.new_zeros(())
                 auxk_loss = model.compute_auxk_loss(images, recon)
             else:
-                recon, dead_frac = model(images)
+                if args.dkl_weight > 0:
+                    recon, dead_frac, details = model(images, return_details=True)
+                    dkl = details["encoder"]["dkl"]
+                else:
+                    recon, dead_frac = model(images)
+                    dkl = images.new_zeros(())
                 recon_loss = F.mse_loss(recon, images)
                 auxk_loss = model.compute_auxk_loss(images, recon)
-            loss = recon_loss + args.auxk_weight * auxk_loss
+            loss = recon_loss + args.auxk_weight * auxk_loss + args.dkl_weight * dkl
 
             loss.backward()
             optimizer.step()
@@ -401,6 +427,7 @@ def main() -> None:
             loader=val_loader,
             device=device,
             auxk_weight=args.auxk_weight,
+            dkl_weight=args.dkl_weight,
         )
 
         elapsed = time.time() - epoch_start

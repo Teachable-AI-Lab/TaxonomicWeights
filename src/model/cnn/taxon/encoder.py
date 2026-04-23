@@ -138,6 +138,7 @@ class TaxonResNetStage(nn.Module):
         hard: bool = False,
         depth_decay: float = 0.5,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -151,6 +152,7 @@ class TaxonResNetStage(nn.Module):
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
         self.k_leaves = int(k_leaves)
+        self.use_gate_value = bool(use_gate_value)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -168,6 +170,11 @@ class TaxonResNetStage(nn.Module):
                 )
             )
         self.blocks = nn.ModuleList(blocks)
+        if self.use_gate_value:
+            channels = self.total_out_channels
+            self.value_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+            self.value_conv.weight.data.copy_(torch.eye(channels).view(channels, channels, 1, 1))
+            nn.init.zeros_(self.value_conv.bias)
 
     @staticmethod
     def output_channels(n_taxonomy_layers: int) -> int:
@@ -256,11 +263,19 @@ class TaxonResNetStage(nn.Module):
         total_entropy = x.new_zeros(())
         total_dkl = x.new_zeros(())
 
-        for depth_idx, logits in enumerate(self._taxon_logits_per_depth(x)):
+        routing_per_depth = self._taxon_logits_per_depth(x)
+        if self.use_gate_value:
+            value_feats = self.value_conv(torch.cat(routing_per_depth, dim=1))
+            value_per_depth = list(torch.split(value_feats, self.layer_channels, dim=1))
+
+        for depth_idx, logits in enumerate(routing_per_depth):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
-            out = logits * prob
+            if self.use_gate_value:
+                out = value_per_depth[depth_idx] * prob
+            else:
+                out = logits * prob
 
             entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
@@ -365,6 +380,7 @@ class TaxonResNetEncoder(nn.Module):
         stem_stride: int = 2,
         use_stem_maxpool: bool = True,
         depth_decay: float = 0.5,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
 
@@ -389,6 +405,7 @@ class TaxonResNetEncoder(nn.Module):
         self.use_stem = bool(use_stem)
         self.stem_stride = int(stem_stride)
         self.use_stem_maxpool = bool(use_stem_maxpool)
+        self.use_gate_value = bool(use_gate_value)
 
         if self.use_stem:
             stem_ops: List[nn.Module] = [
@@ -420,6 +437,7 @@ class TaxonResNetEncoder(nn.Module):
                 temperature=self.temperature,
                 hard=self.default_hard,
                 depth_decay=depth_decay,
+                use_gate_value=self.use_gate_value,
             )
             self.taxon_stages.append(stage)
             current_channels = stage.total_out_channels
@@ -525,6 +543,7 @@ class MultiTaxonResNetStage(nn.Module):
         hard: bool = False,
         depth_decay: float = 0.5,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
         if n_hierarchies < 1:
@@ -541,6 +560,7 @@ class MultiTaxonResNetStage(nn.Module):
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
         self.k_leaves = int(k_leaves)
+        self.use_gate_value = bool(use_gate_value)
 
         # K independent taxonomy stages — each has its own residual blocks and routing.
         self.hierarchies = nn.ModuleList([
@@ -554,6 +574,7 @@ class MultiTaxonResNetStage(nn.Module):
                 hard=hard,
                 depth_decay=depth_decay,
                 k_leaves=k_leaves,
+                use_gate_value=use_gate_value,
             )
             for _ in range(n_hierarchies)
         ])
@@ -692,6 +713,7 @@ class MultiTaxonResNetEncoder(nn.Module):
         use_stem_maxpool: bool = True,
         depth_decay: float = 0.5,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
 
@@ -718,6 +740,7 @@ class MultiTaxonResNetEncoder(nn.Module):
         self.stem_stride = int(stem_stride)
         self.use_stem_maxpool = bool(use_stem_maxpool)
         self.k_leaves = int(k_leaves)
+        self.use_gate_value = bool(use_gate_value)
 
         # ── stem ──────────────────────────────────────────────────────────────
         if self.use_stem:
@@ -756,6 +779,7 @@ class MultiTaxonResNetEncoder(nn.Module):
                 hard=self.default_hard,
                 depth_decay=depth_decay,
                 k_leaves=self.k_leaves,
+                use_gate_value=self.use_gate_value,
             )
             self.multi_taxon_stages.append(stage)
             current_channels = stage.total_out_channels   # K * hierarchy_out_ch
@@ -855,6 +879,7 @@ class TopKTaxonResNetStage(nn.Module):
         warmup_steps: int = 0,
         out_channels: int = 3,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -868,6 +893,7 @@ class TopKTaxonResNetStage(nn.Module):
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
         self.use_batch_topk = bool(use_batch_topk)
+        self.use_gate_value = bool(use_gate_value)
         self.warmup_steps = int(warmup_steps)
         self.k_leaves = int(k_leaves)
 
@@ -902,6 +928,19 @@ class TopKTaxonResNetStage(nn.Module):
 
         # Change D: lightweight projection for AuxK loss (dead features → pixel error).
         self.auxk_proj = nn.Conv2d(self.total_out_channels, out_channels, kernel_size=1, bias=True)
+
+        # Gate-value decomposition: separate linear head for decoder values.
+        # Routing logits (from residual blocks) control which nodes activate;
+        # value_conv outputs provide the actual decoder inputs, removing the
+        # routing–value entanglement and full-magnitude attenuation.
+        if self.use_gate_value:
+            C = self.total_out_channels
+            self.value_conv = nn.Conv2d(C, C, kernel_size=1, bias=True)
+            # Identity init so behaviour at step 0 matches the baseline.
+            self.value_conv.weight.data.copy_(
+                torch.eye(C).view(C, C, 1, 1)
+            )
+            nn.init.zeros_(self.value_conv.bias)
 
         # Dead-node tracking: one counter per channel across all depths.
         self.register_buffer(
@@ -993,12 +1032,22 @@ class TopKTaxonResNetStage(nn.Module):
         total_entropy = x.new_zeros(())
         total_dkl = x.new_zeros(())
 
-        for depth_idx, logits in enumerate(self._taxon_logits_per_depth(x)):
+        routing_per_depth = self._taxon_logits_per_depth(x)
+        if self.use_gate_value:
+            # Compute value features from the separate value head.
+            value_feats = self.value_conv(torch.cat(routing_per_depth, dim=1))
+            value_per_depth = list(torch.split(value_feats, self.layer_channels, dim=1))
+
+        for depth_idx, logits in enumerate(routing_per_depth):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
-            # Change E: per-depth learnable scale before concatenation.
-            out = logits * prob * self.depth_scales[depth_idx]
+            if self.use_gate_value:
+                # Routing controls the mask; values are free from the value head.
+                out = value_per_depth[depth_idx] * prob
+            else:
+                # Change E: per-depth learnable scale before concatenation.
+                out = logits * prob * self.depth_scales[depth_idx]
 
             entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
@@ -1083,7 +1132,11 @@ class TopKTaxonResNetStage(nn.Module):
         # Re-run feature extraction (shares params, so gradients flow).
         stage_logits = self._stage_features(stage_input)
         dead_float = dead_mask_nodes.float().view(1, -1, 1, 1)
-        dead_vals = stage_logits * dead_float
+        if self.use_gate_value:
+            # AuxK signal should flow through the value head, not routing logits.
+            dead_vals = self.value_conv(stage_logits) * dead_float
+        else:
+            dead_vals = stage_logits * dead_float
 
         # Select top-k_aux among dead nodes.
         bsz, c, h, w = dead_vals.shape
@@ -1135,6 +1188,7 @@ class TopKTaxonResNetEncoder(nn.Module):
         warmup_steps: int = 0,
         out_channels: int = 3,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1162,6 +1216,7 @@ class TopKTaxonResNetEncoder(nn.Module):
         self.use_batch_topk = bool(use_batch_topk)
         self.warmup_steps = int(warmup_steps)
         self.k_leaves = int(k_leaves)
+        self.use_gate_value = bool(use_gate_value)
 
         if self.use_stem:
             stem_ops: List[nn.Module] = [
@@ -1201,6 +1256,7 @@ class TopKTaxonResNetEncoder(nn.Module):
                 warmup_steps=self.warmup_steps,
                 out_channels=out_channels,
                 k_leaves=self.k_leaves,
+                use_gate_value=self.use_gate_value,
             )
             self.taxon_stages.append(stage)
             current_channels = stage.total_out_channels
@@ -1290,6 +1346,8 @@ class TopKMultiTaxonResNetStage(nn.Module):
         warmup_steps: int = 0,
         out_channels: int = 3,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
+        use_inter_hierarchy_gate: bool = True,
     ) -> None:
         super().__init__()
         if n_hierarchies < 1:
@@ -1305,6 +1363,7 @@ class TopKMultiTaxonResNetStage(nn.Module):
         self.default_hard = bool(hard)
         self.depth_decay = float(depth_decay)
         self.k_leaves = int(k_leaves)
+        self.use_inter_hierarchy_gate = bool(use_inter_hierarchy_gate)
 
         self.hierarchies = nn.ModuleList([
             TopKTaxonResNetStage(
@@ -1323,14 +1382,18 @@ class TopKMultiTaxonResNetStage(nn.Module):
                 warmup_steps=warmup_steps,
                 out_channels=out_channels,
                 k_leaves=k_leaves,
+                use_gate_value=use_gate_value,
             )
             for _ in range(n_hierarchies)
         ])
 
-        self.gate_conv = nn.Sequential(
-            nn.Conv2d(in_channels, n_hierarchies, kernel_size=1, stride=stride, bias=False),
-            nn.BatchNorm2d(n_hierarchies),
-        )
+        if self.use_inter_hierarchy_gate:
+            self.gate_conv = nn.Sequential(
+                nn.Conv2d(in_channels, n_hierarchies, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(n_hierarchies),
+            )
+        else:
+            self.gate_conv = None
 
         self.hierarchy_out_channels: int = TopKTaxonResNetStage.output_channels(n_taxonomy_layers)
         self.layer_channels: List[int] = self.hierarchies[0].layer_channels
@@ -1354,16 +1417,19 @@ class TopKMultiTaxonResNetStage(nn.Module):
         x: torch.Tensor,
         hard: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        gate = self._compute_gate(x)   # [B, K, H, W]
-
-        # Gate regularisation (entropy + coverage KL)
-        eps = 1e-8
-        log_gate = gate.clamp_min(eps).log()
-        gate_entropy = -(gate * log_gate).sum(dim=1).mean()
-        marginal = gate.mean(dim=(0, 2, 3))
-        marginal = marginal / marginal.sum().clamp_min(eps)
-        uniform_logp = -math.log(gate.shape[1])
-        gate_dkl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
+        if self.use_inter_hierarchy_gate:
+            gate = self._compute_gate(x)   # [B, K, H, W]
+            eps = 1e-8
+            log_gate = gate.clamp_min(eps).log()
+            gate_entropy = -(gate * log_gate).sum(dim=1).mean()
+            marginal = gate.mean(dim=(0, 2, 3))
+            marginal = marginal / marginal.sum().clamp_min(eps)
+            uniform_logp = -math.log(gate.shape[1])
+            gate_dkl = (marginal * (marginal.clamp_min(eps).log() - uniform_logp)).sum()
+        else:
+            gate = None
+            gate_entropy = x.new_zeros(())
+            gate_dkl = x.new_zeros(())
 
         total_dead = x.new_zeros(())
         total_entropy = x.new_zeros(())
@@ -1373,8 +1439,11 @@ class TopKMultiTaxonResNetStage(nn.Module):
 
         for k, hierarchy in enumerate(self.hierarchies):
             out_k, logp_k, regs_k = hierarchy(x, hard=hard)
-            gate_k = gate[:, k:k+1, :, :]
-            all_outputs.append(out_k * gate_k)
+            if gate is not None:
+                gate_k = gate[:, k:k+1, :, :]
+                all_outputs.append(out_k * gate_k)
+            else:
+                all_outputs.append(out_k)
             all_logps.append(logp_k)
             total_dead = total_dead + regs_k["dead_frac"]
             total_entropy = total_entropy + regs_k["entropy"]
@@ -1389,7 +1458,7 @@ class TopKMultiTaxonResNetStage(nn.Module):
                 "dkl": total_dkl,
                 "gate_entropy": gate_entropy,
                 "gate_dkl": gate_dkl,
-                "gate_probs": gate,
+                "gate_probs": gate if gate is not None else x.new_zeros((x.shape[0], self.n_hierarchies, 1, 1)),
             },
         )
 
@@ -1437,6 +1506,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
         self.stage_blocks = tuple(int(v) for v in resolved_stage_blocks)
         self.stage_taxonomy_layers = tuple(int(v) for v in stage_taxonomy_layers)
         self.stage_strides = tuple(int(v) for v in stage_strides)
+        self.use_gate_value = bool(use_gate_value)
 
         # Resolve per-stage hierarchy counts.
         n_stages = len(self.stage_blocks)
@@ -1501,6 +1571,7 @@ class TopKMultiTaxonResNetEncoder(nn.Module):
                 warmup_steps=warmup_steps,
                 out_channels=out_channels,
                 k_leaves=self.k_leaves,
+                use_gate_value=self.use_gate_value,
             )
             self.multi_taxon_stages.append(stage)
             current_channels = stage.total_out_channels
@@ -2169,6 +2240,617 @@ class BiasMultiTaxonResNetEncoder(nn.Module):
         return x, details
 
 
+class PlainResNetStage(nn.Module):
+    """Vanilla ResNet stage of ``n_blocks`` :class:`ResidualConvBlock` modules.
+
+    First block uses ``stride``; remaining blocks use stride 1.  Used by
+    :class:`BottleneckTopKMultiTaxonResNetEncoder` to keep stages 1..N-1
+    plain and apply taxonomy-routing only at the bottleneck.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        n_blocks: int,
+        stride: int = 1,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        blocks: List[nn.Module] = []
+        for idx in range(n_blocks):
+            block_in = in_channels if idx == 0 else out_channels
+            block_stride = stride if idx == 0 else 1
+            blocks.append(
+                ResidualConvBlock(
+                    in_channels=block_in,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=block_stride,
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class BottleneckTopKMultiTaxonResNetEncoder(nn.Module):
+    """ResNet encoder with plain stages followed by a single TopK multi-taxon bottleneck.
+
+    Architecture::
+
+        stem -> PlainResNetStage_1 -> ... -> PlainResNetStage_{N-1}
+             -> TopKMultiTaxonResNetStage  (the bottleneck)
+
+    The bottleneck stage runs K independent TopK taxonomy hierarchies; with
+    ``k_leaves=1`` each hierarchy keeps exactly one leaf path per spatial
+    location (its full depth-L ancestor chain of L active channels), and with
+    ``use_inter_hierarchy_gate=False`` all K hierarchies are concatenated
+    unattenuated.  Result: per spatial location, the latent has exactly
+    ``K * L`` non-zero channels — one path per taxonomy.
+
+    Parameters
+    ----------
+    plain_stage_channels:
+        Per-plain-stage output channel widths (e.g. ``[64, 128, 256]``).
+    plain_stage_blocks:
+        Per-plain-stage block counts (e.g. ``[2, 2, 2]`` for ResNet-18).
+    plain_stage_strides:
+        Per-plain-stage strides.
+    bottleneck_n_taxonomy_layers:
+        Depth ``L`` of the binary-tree taxonomy at the bottleneck.
+    bottleneck_n_blocks:
+        Block count for the residual stack inside each hierarchy of the
+        bottleneck stage.
+    bottleneck_stride:
+        Stride of the bottleneck stage.
+    n_hierarchies:
+        Number of independent taxonomies ``K`` at the bottleneck.
+    k_leaves:
+        Leaves kept per hierarchy per spatial location (1 = single path).
+    use_inter_hierarchy_gate:
+        If ``False`` (recommended for "one path per taxonomy"), all K
+        hierarchies pass through unattenuated.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        plain_stage_channels: Sequence[int] = (64, 128, 256),
+        plain_stage_blocks: Sequence[int] = (2, 2, 2),
+        plain_stage_strides: Sequence[int] = (1, 2, 2),
+        bottleneck_n_taxonomy_layers: int = 6,
+        bottleneck_n_blocks: int = 2,
+        bottleneck_stride: int = 2,
+        n_hierarchies: int = 4,
+        topk_k_multiplier: float = 1.0,
+        k_aux: Optional[int] = None,
+        dead_steps: int = 2000,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        temperature: float = 1.0,
+        hard: bool = False,
+        depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 1,
+        use_gate_value: bool = False,
+        use_inter_hierarchy_gate: bool = False,
+        gate_k: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        if not (len(plain_stage_channels) == len(plain_stage_blocks) == len(plain_stage_strides)):
+            raise ValueError(
+                "plain_stage_channels, plain_stage_blocks, plain_stage_strides must have equal length."
+            )
+
+        self.in_channels = in_channels
+        self.plain_stage_channels = tuple(int(c) for c in plain_stage_channels)
+        self.plain_stage_blocks = tuple(int(b) for b in plain_stage_blocks)
+        self.plain_stage_strides = tuple(int(s) for s in plain_stage_strides)
+        self.bottleneck_n_taxonomy_layers = int(bottleneck_n_taxonomy_layers)
+        self.bottleneck_n_blocks = int(bottleneck_n_blocks)
+        self.bottleneck_stride = int(bottleneck_stride)
+        self.n_hierarchies = int(n_hierarchies)
+        self.k_leaves = int(k_leaves)
+        self.use_gate_value = bool(use_gate_value)
+        self.use_inter_hierarchy_gate = bool(use_inter_hierarchy_gate)
+        self.temperature = float(temperature)
+        self.default_hard = bool(hard)
+        self.use_stem = bool(use_stem)
+        self.stem_stride = int(stem_stride)
+        self.use_stem_maxpool = bool(use_stem_maxpool)
+
+        # ── stem ──────────────────────────────────────────────────────────────
+        if self.use_stem:
+            stem_ops: List[nn.Module] = [
+                nn.Conv2d(in_channels, stem_channels, kernel_size=7,
+                          stride=self.stem_stride, padding=3, bias=False),
+                nn.BatchNorm2d(stem_channels),
+                nn.ReLU(inplace=True),
+            ]
+            if self.use_stem_maxpool:
+                stem_ops.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+            self.stem = nn.Sequential(*stem_ops)
+            current_channels = stem_channels
+            self.stem_total_stride = self.stem_stride * (2 if self.use_stem_maxpool else 1)
+        else:
+            self.stem = nn.Identity()
+            current_channels = in_channels
+            self.stem_total_stride = 1
+
+        # ── plain ResNet stages (no taxonomy routing) ────────────────────────
+        self.stage_input_channels: List[int] = []
+        self.plain_stages = nn.ModuleList()
+
+        for ch, blocks, stride in zip(
+            self.plain_stage_channels, self.plain_stage_blocks, self.plain_stage_strides,
+        ):
+            self.stage_input_channels.append(current_channels)
+            self.plain_stages.append(
+                PlainResNetStage(
+                    in_channels=current_channels,
+                    out_channels=ch,
+                    n_blocks=blocks,
+                    stride=stride,
+                    kernel_size=kernel_size,
+                )
+            )
+            current_channels = ch
+
+        # ── bottleneck taxonomy stage ────────────────────────────────────────
+        self.stage_input_channels.append(current_channels)
+        self.bottleneck_stage = TopKMultiTaxonResNetStage(
+            in_channels=current_channels,
+            n_taxonomy_layers=self.bottleneck_n_taxonomy_layers,
+            n_blocks=self.bottleneck_n_blocks,
+            n_hierarchies=self.n_hierarchies,
+            stride=self.bottleneck_stride,
+            kernel_size=kernel_size,
+            topk_k_multiplier=topk_k_multiplier,
+            k_aux=k_aux,
+            dead_steps=dead_steps,
+            gate_k=int(gate_k) if gate_k is not None else self.n_hierarchies,
+            temperature=self.temperature,
+            hard=self.default_hard,
+            depth_decay=depth_decay,
+            use_batch_topk=use_batch_topk,
+            warmup_steps=warmup_steps,
+            out_channels=out_channels,
+            k_leaves=self.k_leaves,
+            use_gate_value=self.use_gate_value,
+            use_inter_hierarchy_gate=self.use_inter_hierarchy_gate,
+        )
+
+        # Combined per-stage block/stride lists for the decoder mirror.
+        self.stage_blocks = tuple(list(self.plain_stage_blocks) + [self.bottleneck_n_blocks])
+        self.stage_strides = tuple(list(self.plain_stage_strides) + [self.bottleneck_stride])
+        self.final_channels = self.bottleneck_stage.total_out_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+        return_details: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        if hard is None:
+            hard = self.default_hard
+
+        details: Dict[str, object] = {
+            "input_shape": tuple(x.shape),
+            "shape_trace": [],
+            "stages": [],
+            "plain_stage_channels": self.plain_stage_channels,
+            "plain_stage_blocks": self.plain_stage_blocks,
+            "plain_stage_strides": self.plain_stage_strides,
+            "bottleneck_n_taxonomy_layers": self.bottleneck_n_taxonomy_layers,
+            "n_hierarchies": self.n_hierarchies,
+            "k_leaves": self.k_leaves,
+        }
+
+        x = self.stem(x)
+        if return_details:
+            details["shape_trace"].append(("stem", tuple(x.shape)))
+
+        for idx, stage in enumerate(self.plain_stages, start=1):
+            x = stage(x)
+            if return_details:
+                details["shape_trace"].append((f"plain_stage{idx}", tuple(x.shape)))
+
+        x, stage_logp, regs = self.bottleneck_stage(x, hard=hard)
+        if return_details:
+            details["shape_trace"].append(("bottleneck", tuple(x.shape)))
+            details["stages"].append({
+                "name": "bottleneck",
+                "output": x,
+                "logp": stage_logp,
+                "output_shape": tuple(x.shape),
+                "n_hierarchies": self.n_hierarchies,
+                "hierarchy_out_channels": self.bottleneck_stage.hierarchy_out_channels,
+                "gate_probs": regs["gate_probs"],
+                "dead_frac": regs["dead_frac"],
+                "entropy": regs["entropy"],
+                "dkl": regs["dkl"],
+                "gate_entropy": regs["gate_entropy"],
+                "gate_dkl": regs["gate_dkl"],
+            })
+
+        details["latent_shape"] = tuple(x.shape)
+        details["dead_frac"] = regs["dead_frac"]
+        details["entropy"] = regs["entropy"]
+        details["dkl"] = regs["dkl"]
+        return x, details
+
+
+class _BottleneckEncoderBase(nn.Module):
+    """Shared scaffolding for single-stage taxon-bottleneck encoders.
+
+    Subclasses construct ``self.bottleneck_stage`` and override ``_apply_bottleneck``
+    to unpack its forward outputs into the standardized details dict.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        plain_stage_channels: Sequence[int] = (64, 128, 256),
+        plain_stage_blocks: Sequence[int] = (2, 2, 2),
+        plain_stage_strides: Sequence[int] = (1, 2, 2),
+        bottleneck_n_taxonomy_layers: int = 6,
+        bottleneck_n_blocks: int = 2,
+        bottleneck_stride: int = 2,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        temperature: float = 1.0,
+        hard: bool = False,
+    ) -> None:
+        super().__init__()
+        if not (len(plain_stage_channels) == len(plain_stage_blocks) == len(plain_stage_strides)):
+            raise ValueError(
+                "plain_stage_channels, plain_stage_blocks, plain_stage_strides must have equal length."
+            )
+
+        self.in_channels = in_channels
+        self.plain_stage_channels = tuple(int(c) for c in plain_stage_channels)
+        self.plain_stage_blocks = tuple(int(b) for b in plain_stage_blocks)
+        self.plain_stage_strides = tuple(int(s) for s in plain_stage_strides)
+        self.bottleneck_n_taxonomy_layers = int(bottleneck_n_taxonomy_layers)
+        self.bottleneck_n_blocks = int(bottleneck_n_blocks)
+        self.bottleneck_stride = int(bottleneck_stride)
+        self.temperature = float(temperature)
+        self.default_hard = bool(hard)
+        self.use_stem = bool(use_stem)
+        self.stem_stride = int(stem_stride)
+        self.use_stem_maxpool = bool(use_stem_maxpool)
+
+        if self.use_stem:
+            stem_ops: List[nn.Module] = [
+                nn.Conv2d(in_channels, stem_channels, kernel_size=7,
+                          stride=self.stem_stride, padding=3, bias=False),
+                nn.BatchNorm2d(stem_channels),
+                nn.ReLU(inplace=True),
+            ]
+            if self.use_stem_maxpool:
+                stem_ops.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+            self.stem = nn.Sequential(*stem_ops)
+            current_channels = stem_channels
+            self.stem_total_stride = self.stem_stride * (2 if self.use_stem_maxpool else 1)
+        else:
+            self.stem = nn.Identity()
+            current_channels = in_channels
+            self.stem_total_stride = 1
+
+        self.stage_input_channels: List[int] = []
+        self.plain_stages = nn.ModuleList()
+        for ch, blocks, stride in zip(
+            self.plain_stage_channels, self.plain_stage_blocks, self.plain_stage_strides,
+        ):
+            self.stage_input_channels.append(current_channels)
+            self.plain_stages.append(
+                PlainResNetStage(
+                    in_channels=current_channels, out_channels=ch,
+                    n_blocks=blocks, stride=stride, kernel_size=kernel_size,
+                )
+            )
+            current_channels = ch
+        # Subclass appends bottleneck input_channels then assigns
+        # self.bottleneck_stage and self.final_channels.
+        self._final_pre_bottleneck_channels = current_channels
+        self.stage_input_channels.append(current_channels)
+        self.stage_blocks = tuple(list(self.plain_stage_blocks) + [self.bottleneck_n_blocks])
+        self.stage_strides = tuple(list(self.plain_stage_strides) + [self.bottleneck_stride])
+
+    def _run_stem_and_plain(self, x: torch.Tensor, details: Dict[str, object], return_details: bool) -> torch.Tensor:
+        x = self.stem(x)
+        if return_details:
+            details["shape_trace"].append(("stem", tuple(x.shape)))
+        for idx, stage in enumerate(self.plain_stages, start=1):
+            x = stage(x)
+            if return_details:
+                details["shape_trace"].append((f"plain_stage{idx}", tuple(x.shape)))
+        return x
+
+
+class BottleneckTaxonResNetEncoder(_BottleneckEncoderBase):
+    """Plain ResNet stages followed by a single (softmax+DKL) taxon stage.
+
+    Mirrors :class:`BottleneckTopKMultiTaxonResNetEncoder` but uses a single
+    :class:`TaxonResNetStage` (one hierarchy, soft routing, DKL/entropy regs).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        plain_stage_channels: Sequence[int] = (64, 128, 256),
+        plain_stage_blocks: Sequence[int] = (2, 2, 2),
+        plain_stage_strides: Sequence[int] = (1, 2, 2),
+        bottleneck_n_taxonomy_layers: int = 6,
+        bottleneck_n_blocks: int = 2,
+        bottleneck_stride: int = 2,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        temperature: float = 1.0,
+        hard: bool = False,
+        depth_decay: float = 0.5,
+        k_leaves: int = 0,
+        use_gate_value: bool = False,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            plain_stage_channels=plain_stage_channels,
+            plain_stage_blocks=plain_stage_blocks,
+            plain_stage_strides=plain_stage_strides,
+            bottleneck_n_taxonomy_layers=bottleneck_n_taxonomy_layers,
+            bottleneck_n_blocks=bottleneck_n_blocks,
+            bottleneck_stride=bottleneck_stride,
+            kernel_size=kernel_size,
+            use_stem=use_stem,
+            stem_channels=stem_channels,
+            stem_stride=stem_stride,
+            use_stem_maxpool=use_stem_maxpool,
+            temperature=temperature,
+            hard=hard,
+        )
+        self.bottleneck_stage = TaxonResNetStage(
+            in_channels=self._final_pre_bottleneck_channels,
+            n_taxonomy_layers=self.bottleneck_n_taxonomy_layers,
+            n_blocks=self.bottleneck_n_blocks,
+            stride=self.bottleneck_stride,
+            kernel_size=kernel_size,
+            temperature=self.temperature,
+            hard=self.default_hard,
+            depth_decay=depth_decay,
+            k_leaves=k_leaves,
+            use_gate_value=use_gate_value,
+        )
+        self.final_channels = self.bottleneck_stage.total_out_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+        return_details: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        if hard is None:
+            hard = self.default_hard
+        details: Dict[str, object] = {
+            "input_shape": tuple(x.shape),
+            "shape_trace": [], "stages": [],
+        }
+        x = self._run_stem_and_plain(x, details, return_details)
+        x, stage_logp, regs = self.bottleneck_stage(x, hard=hard)
+        if return_details:
+            details["shape_trace"].append(("bottleneck", tuple(x.shape)))
+            details["stages"].append({
+                "name": "bottleneck", "output": x, "logp": stage_logp,
+                "output_shape": tuple(x.shape),
+                "entropy": regs["entropy"], "dkl": regs["dkl"],
+            })
+        details["latent_shape"] = tuple(x.shape)
+        details["entropy"] = regs["entropy"]
+        details["dkl"] = regs["dkl"]
+        return x, details
+
+
+class BottleneckMultiTaxonResNetEncoder(_BottleneckEncoderBase):
+    """Plain ResNet stages followed by a single multi-hierarchy (softmax+DKL) taxon stage."""
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        plain_stage_channels: Sequence[int] = (64, 128, 256),
+        plain_stage_blocks: Sequence[int] = (2, 2, 2),
+        plain_stage_strides: Sequence[int] = (1, 2, 2),
+        bottleneck_n_taxonomy_layers: int = 6,
+        bottleneck_n_blocks: int = 2,
+        bottleneck_stride: int = 2,
+        n_hierarchies: int = 4,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        temperature: float = 1.0,
+        hard: bool = False,
+        depth_decay: float = 0.5,
+        k_leaves: int = 0,
+        use_gate_value: bool = False,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            plain_stage_channels=plain_stage_channels,
+            plain_stage_blocks=plain_stage_blocks,
+            plain_stage_strides=plain_stage_strides,
+            bottleneck_n_taxonomy_layers=bottleneck_n_taxonomy_layers,
+            bottleneck_n_blocks=bottleneck_n_blocks,
+            bottleneck_stride=bottleneck_stride,
+            kernel_size=kernel_size,
+            use_stem=use_stem,
+            stem_channels=stem_channels,
+            stem_stride=stem_stride,
+            use_stem_maxpool=use_stem_maxpool,
+            temperature=temperature,
+            hard=hard,
+        )
+        self.n_hierarchies = int(n_hierarchies)
+        self.bottleneck_stage = MultiTaxonResNetStage(
+            in_channels=self._final_pre_bottleneck_channels,
+            n_taxonomy_layers=self.bottleneck_n_taxonomy_layers,
+            n_blocks=self.bottleneck_n_blocks,
+            n_hierarchies=self.n_hierarchies,
+            stride=self.bottleneck_stride,
+            kernel_size=kernel_size,
+            temperature=self.temperature,
+            hard=self.default_hard,
+            depth_decay=depth_decay,
+            k_leaves=k_leaves,
+            use_gate_value=use_gate_value,
+        )
+        self.final_channels = self.bottleneck_stage.total_out_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+        return_details: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        if hard is None:
+            hard = self.default_hard
+        details: Dict[str, object] = {
+            "input_shape": tuple(x.shape),
+            "shape_trace": [], "stages": [],
+            "n_hierarchies": self.n_hierarchies,
+        }
+        x = self._run_stem_and_plain(x, details, return_details)
+        x, stage_logp, regs = self.bottleneck_stage(x, hard=hard)
+        if return_details:
+            details["shape_trace"].append(("bottleneck", tuple(x.shape)))
+            details["stages"].append({
+                "name": "bottleneck", "output": x, "logp": stage_logp,
+                "output_shape": tuple(x.shape),
+                "entropy": regs["entropy"], "dkl": regs["dkl"],
+                "gate_entropy": regs["gate_entropy"],
+                "gate_dkl": regs["gate_dkl"],
+                "gate_probs": regs["gate_probs"],
+            })
+        details["latent_shape"] = tuple(x.shape)
+        details["entropy"] = regs["entropy"]
+        details["dkl"] = regs["dkl"]
+        details["gate_entropy"] = regs["gate_entropy"]
+        details["gate_dkl"] = regs["gate_dkl"]
+        return x, details
+
+
+class BottleneckTopKTaxonResNetEncoder(_BottleneckEncoderBase):
+    """Plain ResNet stages followed by a single TopK taxon stage (single hierarchy)."""
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        plain_stage_channels: Sequence[int] = (64, 128, 256),
+        plain_stage_blocks: Sequence[int] = (2, 2, 2),
+        plain_stage_strides: Sequence[int] = (1, 2, 2),
+        bottleneck_n_taxonomy_layers: int = 6,
+        bottleneck_n_blocks: int = 2,
+        bottleneck_stride: int = 2,
+        topk_k_multiplier: float = 1.0,
+        k_aux: Optional[int] = None,
+        dead_steps: int = 2000,
+        kernel_size: int = 3,
+        use_stem: bool = True,
+        stem_channels: int = 64,
+        stem_stride: int = 2,
+        use_stem_maxpool: bool = True,
+        temperature: float = 1.0,
+        hard: bool = False,
+        depth_decay: float = 0.5,
+        use_batch_topk: bool = True,
+        warmup_steps: int = 0,
+        out_channels: int = 3,
+        k_leaves: int = 0,
+        use_gate_value: bool = False,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            plain_stage_channels=plain_stage_channels,
+            plain_stage_blocks=plain_stage_blocks,
+            plain_stage_strides=plain_stage_strides,
+            bottleneck_n_taxonomy_layers=bottleneck_n_taxonomy_layers,
+            bottleneck_n_blocks=bottleneck_n_blocks,
+            bottleneck_stride=bottleneck_stride,
+            kernel_size=kernel_size,
+            use_stem=use_stem,
+            stem_channels=stem_channels,
+            stem_stride=stem_stride,
+            use_stem_maxpool=use_stem_maxpool,
+            temperature=temperature,
+            hard=hard,
+        )
+        self.bottleneck_stage = TopKTaxonResNetStage(
+            in_channels=self._final_pre_bottleneck_channels,
+            n_taxonomy_layers=self.bottleneck_n_taxonomy_layers,
+            n_blocks=self.bottleneck_n_blocks,
+            stride=self.bottleneck_stride,
+            kernel_size=kernel_size,
+            topk_k_multiplier=topk_k_multiplier,
+            k_aux=k_aux,
+            dead_steps=dead_steps,
+            temperature=self.temperature,
+            hard=self.default_hard,
+            depth_decay=depth_decay,
+            use_batch_topk=use_batch_topk,
+            warmup_steps=warmup_steps,
+            out_channels=out_channels,
+            k_leaves=k_leaves,
+            use_gate_value=use_gate_value,
+        )
+        self.final_channels = self.bottleneck_stage.total_out_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hard: Optional[bool] = None,
+        return_details: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        if hard is None:
+            hard = self.default_hard
+        details: Dict[str, object] = {
+            "input_shape": tuple(x.shape),
+            "shape_trace": [], "stages": [],
+        }
+        x = self._run_stem_and_plain(x, details, return_details)
+        x, stage_logp, regs = self.bottleneck_stage(x, hard=hard)
+        if return_details:
+            details["shape_trace"].append(("bottleneck", tuple(x.shape)))
+            details["stages"].append({
+                "name": "bottleneck", "output": x, "logp": stage_logp,
+                "output_shape": tuple(x.shape),
+                "dead_frac": regs["dead_frac"],
+                "entropy": regs["entropy"], "dkl": regs["dkl"],
+            })
+        details["latent_shape"] = tuple(x.shape)
+        details["dead_frac"] = regs["dead_frac"]
+        details["entropy"] = regs["entropy"]
+        details["dkl"] = regs["dkl"]
+        return x, details
+
+
 __all__ = [
     "resolve_resnet_stage_blocks",
     "ResidualConvBlock",
@@ -2184,4 +2866,9 @@ __all__ = [
     "BiasTaxonResNetEncoder",
     "BiasMultiTaxonResNetStage",
     "BiasMultiTaxonResNetEncoder",
+    "PlainResNetStage",
+    "BottleneckTopKMultiTaxonResNetEncoder",
+    "BottleneckTaxonResNetEncoder",
+    "BottleneckMultiTaxonResNetEncoder",
+    "BottleneckTopKTaxonResNetEncoder",
 ]

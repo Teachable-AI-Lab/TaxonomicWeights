@@ -1,6 +1,5 @@
 {
-    "experiment_name": "topk_multi_taxon_ae_celeba_hq_r18_widen_d3_v3kleaves",
-    "description": "Widening multi-taxon: fixed depth L=3 per stage, hierarchies double [4,8,16,32] to achieve ~56/112/224/448-channel stages. k_leaves=2 per hierarchy, no skip or matryoshka.",
+    "experiment_name": "topk_taxon_ae_celeba_hq_r18_small_v3_main",
     "data": {
         "data_root": "./data/celeba_hq",
         "image_size": 256,
@@ -11,13 +10,11 @@
     "model": {
         "in_channels": 3,
         "resnet_variant": "18",
-        "stage_taxonomy_layers": [3, 3, 3, 3],
+        "stage_taxonomy_layers": [3, 4, 5, 6],
         "stage_strides": [1, 2, 2, 2],
         "stage_blocks": null,
-        "n_hierarchies": [4, 8, 16, 32],
         "k_aux": null,
         "dead_steps": 2000,
-        "gate_k": 1,
         "kernel_size": 3,
         "use_stem": true,
         "stem_channels": 64,
@@ -28,8 +25,7 @@
         "depth_decay": 0.5,
         "use_batch_topk": true,
         "warmup_steps": 5000,
-        "skip_rank": 0,
-        "k_leaves": 2
+        "k_leaves": 4
     },
     "training": {
         "epochs": 90,
@@ -41,11 +37,10 @@
         "save_every": 5,
         "seed": 42,
         "max_train_steps": 0,
-        "matryoshka": true,
-        "matryoshka_weight": 1.0
+        "matryoshka": true
     },
     "analysis": {
-        "checkpoint_path": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_widen_d3_v3kleaves_K4-8-16-32_auxk_1e-02/checkpoints/best.pt",
+        "checkpoint_path": "./outputs/celeba_hq/ablations/topk_taxon_ae_celeba_hq_r18_small_v3_main_auxk_1e-02/checkpoints/best.pt",
         "num_latent_batches": 50,
         "num_reconstruction_batches": 20,
         "num_multiple_recon_images": 8,
@@ -54,6 +49,6 @@
         "num_taxonomy_batches": 10
     },
     "output": {
-        "output_dir": "./outputs/celeba_hq/main/topk_multi_taxon_ae_celeba_hq_r18_widen_d3_v3kleaves"
+        "output_dir": "./outputs/celeba_hq/ablations/topk_taxon_ae_celeba_hq_r18_small_v3_main"
     }
 }

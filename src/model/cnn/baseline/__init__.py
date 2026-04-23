@@ -5,6 +5,7 @@ from .sae_encoder import ConvSAEStage, ConvSAEEncoder
 from .sae import SparseConvAutoencoder
 from .topk_sae_encoder import TopKSAEEncoder
 from .topk_sae import TopKSparseConvAutoencoder
+from .intermediate_topk_sae import IntermediateTopKSAEEncoder, IntermediateTopKSparseConvAutoencoder
 from .gated_sae_encoder import GatedSAEEncoder
 from .gated_sae import GatedSparseConvAutoencoder
 from .jumprelu_sae_encoder import JumpReLUSAEEncoder
@@ -21,4 +22,6 @@ __all__ = [
     "GatedSparseConvAutoencoder",
     "JumpReLUSAEEncoder",
     "JumpReLUSparseConvAutoencoder",
+    "IntermediateTopKSAEEncoder",
+    "IntermediateTopKSparseConvAutoencoder",
 ]

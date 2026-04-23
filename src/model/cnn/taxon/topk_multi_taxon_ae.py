@@ -20,7 +20,6 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .decoder import TaxonResNetDecoder
 from .encoder import TopKMultiTaxonResNetEncoder
@@ -52,16 +51,14 @@ class TopKMultiTaxonAutoencoder(nn.Module):
         depth_decay: float = 0.5,
         use_batch_topk: bool = True,
         warmup_steps: int = 0,
-        skip_rank: int = 0,
         k_leaves: int = 0,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
 
         self.n_hierarchies = int(n_hierarchies) if isinstance(n_hierarchies, (int, float)) else int(list(n_hierarchies)[-1])
         self.output_activation = output_activation.lower()
         self.default_hard = hard
-        self.skip_rank = int(skip_rank)
-        self.stem_channels = int(stem_channels)
 
         self.encoder = TopKMultiTaxonResNetEncoder(
             in_channels=in_channels,
@@ -86,6 +83,7 @@ class TopKMultiTaxonAutoencoder(nn.Module):
             warmup_steps=warmup_steps,
             out_channels=in_channels,
             k_leaves=k_leaves,
+            use_gate_value=use_gate_value,
         )
 
         self.decoder = TaxonResNetDecoder(
@@ -98,38 +96,6 @@ class TopKMultiTaxonAutoencoder(nn.Module):
             stem_total_stride=self.encoder.stem_total_stride,
             kernel_size=kernel_size,
         )
-
-        # Low-rank skip connection branching from stage-0 output.
-        # By branching after the first encoder stage the skip sees the first
-        # level of learned sparse structure instead of raw stem features,
-        # making it a genuine complement to the tree rather than a shortcut.
-        # skip_down/skip_up project through a rank-r bottleneck in stage-0
-        # feature space (r << s0_channels ensures genuine low rank).
-        # skip_proj then maps back to pixel space for the residual addition.
-        if self.skip_rank > 0:
-            s0_channels = self.encoder.multi_taxon_stages[0].total_out_channels
-            self.skip_down = nn.Conv2d(s0_channels, skip_rank, kernel_size=1, bias=False)
-            self.skip_up   = nn.Conv2d(skip_rank, s0_channels, kernel_size=1, bias=True)
-            self.skip_proj = nn.Conv2d(s0_channels, in_channels, kernel_size=1, bias=True)
-            nn.init.kaiming_normal_(self.skip_down.weight, mode="fan_in")
-            self.skip_down.weight.data.mul_(0.01)
-            nn.init.kaiming_normal_(self.skip_up.weight, mode="fan_in")
-            self.skip_up.weight.data.mul_(0.01)
-            nn.init.zeros_(self.skip_up.bias)
-            nn.init.zeros_(self.skip_proj.weight)  # skip inactive at init
-            nn.init.zeros_(self.skip_proj.bias)
-
-    def _compute_skip_recon(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the skip connection's additive contribution to reconstruction.
-
-        Branches from stage-0 output so the skip operates on the first level
-        of learned sparse structure rather than raw stem features.
-        """
-        s = self.encoder.stem(x)                          # (B, stem_ch, H/s, W/s)
-        s0, _, _ = self.encoder.multi_taxon_stages[0](s)  # (B, s0_ch, H1, W1)
-        feat = self.skip_up(self.skip_down(s0))            # low-rank bottleneck
-        skip = self.skip_proj(feat)                        # (B, in_channels, H1, W1)
-        return F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
     def encode(self, x, hard=None, return_details=False):
         return self.encoder(x, hard=hard, return_details=return_details)
@@ -176,8 +142,6 @@ class TopKMultiTaxonAutoencoder(nn.Module):
             hard = self.default_hard
         z, enc_details = self.encode(x, hard=hard, return_details=return_details)
         recon, dec_details = self.decode(z, output_size=x.shape[-2:], return_details=return_details)
-        if self.skip_rank > 0:
-            recon = recon + self._compute_skip_recon(x)
         recon = self._apply_output_activation(recon)
 
         dead_frac = enc_details["dead_frac"]
@@ -215,8 +179,6 @@ class TopKMultiTaxonAutoencoder(nn.Module):
         hier_ch = last_stage.hierarchy_out_channels
         K = self.n_hierarchies
 
-        skip_out = self._compute_skip_recon(x) if self.skip_rank > 0 else None
-
         prefix_recons: List[torch.Tensor] = []
         for d in range(n_layers):
             prefix_ch = sum(layer_ch[: d + 1])
@@ -226,8 +188,6 @@ class TopKMultiTaxonAutoencoder(nn.Module):
                 mask[:, start : start + prefix_ch] = 1.0
             z_prefix = z * mask
             recon_d, _ = self.decode(z_prefix, output_size=x.shape[-2:])
-            if skip_out is not None:
-                recon_d = recon_d + skip_out
             prefix_recons.append(self._apply_output_activation(recon_d))
 
         return prefix_recons, enc_details

@@ -23,7 +23,6 @@
         "use_stem_maxpool": true,
         "output_activation": "none",
         "depth_decay": 0.5,
-        "skip_rank": 8,
         "k_leaves": 4
     },
     "training": {

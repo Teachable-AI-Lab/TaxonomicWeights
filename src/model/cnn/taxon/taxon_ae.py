@@ -41,6 +41,7 @@ class TaxonAutoencoder(nn.Module):
         use_stem_maxpool: bool = True,
         output_activation: str = "none",
         depth_decay: float = 0.5,
+        use_gate_value: bool = False,
     ) -> None:
         super().__init__()
 
@@ -61,6 +62,7 @@ class TaxonAutoencoder(nn.Module):
             stem_stride=stem_stride,
             use_stem_maxpool=use_stem_maxpool,
             depth_decay=depth_decay,
+            use_gate_value=use_gate_value,
         )
 
         self.decoder = TaxonResNetDecoder(

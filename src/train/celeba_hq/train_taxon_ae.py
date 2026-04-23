@@ -219,6 +219,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=m.get("temperature", 1.0))
     parser.add_argument("--hard", action="store_true", default=m.get("hard", False),
                         help="Use hard straight-through routing in taxonomy softmax")
+    parser.add_argument("--use-gate-value", action="store_true", default=m.get("use_gate_value", False))
     # training
     parser.add_argument("--epochs", type=int, default=t.get("epochs", 90))
     parser.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
@@ -295,6 +296,7 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
+        use_gate_value=args.use_gate_value,
     ).to(device)
 
     optimizer = AdamW(
@@ -332,6 +334,7 @@ def main() -> None:
         f"  train_size={len(celeba_loader.trainset)} val_size={len(celeba_loader.valset)}\n"
         f"  batch_size={args.batch_size} epochs={args.epochs}\n"
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
+        f"  use_gate_value={args.use_gate_value}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}"
     )
 

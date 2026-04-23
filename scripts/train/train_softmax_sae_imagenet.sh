@@ -3,8 +3,8 @@
 #SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/train_softmax_sae_imagenet_%j.out
 #SBATCH --error=slurm/slurm_errors/train_softmax_sae_imagenet_%j.err
-#SBATCH --partition=overcap
-#SBATCH --account=overcap
+#SBATCH --partition=tail-lab
+#SBATCH --account=tail-lab
 #SBATCH --qos=short
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8

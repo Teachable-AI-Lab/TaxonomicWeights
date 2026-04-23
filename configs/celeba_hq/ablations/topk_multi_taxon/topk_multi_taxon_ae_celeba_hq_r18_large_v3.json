@@ -27,7 +27,6 @@
         "depth_decay": 0.5,
         "use_batch_topk": true,
         "warmup_steps": 5000,
-        "skip_rank": 8,
         "k_leaves": 4
     },
     "training": {

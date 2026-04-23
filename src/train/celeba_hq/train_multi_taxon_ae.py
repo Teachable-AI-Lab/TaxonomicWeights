@@ -248,13 +248,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-steps", type=int,
                         default=t.get("max_train_steps", 0))
     parser.add_argument("--resume", type=str, default="")
-    # v3 additions
-    parser.add_argument("--skip-rank", type=int,
-                        default=m.get("skip_rank", 0))
+    # v3/v4 additions
     parser.add_argument("--k-leaves", type=int,
                         default=m.get("k_leaves", 0))
     parser.add_argument("--matryoshka", action="store_true",
                         default=t.get("matryoshka", False))
+    parser.add_argument("--weighted-matryoshka", action="store_true",
+                        default=t.get("weighted_matryoshka", False))
+    parser.add_argument("--use-gate-value", action="store_true",
+                        default=m.get("use_gate_value", False))
     return parser.parse_args()
 
 
@@ -326,8 +328,8 @@ def main() -> None:
         use_stem_maxpool=_mc.get("use_stem_maxpool", True),
         output_activation=_mc.get("output_activation", "none"),
         depth_decay=_mc.get("depth_decay", 0.5),
-        skip_rank=args.skip_rank,
         k_leaves=args.k_leaves,
+        use_gate_value=args.use_gate_value,
     ).to(device)
 
     optimizer = AdamW(
@@ -368,6 +370,7 @@ def main() -> None:
         f"  lr={args.learning_rate} wd={args.weight_decay}\n"
         f"  dkl_weight={args.dkl_weight}  entropy_weight={args.entropy_weight}\n"
         f"  gate_dkl_weight={args.gate_dkl_weight}  gate_entropy_weight={args.gate_entropy_weight}\n"
+        f"  use_gate_value={args.use_gate_value}  weighted_matryoshka={args.weighted_matryoshka}\n"
         f"  stage_taxonomy_layers={tuple(args.stage_taxonomy_layers)}\n"
         f"  output_dir={output_dir}"
     )
@@ -405,9 +408,18 @@ def main() -> None:
                     images, hard=args.hard
                 )
                 recon = prefix_recons[-1]  # full-depth for logging
-                recon_loss = sum(
-                    F.mse_loss(r, images) for r in prefix_recons
-                ) / len(prefix_recons)
+                if args.weighted_matryoshka:
+                    n_d = len(prefix_recons)
+                    weights = [2 ** d for d in range(n_d)]
+                    w_sum = sum(weights)
+                    recon_loss = sum(
+                        w * F.mse_loss(r, images) / w_sum
+                        for w, r in zip(weights, prefix_recons)
+                    )
+                else:
+                    recon_loss = sum(
+                        F.mse_loss(r, images) for r in prefix_recons
+                    ) / len(prefix_recons)
                 dkl = enc_details["dkl"]
                 entropy = enc_details["entropy"]
                 gate_dkl = enc_details["gate_dkl"]
