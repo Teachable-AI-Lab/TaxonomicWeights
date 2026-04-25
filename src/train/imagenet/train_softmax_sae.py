@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
-from src.utils.dataloader import ImageNet1kHFLoader
+from src.utils.dataloader import TinyImageNetLoader
 
 
 # ---------------------------------------------------------------------------
@@ -247,13 +247,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    imagenet_loader = ImageNet1kHFLoader(
+    imagenet_loader = TinyImageNetLoader(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
         pin_memory=(device.type == "cuda"),
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
     )
     train_loader, val_loader = imagenet_loader.get_loaders()
 

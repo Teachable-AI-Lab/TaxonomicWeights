@@ -1,0 +1,60 @@
+{
+    "experiment_name": "sae_matryoshka_intermediate_topk_imagenet_r18_v3_main",
+    "data": {
+        "data_root": "./data/tiny_imagenet",
+        "image_size": 64,
+        "batch_size": 32,
+        "num_workers": 8
+    },
+    "model": {
+        "in_channels": 3,
+        "resnet_variant": "18",
+        "stage_channels": [
+            62,
+            126,
+            254,
+            510
+        ],
+        "stage_strides": [
+            2,
+            2,
+            2,
+            2
+        ],
+        "stage_blocks": null,
+        "k_values": [
+            5,
+            6,
+            7,
+            8
+        ],
+        "k_aux": 8,
+        "use_aux_loss": true,
+        "dead_threshold": 0.001,
+        "kernel_size": 3,
+        "use_stem": true,
+        "stem_channels": 64,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none"
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "sparsity_weight": 0.01,
+        "loss_weights": [
+            0.25,
+            0.5,
+            1.0,
+            2.0
+        ],
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "output": {
+        "output_dir": "./outputs/imagenet/main/sae_matryoshka_intermediate_topk_imagenet_r18_v3_main"
+    }
+}

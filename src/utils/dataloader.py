@@ -469,6 +469,95 @@ class ImageNet1kHFLoader:
         return self.train_loader, self.val_loader
 
 
+class TinyImageNetLoader:
+    """
+    DataLoader wrapper for the ``zh-plus/tiny-imagenet`` HuggingFace dataset.
+
+    Tiny-ImageNet: 200 classes, 64×64 images, ~100k train / 10k val.
+    No need for max_samples limits — the whole dataset is already small.
+
+    Normalization matches the rest of the pipeline: [-1, 1] via mean/std=0.5.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 32,
+        num_workers: int = 8,
+        image_size: int = 64,
+        pin_memory: bool = True,
+        cache_dir: str | None = None,
+        transform=None,
+    ):
+        from datasets import load_dataset
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ])
+
+        _cache = cache_dir or str(Path(__file__).parent.parent.parent / "data" / "tiny_imagenet")
+        _hub_cache = str(Path(_cache) / "hub")
+        os.environ.setdefault("HF_HUB_CACHE", _hub_cache)
+        os.environ.setdefault("HF_DATASETS_CACHE", _cache)
+
+        token = os.environ.get("HF_TOKEN")
+        if token is None:
+            _token_file = Path(__file__).parent.parent.parent / "hf_token"
+            if _token_file.exists():
+                token = _token_file.read_text().strip()
+        if token is None:
+            token = True
+
+        ds = load_dataset("zh-plus/tiny-imagenet", cache_dir=_cache, token=token)
+        train_ds = ds["train"]
+        val_ds = ds["valid"]
+
+        class _HFImageDataset(Dataset):
+            def __init__(self, hf_split, tfm):
+                self.hf = hf_split
+                self.tfm = tfm
+            def __len__(self):
+                return len(self.hf)
+            def __getitem__(self, idx):
+                item = self.hf[idx]
+                img = item["image"]
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                return self.tfm(img), item["label"]
+
+        self.trainset = _HFImageDataset(train_ds, self.transform)
+        self.valset = _HFImageDataset(val_ds, self.transform)
+        self.num_classes = 200
+
+        self.train_loader = DataLoader(
+            self.trainset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+        self.val_loader = DataLoader(
+            self.valset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+
+    def get_loaders(self):
+        return self.train_loader, self.val_loader
+
+
 # ---------------------------------------------------------------------------
 # LLM Activation Dataset — for training linear SAEs
 # ---------------------------------------------------------------------------

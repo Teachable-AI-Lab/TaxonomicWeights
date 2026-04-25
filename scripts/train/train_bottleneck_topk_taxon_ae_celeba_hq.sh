@@ -5,11 +5,11 @@
 #SBATCH --error=slurm/slurm_errors/train_bottleneck_topk_taxon_ae_celeba_hq_%j.err
 #SBATCH --partition=overcap
 #SBATCH --account=overcap
-#SBATCH --qos=short
+#SBATCH --qos=long
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=7-00:00:00
 
 source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate taxon-weights

@@ -234,8 +234,7 @@ def _short_name(run_dir: str, version: str = "") -> str:
         parts.append(version)
     if n:
         parts.append(n)
-    suffix = f" ({', '.join(parts)})" if parts else ""
-    return f"{mtype}{suffix}"
+    return ', '.join(parts) if parts else mtype
 
 
 def _model_type(run_dir: str) -> str:
@@ -368,8 +367,11 @@ def _infer_bottleneck_n_taxonomy_layers(state_dict: dict) -> int:
 
     ``encoder.bottleneck_stage.blocks.0.main.1.weight`` is a Conv2d whose
     shape[0] = total output channels = 2^(n+1)-2.  Inverting: n = log2(ch+2)-1.
+    For multi-taxon models the key is under ``hierarchies.0.``.
     """
     key = "encoder.bottleneck_stage.blocks.0.main.1.weight"
+    if key not in state_dict:
+        key = "encoder.bottleneck_stage.hierarchies.0.blocks.0.main.1.weight"
     if key not in state_dict:
         return 6  # safe default
     ch = state_dict[key].shape[0]
@@ -534,28 +536,30 @@ def load_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[Multi
 def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTaxonAutoencoder, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
     stage_taxonomy_layers = _resolve_stage_taxonomy_layers(a, ckpt["model_state"])
     model = TopKTaxonAutoencoder(
-        in_channels=a.get("in_channels", 3),
-        resnet_variant=a.get("resnet_variant", "18"),
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        resnet_variant=a.get("resnet_variant", mcfg.get("resnet_variant", "18")),
         stage_taxonomy_layers=stage_taxonomy_layers,
-        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
-        stage_blocks=a.get("stage_blocks", None),
-        k_aux=a.get("k_aux", None),
-        topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
-        dead_steps=a.get("dead_steps", 2000),
-        kernel_size=a.get("kernel_size", 3),
-        use_stem=a.get("use_stem", True),
-        stem_channels=a.get("stem_channels", 64),
-        stem_stride=a.get("stem_stride", 2),
-        use_stem_maxpool=a.get("use_stem_maxpool", True),
-        output_activation=a.get("output_activation", "none"),
-        depth_decay=a.get("depth_decay", 0.5),
-        temperature=a.get("temperature", 1.0),
-        hard=a.get("hard", False),
-        use_batch_topk=a.get("use_batch_topk", True),
-        warmup_steps=a.get("warmup_steps", 0),
-        use_gate_value=a.get("use_gate_value", False),
+        stage_strides=tuple(a.get("stage_strides", mcfg.get("stage_strides", [1, 2, 2, 2]))),
+        stage_blocks=a.get("stage_blocks", mcfg.get("stage_blocks", None)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        temperature=a.get("temperature", mcfg.get("temperature", 1.0)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
     )
     model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
@@ -565,30 +569,32 @@ def load_topk_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKTa
 def load_topk_multi_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[TopKMultiTaxonAutoencoder, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    stage_taxonomy_layers = _resolve_stage_taxonomy_layers(a, ckpt["model_state"])
     model = TopKMultiTaxonAutoencoder(
-        in_channels=a.get("in_channels", 3),
-        resnet_variant=a.get("resnet_variant", "18"),
-        stage_taxonomy_layers=tuple(a.get("stage_taxonomy_layers", [3, 4, 5, 6])),
-        stage_strides=tuple(a.get("stage_strides", [1, 2, 2, 2])),
-        stage_blocks=a.get("stage_blocks", None),
-        n_hierarchies=a.get("n_hierarchies", 3),
-        k_aux=a.get("k_aux", None),
-        topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
-        dead_steps=a.get("dead_steps", 2000),
-        gate_k=a.get("gate_k", 2),
-        kernel_size=a.get("kernel_size", 3),
-        use_stem=a.get("use_stem", True),
-        stem_channels=a.get("stem_channels", 64),
-        stem_stride=a.get("stem_stride", 2),
-        use_stem_maxpool=a.get("use_stem_maxpool", True),
-        output_activation=a.get("output_activation", "none"),
-        depth_decay=a.get("depth_decay", 0.5),
-        temperature=a.get("temperature", 1.0),
-        hard=a.get("hard", False),
-        use_batch_topk=a.get("use_batch_topk", True),
-        warmup_steps=a.get("warmup_steps", 0),
-        k_leaves=a.get("k_leaves", 0),
-        use_gate_value=a.get("use_gate_value", False),
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        resnet_variant=a.get("resnet_variant", mcfg.get("resnet_variant", "18")),
+        stage_taxonomy_layers=stage_taxonomy_layers,
+        stage_strides=tuple(a.get("stage_strides", mcfg.get("stage_strides", [1, 2, 2, 2]))),
+        stage_blocks=a.get("stage_blocks", mcfg.get("stage_blocks", None)),
+        n_hierarchies=a.get("n_hierarchies", mcfg.get("n_hierarchies", 3)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        gate_k=a.get("gate_k", mcfg.get("gate_k", 2)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        temperature=a.get("temperature", mcfg.get("temperature", 1.0)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
     )
     state = ckpt["model_state"]
     model_state = model.state_dict()
@@ -660,13 +666,13 @@ def load_bottleneck_topk_multi_taxon_model(
     a = ckpt.get("args", {})
     mcfg = _model_cfg_from_config(a.get("config", ""))
     s = ckpt["model_state"]
-    bn_layers = a.get("bottleneck_n_taxonomy_layers", mcfg.get("bottleneck_n_taxonomy_layers"))
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers")
     if bn_layers is None:
         bn_layers = _infer_bottleneck_n_taxonomy_layers(s)
-    n_hier = a.get("n_hierarchies", mcfg.get("n_hierarchies"))
+    n_hier = a.get("n_hierarchies") or mcfg.get("n_hierarchies")
     if n_hier is None:
         n_hier = _infer_n_hierarchies(s)
-    use_inter_gate = a.get("use_inter_hierarchy_gate", mcfg.get("use_inter_hierarchy_gate"))
+    use_inter_gate = a.get("use_inter_hierarchy_gate") if a.get("use_inter_hierarchy_gate") is not None else mcfg.get("use_inter_hierarchy_gate")
     if use_inter_gate is None:
         use_inter_gate = ("encoder.bottleneck_stage.gate_conv.0.weight" in s)
     model = BottleneckTopKMultiTaxonAutoencoder(
@@ -773,32 +779,35 @@ def load_bottleneck_topk_taxon_model(
 ) -> Tuple[BottleneckTopKTaxonAutoencoder, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
     s = ckpt["model_state"]
-    bn_layers = a.get("bottleneck_n_taxonomy_layers") or _infer_bottleneck_n_taxonomy_layers(s)
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers")
+    if bn_layers is None:
+        bn_layers = _infer_bottleneck_n_taxonomy_layers(s)
     model = BottleneckTopKTaxonAutoencoder(
-        in_channels=a.get("in_channels", 3),
-        plain_stage_channels=tuple(a.get("plain_stage_channels", [64, 128, 256])),
-        plain_stage_blocks=tuple(a.get("plain_stage_blocks", [2, 2, 2])),
-        plain_stage_strides=tuple(a.get("plain_stage_strides", [1, 2, 2])),
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [1, 2, 2]))),
         bottleneck_n_taxonomy_layers=bn_layers,
-        bottleneck_n_blocks=a.get("bottleneck_n_blocks", 2),
-        bottleneck_stride=a.get("bottleneck_stride", 2),
-        topk_k_multiplier=a.get("topk_k_multiplier", 1.0),
-        k_aux=a.get("k_aux", None),
-        dead_steps=a.get("dead_steps", 2000),
-        kernel_size=a.get("kernel_size", 3),
-        use_stem=a.get("use_stem", True),
-        stem_channels=a.get("stem_channels", 64),
-        stem_stride=a.get("stem_stride", 2),
-        use_stem_maxpool=a.get("use_stem_maxpool", True),
-        output_activation=a.get("output_activation", "none"),
-        temperature=a.get("temperature", 0.5),
-        hard=a.get("hard", False),
-        depth_decay=a.get("depth_decay", 0.5),
-        use_batch_topk=a.get("use_batch_topk", True),
-        warmup_steps=a.get("warmup_steps", 0),
-        k_leaves=a.get("k_leaves", 0),
-        use_gate_value=a.get("use_gate_value", False),
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
     )
     model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()

@@ -1,0 +1,65 @@
+{
+    "experiment_name": "bottleneck_topk_multi_taxon_ae_imagenet_r18_v6_main_K12_L6_gate1",
+    "data": {
+        "data_root": "./data/tiny_imagenet",
+        "image_size": 64,
+        "batch_size": 32,
+        "num_workers": 8
+    },
+    "model": {
+        "in_channels": 3,
+        "plain_stage_channels": [
+            64,
+            128,
+            256
+        ],
+        "plain_stage_blocks": [
+            2,
+            2,
+            2
+        ],
+        "plain_stage_strides": [
+            2,
+            2,
+            2
+        ],
+        "bottleneck_n_blocks": 2,
+        "bottleneck_stride": 2,
+        "topk_k_multiplier": 1.0,
+        "dead_steps": 2000,
+        "kernel_size": 3,
+        "use_stem": true,
+        "stem_channels": 64,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none",
+        "temperature": 0.5,
+        "hard": false,
+        "depth_decay": 0.5,
+        "use_batch_topk": true,
+        "warmup_steps": 5000,
+        "use_gate_value": false,
+        "bottleneck_n_taxonomy_layers": 6,
+        "n_hierarchies": 12,
+        "k_leaves": 1,
+        "use_inter_hierarchy_gate": true,
+        "gate_k": 1
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "auxk_weight": 0.01,
+        "dkl_weight": 0.0,
+        "decoder_max_norm": 1.0,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0,
+        "matryoshka": false,
+        "weighted_matryoshka": false
+    },
+    "output": {
+        "output_dir": "./outputs/imagenet/main/bottleneck_topk_multi_taxon_ae_imagenet_r18_v6_main"
+    }
+}
