@@ -23,6 +23,7 @@
             2,
             2
         ],
+        "bottleneck_n_taxonomy_layers": 8,
         "bottleneck_n_blocks": 2,
         "bottleneck_stride": 2,
         "topk_k_multiplier": 1.0,
@@ -38,9 +39,8 @@
         "depth_decay": 0.5,
         "use_batch_topk": true,
         "warmup_steps": 5000,
-        "use_gate_value": false,
-        "bottleneck_n_taxonomy_layers": 8,
-        "k_leaves": 0
+        "k_leaves": 0,
+        "use_gate_value": false
     },
     "training": {
         "epochs": 90,
@@ -52,9 +52,7 @@
         "decoder_max_norm": 1.0,
         "save_every": 5,
         "seed": 42,
-        "max_train_steps": 0,
-        "matryoshka": false,
-        "weighted_matryoshka": false
+        "max_train_steps": 0
     },
     "output": {
         "output_dir": "./outputs/imagenet/main/bottleneck_topk_taxon_ae_imagenet_r18_v1_main"

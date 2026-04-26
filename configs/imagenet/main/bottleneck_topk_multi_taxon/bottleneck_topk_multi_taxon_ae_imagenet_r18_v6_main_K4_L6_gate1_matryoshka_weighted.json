@@ -23,8 +23,13 @@
             2,
             2
         ],
+        "bottleneck_n_taxonomy_layers": 6,
         "bottleneck_n_blocks": 2,
         "bottleneck_stride": 2,
+        "n_hierarchies": 4,
+        "k_leaves": 1,
+        "use_inter_hierarchy_gate": true,
+        "gate_k": 1,
         "topk_k_multiplier": 1.0,
         "dead_steps": 2000,
         "kernel_size": 3,
@@ -38,12 +43,7 @@
         "depth_decay": 0.5,
         "use_batch_topk": true,
         "warmup_steps": 5000,
-        "use_gate_value": false,
-        "bottleneck_n_taxonomy_layers": 6,
-        "n_hierarchies": 4,
-        "k_leaves": 1,
-        "use_inter_hierarchy_gate": true,
-        "gate_k": 1
+        "use_gate_value": false
     },
     "training": {
         "epochs": 90,
@@ -57,8 +57,8 @@
         "seed": 42,
         "max_train_steps": 0,
         "matryoshka": true,
-        "weighted_matryoshka": true,
-        "matryoshka_weight": 1.0
+        "matryoshka_weight": 1.0,
+        "weighted_matryoshka": true
     },
     "output": {
         "output_dir": "./outputs/imagenet/main/bottleneck_topk_multi_taxon_ae_imagenet_r18_v6_main"

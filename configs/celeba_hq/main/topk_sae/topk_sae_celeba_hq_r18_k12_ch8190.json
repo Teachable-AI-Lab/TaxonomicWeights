@@ -1,0 +1,42 @@
+{
+    "experiment_name": "sae_topk_celeba_hq_r18_k12_ch8190",
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "model": {
+        "model_variant": "topk",
+        "in_channels": 3,
+        "resnet_variant": "18",
+        "stage_channels": [64, 128, 256, 8190],
+        "stage_strides": [1, 2, 2, 2],
+        "stage_blocks": null,
+        "topk_k": 12,
+        "k_aux": 12,
+        "use_aux_loss": true,
+        "dead_threshold": 0.001,
+        "kernel_size": 3,
+        "use_stem": true,
+        "stem_channels": 64,
+        "stem_stride": 2,
+        "use_stem_maxpool": true,
+        "output_activation": "none"
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 3e-4,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 3,
+        "sparsity_weight": 1e-2,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "output": {
+        "output_dir": "./outputs/celeba_hq/main/sae_topk_celeba_hq_r18_k12_ch8190",
+        "analysis_save_dir": "./outputs/celeba_hq/main/sae_topk_celeba_hq_r18_k12_ch8190/analysis"
+    }
+}

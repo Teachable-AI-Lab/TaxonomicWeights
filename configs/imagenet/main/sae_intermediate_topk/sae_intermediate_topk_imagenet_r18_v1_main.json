@@ -3,7 +3,7 @@
     "data": {
         "data_root": "./data/tiny_imagenet",
         "image_size": 64,
-        "batch_size": 32,
+        "batch_size": 16,
         "num_workers": 8
     },
     "model": {
@@ -16,7 +16,7 @@
             512
         ],
         "stage_strides": [
-            2,
+            1,
             2,
             2,
             2

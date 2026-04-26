@@ -10,8 +10,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:a40:1
-#SBATCH --time=24:00:00
-#SBATCH --qos=long
+#SBATCH --time=1-00:00:00
+#SBATCH --qos=short
 
 cd /nethome/ksingara3/flash/TaxonomicWeights
 

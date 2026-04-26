@@ -1,5 +1,5 @@
 {
-    "experiment_name": "sae_matryoshka_batch_topk_imagenet_r18",
+    "experiment_name": "sae_matryoshka_batch_topk_imagenet_r18_k16",
     "model": {
         "model_variant": "matryoshka_batch_topk",
         "resnet_variant": "18",
@@ -16,11 +16,11 @@
             2
         ],
         "k_values": [
+            16,
             8,
-            4,
-            2
+            4
         ],
-        "k_aux": 8,
+        "k_aux": 16,
         "use_aux_loss": true,
         "dead_threshold": 0.001,
         "stem_stride": 2,
@@ -48,7 +48,7 @@
         "seed": 42
     },
     "output": {
-        "output_dir": "./outputs/imagenet/sae_matryoshka_batch_topk_imagenet_r18",
-        "analysis_save_dir": "./outputs/imagenet/sae_matryoshka_batch_topk_imagenet_r18/analysis"
+        "output_dir": "./outputs/imagenet/sae_matryoshka_batch_topk_imagenet_r18_k16",
+        "analysis_save_dir": "./outputs/imagenet/sae_matryoshka_batch_topk_imagenet_r18_k16/analysis"
     }
 }

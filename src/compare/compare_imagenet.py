@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -50,12 +49,23 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import math
+import re
+
 from src.model.cnn.taxon.taxon_ae import TaxonAutoencoder
 from src.model.cnn.taxon.multi_taxon_ae import MultiTaxonAutoencoder
 from src.model.cnn.taxon.topk_taxon_ae import TopKTaxonAutoencoder
 from src.model.cnn.taxon.topk_multi_taxon_ae import TopKMultiTaxonAutoencoder
 from src.model.cnn.taxon.bias_taxon_ae import BiasTaxonAutoencoder
 from src.model.cnn.taxon.bias_multi_taxon_ae import BiasMultiTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_topk_taxon_ae import BottleneckTopKTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_topk_multi_taxon_ae import BottleneckTopKMultiTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_taxon_ae import BottleneckTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_multi_taxon_ae import BottleneckMultiTaxonAutoencoder
+from src.model.cnn.baseline.intermediate_topk_sae import IntermediateTopKSparseConvAutoencoder
+from src.model.cnn.baseline.matryoshka_intermediate_topk_sae import (
+    IntermediateMatryoshkaBatchTopKSparseConvAutoencoder,
+)
 from src.model.cnn.baseline.sae import SparseConvAutoencoder
 from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
 from src.model.cnn.baseline.gated_sae import GatedSparseConvAutoencoder
@@ -63,7 +73,7 @@ from src.model.cnn.baseline.jumprelu_sae import JumpReLUSparseConvAutoencoder
 from src.model.cnn.baseline.matryoshka_batch_topk_sae import MatryoshkaBatchTopKSparseConvAutoencoder
 from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
 from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
-from src.utils.dataloader import ImageNet1kHFLoader
+from src.utils.dataloader import TinyImageNetLoader
 
 
 # ─── colour palette ────────────────────────────────────────────────────────────
@@ -112,7 +122,39 @@ _BIAS_MULTI_TAXON_PALETTE = [
 ]
 
 
+_BOTTLENECK_TOPK_TAXON_PALETTE = [
+    "#005f73", "#0a9396", "#94d2bd", "#007ea7", "#00b4d8",
+]
+_BOTTLENECK_TOPK_MULTI_TAXON_PALETTE = [
+    "#000080", "#1f3a93", "#3b5998", "#5b7bbf", "#082567",
+]
+_BOTTLENECK_TAXON_PALETTE = [
+    "#003f5c", "#2f4b7c", "#1a3a5c", "#265073", "#0d4d6b",
+]
+_BOTTLENECK_MULTI_TAXON_PALETTE = [
+    "#5e2d79", "#7c3aad", "#9b59b6", "#6c3483", "#4a235a",
+]
+_INTERMEDIATE_TOPK_PALETTE = [
+    "#bc6c25", "#dda15e", "#a05e25", "#8b4513", "#d2691e",
+]
+_MATRYOSHKA_INTERMEDIATE_TOPK_PALETTE = [
+    "#7a4f01", "#c2740d", "#a5670e", "#5c3b00", "#d18a2c",
+]
+
+
 def model_colour(model_type: str, idx: int) -> str:
+    if model_type == "bottleneck_topk_taxon":
+        return _BOTTLENECK_TOPK_TAXON_PALETTE[idx % len(_BOTTLENECK_TOPK_TAXON_PALETTE)]
+    if model_type == "bottleneck_topk_multi_taxon":
+        return _BOTTLENECK_TOPK_MULTI_TAXON_PALETTE[idx % len(_BOTTLENECK_TOPK_MULTI_TAXON_PALETTE)]
+    if model_type == "bottleneck_taxon":
+        return _BOTTLENECK_TAXON_PALETTE[idx % len(_BOTTLENECK_TAXON_PALETTE)]
+    if model_type == "bottleneck_multi_taxon":
+        return _BOTTLENECK_MULTI_TAXON_PALETTE[idx % len(_BOTTLENECK_MULTI_TAXON_PALETTE)]
+    if model_type == "intermediate_topk_sae":
+        return _INTERMEDIATE_TOPK_PALETTE[idx % len(_INTERMEDIATE_TOPK_PALETTE)]
+    if model_type == "matryoshka_intermediate_topk_sae":
+        return _MATRYOSHKA_INTERMEDIATE_TOPK_PALETTE[idx % len(_MATRYOSHKA_INTERMEDIATE_TOPK_PALETTE)]
     if model_type == "topk_taxon":
         return _TOPK_TAXON_PALETTE[idx % len(_TOPK_TAXON_PALETTE)]
     if model_type == "bias_taxon":
@@ -147,16 +189,24 @@ def model_colour(model_type: str, idx: int) -> str:
 def _short_name(run_dir: str) -> str:
     mtype = _model_type(run_dir)
     n = run_dir
-    for prefix in ("topk_multi_taxon_ae_imagenet_r18_", "bias_multi_taxon_ae_imagenet_r18_",
-                   "multi_taxon_ae_imagenet_r18_",
-                   "topk_taxon_ae_imagenet_r18_", "bias_taxon_ae_imagenet_r18_",
-                   "taxon_ae_imagenet_r18_", "sae_jumprelu_imagenet_r18_",
-                   "sae_matryoshka_batch_topk_imagenet_r18_",
-                   "sae_softmax_imagenet_r18_",
-                   "sae_topk_imagenet_r18_", "sae_gated_imagenet_r18_",
-                   "sae_imagenet_r18_",       "taxon_ae_imagenet_r18_",   "sae_imagenet_r18_",
-                   "baseline_ae_imagenet_r18", "baseline_ae_imagenet",
-                   "baseline_ae_imagenet_r18",  "baseline_ae_imagenet"):
+    for prefix in (
+        "bottleneck_topk_multi_taxon_ae_imagenet_r18_",
+        "bottleneck_topk_taxon_ae_imagenet_r18_",
+        "bottleneck_multi_taxon_ae_imagenet_r18_",
+        "bottleneck_taxon_ae_imagenet_r18_",
+        "topk_multi_taxon_ae_imagenet_r18_", "bias_multi_taxon_ae_imagenet_r18_",
+        "multi_taxon_ae_imagenet_r18_",
+        "topk_taxon_ae_imagenet_r18_", "bias_taxon_ae_imagenet_r18_",
+        "taxon_ae_imagenet_r18_",
+        "sae_matryoshka_intermediate_topk_imagenet_r18_",
+        "sae_intermediate_topk_imagenet_r18_",
+        "sae_matryoshka_batch_topk_imagenet_r18_",
+        "sae_jumprelu_imagenet_r18_",
+        "sae_softmax_imagenet_r18_",
+        "sae_topk_imagenet_r18_", "sae_gated_imagenet_r18_",
+        "sae_imagenet_r18_",
+        "baseline_ae_imagenet_r18", "baseline_ae_imagenet",
+    ):
         n = n.replace(prefix, "").strip("_")
     n = n.replace("_", " ").strip()
     suffix = f" ({n})" if n else ""
@@ -164,6 +214,14 @@ def _short_name(run_dir: str) -> str:
 
 
 def _model_type(run_dir: str) -> str:
+    if run_dir.startswith("bottleneck_topk_multi_taxon_"):
+        return "bottleneck_topk_multi_taxon"
+    if run_dir.startswith("bottleneck_topk_taxon_"):
+        return "bottleneck_topk_taxon"
+    if run_dir.startswith("bottleneck_multi_taxon_"):
+        return "bottleneck_multi_taxon"
+    if run_dir.startswith("bottleneck_taxon_"):
+        return "bottleneck_taxon"
     if run_dir.startswith("topk_multi_taxon_"):
         return "topk_multi_taxon"
     if run_dir.startswith("bias_multi_taxon_"):
@@ -174,6 +232,10 @@ def _model_type(run_dir: str) -> str:
         return "topk_taxon"
     if run_dir.startswith("bias_taxon_"):
         return "bias_taxon"
+    if run_dir.startswith("sae_matryoshka_intermediate_topk_"):
+        return "matryoshka_intermediate_topk_sae"
+    if run_dir.startswith("sae_intermediate_topk_"):
+        return "intermediate_topk_sae"
     if run_dir.startswith("sae_matryoshka_batch_topk_"):
         return "matryoshka_batch_topk_sae"
     if run_dir.startswith("sae_softmax_"):
@@ -199,16 +261,26 @@ def _to_display(t: torch.Tensor) -> np.ndarray:
 
 # ─── discovery ─────────────────────────────────────────────────────────────────
 
-def discover_runs(outputs_dir: Path) -> List[Dict]:
+def _is_ablation_run(run_path: Path, run_name: str) -> bool:
+    path_parts = {p.lower() for p in run_path.parts}
+    if "main" in path_parts:
+        return False
+    if "ablations" in path_parts:
+        return True
+    name = run_name.lower()
+    ablation_tokens = ("ablation", "abl_", "_abl", "_only", "_no_", "_minus_")
+    return any(tok in name for tok in ablation_tokens)
+
+
+def discover_runs(outputs_dir: Path, include_ablations: bool = False) -> List[Dict]:
+    """Recursively find all imagenet runs under outputs_dir with a best.pt checkpoint."""
     runs = []
-    for name in sorted(os.listdir(outputs_dir)):
+    for best_ckpt in sorted(outputs_dir.rglob("checkpoints/best.pt")):
+        run_path = best_ckpt.parent.parent
+        name = run_path.name
         if "imagenet" not in name.lower():
             continue
-        run_path = outputs_dir / name
-        if not run_path.is_dir():
-            continue
-        best_ckpt = run_path / "checkpoints" / "best.pt"
-        if not best_ckpt.exists():
+        if not include_ablations and _is_ablation_run(run_path, name):
             continue
         runs.append({
             "name":      name,
@@ -219,7 +291,16 @@ def discover_runs(outputs_dir: Path) -> List[Dict]:
             "history":   run_path / "training_history.json",
             "analysis":  run_path / "analysis",
         })
-    runs.sort(key=lambda r: ({"taxon": 0, "multi_taxon": 1, "topk_taxon": 2, "topk_multi_taxon": 3, "bias_taxon": 4, "bias_multi_taxon": 5, "sae": 6, "topk_sae": 7, "gated_sae": 8, "jumprelu_sae": 9, "matryoshka_batch_topk_sae": 10, "softmax_sae": 11, "baseline": 12}.get(r["type"], 99), r["name"]))
+    _order = {
+        "taxon": 0, "topk_taxon": 1, "bias_taxon": 2,
+        "multi_taxon": 3, "topk_multi_taxon": 4, "bias_multi_taxon": 5,
+        "bottleneck_taxon": 5.1, "bottleneck_multi_taxon": 5.2,
+        "bottleneck_topk_taxon": 5.3, "bottleneck_topk_multi_taxon": 5.5,
+        "sae": 6, "intermediate_topk_sae": 6.5, "topk_sae": 7, "gated_sae": 8,
+        "jumprelu_sae": 9, "matryoshka_batch_topk_sae": 10,
+        "matryoshka_intermediate_topk_sae": 10.5, "softmax_sae": 11, "baseline": 12,
+    }
+    runs.sort(key=lambda r: (_order.get(r["type"], 99), r["name"]))
     type_counters: Dict[str, int] = {}
     for r in runs:
         idx = type_counters.get(r["type"], 0)
@@ -361,6 +442,249 @@ def load_bias_taxon_model(ckpt_path: Path, device: torch.device) -> Tuple[BiasTa
     return model, ckpt
 
 
+# ─── architecture-inference helpers (for bottleneck models) ────────────────────
+
+def _infer_bottleneck_n_taxonomy_layers(state_dict: dict) -> int:
+    key = "encoder.bottleneck_stage.blocks.0.main.1.weight"
+    if key not in state_dict:
+        key = "encoder.bottleneck_stage.hierarchies.0.blocks.0.main.1.weight"
+    if key not in state_dict:
+        return 6
+    ch = state_dict[key].shape[0]
+    return int(round(math.log2(ch + 2))) - 1
+
+
+def _infer_n_hierarchies(state_dict: dict) -> int:
+    key = "encoder.bottleneck_stage.gate_conv.0.weight"
+    if key not in state_dict:
+        pat = re.compile(r"^encoder\.bottleneck_stage\.hierarchies\.(\d+)\.")
+        idxs = []
+        for k in state_dict.keys():
+            m = pat.match(k)
+            if m is not None:
+                idxs.append(int(m.group(1)))
+        if idxs:
+            return max(idxs) + 1
+        return 4
+    return int(state_dict[key].shape[0])
+
+
+def _infer_stage_taxonomy_layers(state_dict: dict) -> List[int]:
+    layers: List[int] = []
+    i = 0
+    while True:
+        key = f"encoder.taxon_stages.{i}.blocks.0.main.1.weight"
+        if key not in state_dict:
+            break
+        ch = state_dict[key].shape[0]
+        n = int(round(math.log2(ch + 2))) - 1
+        layers.append(n)
+        i += 1
+    if not layers:
+        raise RuntimeError(
+            "Could not infer stage_taxonomy_layers: no matching encoder keys found."
+        )
+    return layers
+
+
+def _stage_taxonomy_layers_from_config(config_rel_path: str) -> Optional[List[int]]:
+    if not config_rel_path:
+        return None
+    cfg_path = ROOT / config_rel_path
+    if not cfg_path.exists():
+        return None
+    try:
+        with open(cfg_path) as _f:
+            cfg = json.load(_f)
+        val = cfg.get("model", {}).get("stage_taxonomy_layers")
+        if val is not None:
+            return list(val)
+    except Exception:
+        pass
+    return None
+
+
+def _model_cfg_from_config(config_rel_path: str) -> Dict:
+    if not config_rel_path:
+        return {}
+    cfg_path = ROOT / config_rel_path
+    if not cfg_path.exists():
+        return {}
+    try:
+        with open(cfg_path) as _f:
+            cfg = json.load(_f)
+        model_cfg = cfg.get("model", {})
+        return model_cfg if isinstance(model_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_stage_taxonomy_layers(a: dict, model_state: dict) -> tuple:
+    if "stage_taxonomy_layers" in a:
+        return tuple(a["stage_taxonomy_layers"])
+    from_cfg = _stage_taxonomy_layers_from_config(a.get("config", ""))
+    if from_cfg is not None:
+        return tuple(from_cfg)
+    return tuple(_infer_stage_taxonomy_layers(model_state))
+
+
+def load_bottleneck_topk_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[BottleneckTopKTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    s = ckpt["model_state"]
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers")
+    if bn_layers is None:
+        bn_layers = _infer_bottleneck_n_taxonomy_layers(s)
+    model = BottleneckTopKTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [2, 2, 2]))),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
+    )
+    model.load_state_dict(s, strict=False)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bottleneck_topk_multi_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[BottleneckTopKMultiTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    s = ckpt["model_state"]
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers")
+    if bn_layers is None:
+        bn_layers = _infer_bottleneck_n_taxonomy_layers(s)
+    n_hier = a.get("n_hierarchies") or mcfg.get("n_hierarchies")
+    if n_hier is None:
+        n_hier = _infer_n_hierarchies(s)
+    use_inter_gate = a.get("use_inter_hierarchy_gate") if a.get("use_inter_hierarchy_gate") is not None else mcfg.get("use_inter_hierarchy_gate")
+    if use_inter_gate is None:
+        use_inter_gate = ("encoder.bottleneck_stage.gate_conv.0.weight" in s)
+    model = BottleneckTopKMultiTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [2, 2, 2]))),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        n_hierarchies=n_hier,
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 1.0)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 1)),
+        gate_k=a.get("gate_k", mcfg.get("gate_k", None)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
+        use_inter_hierarchy_gate=use_inter_gate,
+    )
+    model.load_state_dict(s, strict=False)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bottleneck_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[BottleneckTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    s = ckpt["model_state"]
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers") or _infer_bottleneck_n_taxonomy_layers(s)
+    model = BottleneckTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [2, 2, 2]))),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
+    )
+    model.load_state_dict(s, strict=False)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bottleneck_multi_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[BottleneckMultiTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    s = ckpt["model_state"]
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers") or _infer_bottleneck_n_taxonomy_layers(s)
+    n_hier = a.get("n_hierarchies") or mcfg.get("n_hierarchies") or _infer_n_hierarchies(s)
+    model = BottleneckMultiTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [2, 2, 2]))),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        n_hierarchies=n_hier,
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
+    )
+    model.load_state_dict(s, strict=False)
+    model.to(device).eval()
+    return model, ckpt
+
+
 def load_sae_model(ckpt_path: Path, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = ckpt.get("args", {})
@@ -383,6 +707,24 @@ def load_sae_model(ckpt_path: Path, device: torch.device):
     if variant == "matryoshka_batch_topk":
         k_vals = sorted(a.get("k_values", [64, 32, 16]), reverse=True)
         model = MatryoshkaBatchTopKSparseConvAutoencoder(
+            **common,
+            k_values=k_vals,
+            k_aux=a.get("k_aux", None),
+            use_aux_loss=False,
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+    elif variant == "matryoshka_intermediate_batch_topk":
+        k_vals = list(a.get("k_values", [32, 16, 8, 4]))
+        model = IntermediateMatryoshkaBatchTopKSparseConvAutoencoder(
+            **common,
+            k_values=k_vals,
+            k_aux=a.get("k_aux", None),
+            use_aux_loss=False,
+            dead_threshold=a.get("dead_threshold", 1e-3),
+        )
+    elif variant == "intermediate_topk":
+        k_vals = list(a.get("k_values", [32, 16, 8, 4]))
+        model = IntermediateTopKSparseConvAutoencoder(
             **common,
             k_values=k_vals,
             k_aux=a.get("k_aux", None),
@@ -460,7 +802,19 @@ def load_model(run: Dict, device: torch.device):
         return load_bias_multi_taxon_model(run["best_ckpt"], device)
     if run["type"] == "taxon":
         return load_taxon_model(run["best_ckpt"], device)
-    if run["type"] in {"sae", "topk_sae", "gated_sae", "jumprelu_sae", "matryoshka_batch_topk_sae", "softmax_sae"}:
+    if run["type"] == "bottleneck_topk_taxon":
+        return load_bottleneck_topk_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bottleneck_topk_multi_taxon":
+        return load_bottleneck_topk_multi_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bottleneck_taxon":
+        return load_bottleneck_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bottleneck_multi_taxon":
+        return load_bottleneck_multi_taxon_model(run["best_ckpt"], device)
+    if run["type"] in {
+        "sae", "topk_sae", "gated_sae", "jumprelu_sae",
+        "matryoshka_batch_topk_sae", "matryoshka_intermediate_topk_sae",
+        "intermediate_topk_sae", "softmax_sae",
+    }:
         return load_sae_model(run["best_ckpt"], device)
     return load_baseline_model(run["best_ckpt"], device)
 
@@ -474,7 +828,7 @@ def compute_live_metrics(
     loader,
     n_batches_latent: int = 20,
     n_batches_recon: int = 10,
-    sparsity_threshold: float = 0.1,
+    sparsity_threshold: float = 1e-6,
 ) -> Dict:
     model, _ = load_model(run, device)
     model.eval()
@@ -484,21 +838,29 @@ def compute_live_metrics(
         imgs = imgs.to(device)
         if run["type"] == "taxon":
             recon, _, _ = model(imgs)
-        elif run["type"] == "topk_taxon":
+        elif run["type"] in ("topk_taxon", "bottleneck_topk_taxon"):
             recon, _ = model(imgs)
-        elif run["type"] == "bias_taxon":
+        elif run["type"] in ("bias_taxon", "bottleneck_taxon"):
             (recon,) = model(imgs)
         elif run["type"] == "multi_taxon":
             recon, _, _, _, _ = model(imgs)
-        elif run["type"] == "topk_multi_taxon":
+        elif run["type"] in ("topk_multi_taxon", "bottleneck_topk_multi_taxon"):
             recon, _ = model(imgs)
-        elif run["type"] == "bias_multi_taxon":
+        elif run["type"] in ("bias_multi_taxon", "bottleneck_multi_taxon"):
             (recon,) = model(imgs)
         elif run["type"] == "softmax_sae":
             recon, _, _ = model(imgs)
         else:
             recon, _    = model(imgs)
-        z, _ = model.encode(imgs)
+        z_out = model.encode(imgs)
+        if isinstance(z_out, (list, tuple)):
+            z_first = z_out[0]
+            if isinstance(z_first, (list, tuple)):
+                z = z_first[-1]
+            else:
+                z = z_first
+        else:
+            z = z_out
         if b_idx < n_batches_recon:
             mse_list.extend(((imgs - recon) ** 2).mean(dim=(1, 2, 3)).cpu().numpy())
             mae_list.extend(torch.abs(imgs - recon).mean(dim=(1, 2, 3)).cpu().numpy())
@@ -620,15 +982,15 @@ def collect_reconstructions(
     with torch.no_grad():
         if run["type"] == "taxon":
             recon, _, _ = model(imgs)
-        elif run["type"] == "topk_taxon":
+        elif run["type"] in ("topk_taxon", "bottleneck_topk_taxon"):
             recon, _ = model(imgs)
-        elif run["type"] == "bias_taxon":
+        elif run["type"] in ("bias_taxon", "bottleneck_taxon"):
             (recon,) = model(imgs)
         elif run["type"] == "multi_taxon":
             recon, _, _, _, _ = model(imgs)
-        elif run["type"] == "topk_multi_taxon":
+        elif run["type"] in ("topk_multi_taxon", "bottleneck_topk_multi_taxon"):
             recon, _ = model(imgs)
-        elif run["type"] == "bias_multi_taxon":
+        elif run["type"] in ("bias_multi_taxon", "bottleneck_multi_taxon"):
             (recon,) = model(imgs)
         elif run["type"] == "softmax_sae":
             recon, _, _ = model(imgs)
@@ -967,7 +1329,7 @@ def make_summary_csv(runs, all_metrics, save_dir) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Comparative analysis of all ImageNet-1k Taxon-AE and SAE runs"
+        description="Comparative analysis of all Tiny-ImageNet Taxon-AE and SAE runs"
     )
     p.add_argument("--outputs-dir",  type=str, default="./outputs/imagenet")
     p.add_argument("--save-dir",     type=str, default="./outputs/imagenet/comparison")
@@ -989,20 +1351,21 @@ def main() -> None:
 
     runs = discover_runs(outputs_dir)
     if not runs:
-        print("No ImageNet-1k runs with a best.pt found under", outputs_dir)
+        print("No Tiny-ImageNet runs with a best.pt found under", outputs_dir)
         print("Run train_sae_imagenet.py (or train_taxon_imagenet.py) first.")
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Found {len(runs)} ImageNet-1k run(s):")
+    print(f"Found {len(runs)} Tiny-ImageNet run(s):")
     for r in runs:
         print(f"  [{r['type']:5s}] {r['name']}")
 
     # Build ImageNet-1k validation loader via HuggingFace datasets.
-    imagenet_loader = ImageNet1kHFLoader(
+    imagenet_loader = TinyImageNetLoader(
         batch_size=args.batch_size,
         num_workers=8,
-        image_size=224,
+        image_size=64,
+        cache_dir=args.data_root,
     )
     _, test_loader = imagenet_loader.get_loaders()
 

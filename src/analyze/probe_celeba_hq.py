@@ -37,8 +37,8 @@ Outputs
 ``<save_dir>/probe_celeba_hq_taxon_scatter.png``   — perf vs L0 scatter, taxon vs non-taxon
 ``<save_dir>/probe_celeba_hq_taxon_matched.png``   — matched-pair bar charts
 ``<save_dir>/probe_celeba_hq_taxon_attr_compare.png`` — per-attr heatmap, matched pairs
-``<save_dir>/probe_celeba_hq_tsne_<name>.png``     — per-model t-SNE coloured by all attrs
-``<save_dir>/probe_celeba_hq_tsne_compare.png``    — cross-model t-SNE for headline attrs
+``<save_dir>/tsne/probe_celeba_hq_tsne_<name>.png``   — per-model t-SNE coloured by all attrs
+``<save_dir>/tsne/probe_celeba_hq_tsne_compare.png``  — cross-model t-SNE for headline attrs
 ``<save_dir>/<run_name>/latents.npz``              — cached latents + attr labels
 """
 
@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -351,7 +352,7 @@ def compute_sparsity_stats(
     model: torch.nn.Module,
     loader,
     device: torch.device,
-    threshold: float = 1e-4,
+    threshold: float = 1e-6,
     max_batches: int = 60,
 ) -> Dict[str, float]:
     """Compute L0 norm, dead feature fraction, and selectivity on the val set.
@@ -359,9 +360,9 @@ def compute_sparsity_stats(
     Returns
     -------
     dict with float scalars:
-      mean_l0        : mean fraction of active (> threshold) feature map values
-      dead_frac      : fraction of channels that are zero across all samples
-      l0_abs         : mean count of active channels (pooled)
+      mean_l0        : mean fraction of active (> threshold) latent positions (flattened)
+      dead_frac      : fraction of latent dimensions that never fire across all samples
+      l0_abs         : mean count of active latent positions per image (channels × spatial)
       selectivity    : mean channel std-dev / mean activation (higher = more selective)
       mean_jaccard   : mean pairwise Jaccard on binarised activation vectors
                        (estimated from a random 512-sample subset)
@@ -399,8 +400,8 @@ def compute_sparsity_stats(
                 continue
             z = captured.pop("z")
             if z.dim() == 4:
-                z = F.adaptive_avg_pool2d(z.abs(), 1).flatten(1)
-            z = z.cpu().float().numpy()
+                z = z.reshape(z.shape[0], -1)
+            z = z.abs().cpu().float().numpy()
             all_acts.append(z)
     finally:
         hook_handle.remove()
@@ -721,37 +722,55 @@ def plot_taxon_scatter(all_results: List[dict], save_dir: Path):
         return
 
     n = len(active_metrics)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
-    if n == 1:
-        axes = [axes]
 
-    for ax, (title, fn) in zip(axes, active_metrics):
-        tx, ty, tlabels = _collect(taxon_r, fn)
-        bx, by, blabels = _collect(baseline_r, fn)
-
-        ax.scatter(bx, by, marker="X", s=90, color=_BASE_COLOR, alpha=0.8,
-                   label="Non-taxon", zorder=3, edgecolors="black", linewidths=0.4)
-        ax.scatter(tx, ty, marker="o", s=90, color=_TAXON_COLOR, alpha=0.85,
-                   label="Taxon", zorder=4, edgecolors="black", linewidths=0.4)
-
+    def _draw_panel(ax, tx, ty, tlabels, bx, by, blabels, title, x_cap=None):
+        def _cx(x):
+            return min(x, x_cap) if x_cap is not None else x
+        ax.scatter([_cx(x) for x in bx], by, marker="X", s=90,
+                   color=_BASE_COLOR, alpha=0.8, label="Non-taxon",
+                   zorder=3, edgecolors="black", linewidths=0.4)
+        ax.scatter([_cx(x) for x in tx], ty, marker="o", s=90,
+                   color=_TAXON_COLOR, alpha=0.85, label="Taxon",
+                   zorder=4, edgecolors="black", linewidths=0.4)
         for x, y, lbl in zip(tx, ty, tlabels):
-            ax.annotate(lbl, (x, y), textcoords="offset points",
+            prefix = "\u2192" if (x_cap is not None and x > x_cap) else ""
+            ax.annotate(f"{prefix}{lbl}", (_cx(x), y), textcoords="offset points",
                         xytext=(4, 3), fontsize=6, color=_TAXON_COLOR, alpha=0.85)
         for x, y, lbl in zip(bx, by, blabels):
-            ax.annotate(lbl, (x, y), textcoords="offset points",
+            prefix = "\u2192" if (x_cap is not None and x > x_cap) else ""
+            ax.annotate(f"{prefix}{lbl}", (_cx(x), y), textcoords="offset points",
                         xytext=(4, 3), fontsize=6, color=_BASE_COLOR, alpha=0.7)
-
-        # Reference line at median taxon L0
         if tx:
             med = float(np.median(tx))
-            ax.axvline(med, color=_TAXON_COLOR, linewidth=0.8, linestyle="--", alpha=0.45,
-                       label=f"Taxon median L0={med:.0f}")
-
-        ax.set_xlabel("Mean Active Channels (L0 abs)", fontsize=9)
+            ax.axvline(_cx(med), color=_TAXON_COLOR, linewidth=0.8, linestyle="--",
+                       alpha=0.45, label=f"Taxon median L0={med:.0f}")
+        if x_cap is not None:
+            ax.set_xlim(-0.02 * x_cap, x_cap * 1.05)
+            ax.axvline(x_cap, color="gray", lw=0.7, ls=":", alpha=0.5)
+        ax.set_xlabel("Mean Active Features (L0 abs)", fontsize=9)
         ax.set_ylabel(title, fontsize=9)
-        ax.set_title(title, fontsize=10)
         ax.legend(fontsize=7, loc="best")
         ax.grid(alpha=0.3)
+
+    # Shared x_cap: 90th percentile of all L0 values
+    all_xs_flat = []
+    for _, fn in active_metrics:
+        tx, _, _ = _collect(taxon_r, fn)
+        bx, _, _ = _collect(baseline_r, fn)
+        all_xs_flat.extend(tx + bx)
+    x_cap = float(np.percentile(all_xs_flat, 90)) if all_xs_flat else None
+
+    fig, axes = plt.subplots(2, n, figsize=(5 * n, 10))
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    for col, (title, fn) in enumerate(active_metrics):
+        tx, ty, tlabels = _collect(taxon_r, fn)
+        bx, by, blabels = _collect(baseline_r, fn)
+        _draw_panel(axes[0, col], tx, ty, tlabels, bx, by, blabels, title)
+        axes[0, col].set_title(f"{title} (full)", fontsize=10)
+        _draw_panel(axes[1, col], tx, ty, tlabels, bx, by, blabels, title, x_cap=x_cap)
+        axes[1, col].set_title(f"{title} (zoomed, L0 \u2264 {x_cap:.0f})", fontsize=10)
 
     fig.suptitle("Taxonomic vs Non-Taxonomic: Performance vs Sparsity (CelebA-HQ)",
                  fontsize=12, fontweight="bold")
@@ -1070,6 +1089,334 @@ def plot_monosemanticity_scatter(all_results: List[dict], save_dir: Path):
     print(f"  Saved: {out.name}")
 
 
+# ─── taxon hierarchy exploration ──────────────────────────────────────────────
+
+_TAXON_HIERARCHY_TYPES = {"bottleneck_topk_taxon"}
+_HIER_PROB_THRESHOLD   = 0.01   # "active" node: dataset-mean path-prob > 1%
+
+
+@torch.no_grad()
+def compute_taxon_hierarchy_stats(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    max_batches: int = 60,
+    prob_threshold: float = _HIER_PROB_THRESHOLD,
+) -> Dict[str, object]:
+    """Analyse how the binary-tree hierarchy is explored by a bottleneck_topk_taxon model.
+
+    Runs ``model.encoder(x, return_details=True)`` to obtain per-depth log-path
+    probabilities (from the taxon stage, *before* TopK masking), then computes:
+
+    ``node_util[d]``       — fraction of the 2^(d+1) nodes at depth d whose
+                             dataset-mean path probability exceeds *prob_threshold*.
+    ``mean_entropy[d]``    — mean per-spatial-position path entropy at depth d,
+                             normalised by log(2^(d+1)) (0 = fully peaked, 1 = uniform).
+    ``dead_nodes[d]``      — fraction of nodes that never exceed *prob_threshold*
+                             in any single (image, spatial-position) pair.
+    ``leaf_utilization``   — fraction of the 2^L leaf nodes that are ever the
+                             dominant (argmax) path across the sampled dataset.
+    ``leaf_counts``        — int ndarray (2^L,): per-leaf dominance count over
+                             all (image, spatial-position) pairs seen.
+    """
+    encoder   = getattr(model, "encoder", None)
+    if encoder is None:
+        return {}
+    bottleneck = getattr(encoder, "bottleneck_stage", None)
+    if bottleneck is None:
+        return {}
+    layer_channels = getattr(bottleneck, "layer_channels", None)
+    if layer_channels is None:
+        return {}
+
+    n_layers   = len(layer_channels)
+    n_leaves   = layer_channels[-1]
+    model.eval()
+
+    depth_prob_mean_acc = [np.zeros(layer_channels[d], dtype=np.float64) for d in range(n_layers)]
+    depth_prob_max      = [np.zeros(layer_channels[d], dtype=np.float64) for d in range(n_layers)]
+    depth_entropy_acc   = [0.0] * n_layers
+    leaf_counts         = np.zeros(n_leaves, dtype=np.int64)
+    n_batches           = 0
+
+    for batch_idx, (imgs, _) in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        imgs = imgs.to(device, non_blocking=True)
+        try:
+            _, enc_details = encoder(imgs, return_details=True)
+        except Exception:
+            continue
+
+        stages = enc_details.get("stages", [])
+        if not stages:
+            continue
+        stage_logp = stages[0].get("logp")
+        if stage_logp is None or not isinstance(stage_logp, torch.Tensor):
+            continue
+
+        # Split (B, total_channels, H, W) by layer_channels → per-depth logp
+        logp_per_depth = torch.split(stage_logp.float(), list(layer_channels), dim=1)
+
+        for d, logp_d in enumerate(logp_per_depth):
+            prob_d = logp_d.exp()                                           # (B, 2^(d+1), H, W)
+            depth_prob_mean_acc[d] += prob_d.mean(dim=(0, 2, 3)).cpu().numpy()
+            depth_prob_max[d]       = np.maximum(
+                depth_prob_max[d], prob_d.amax(dim=(0, 2, 3)).cpu().numpy()
+            )
+            # Per-spatial-position path entropy, normalised
+            ent     = -(prob_d * logp_d.clamp(min=-20.0)).sum(dim=1).mean().item()
+            max_ent = math.log(max(layer_channels[d], 2))
+            depth_entropy_acc[d] += ent / max_ent
+
+        # Dominant leaf path per (image, spatial-position)
+        leaf_argmax = logp_per_depth[-1].argmax(dim=1)                      # (B, H, W)
+        np.add.at(leaf_counts, leaf_argmax.cpu().numpy().ravel(), 1)
+        n_batches += 1
+
+    if n_batches == 0:
+        return {}
+
+    node_util    = []
+    dead_nodes   = []
+    mean_entropy = []
+    for d in range(n_layers):
+        mean_p = depth_prob_mean_acc[d] / n_batches
+        node_util.append(float(np.mean(mean_p > prob_threshold)))
+        dead_nodes.append(float(np.mean(depth_prob_max[d] <= prob_threshold)))
+        mean_entropy.append(depth_entropy_acc[d] / n_batches)
+
+    return {
+        "n_layers":         n_layers,
+        "layer_channels":   list(layer_channels),
+        "node_util":        node_util,
+        "dead_nodes":       dead_nodes,
+        "mean_entropy":     mean_entropy,
+        "leaf_utilization": float(np.sum(leaf_counts > 0)) / float(n_leaves),
+        "leaf_counts":      leaf_counts,
+    }
+
+
+# ─── prefix reconstruction ────────────────────────────────────────────────────
+
+@torch.no_grad()
+def compute_prefix_reconstruction(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    save_dir: Path,
+    run_name: str,
+    max_batches: int = 30,
+    max_visual_images: int = 8,
+) -> Dict[str, object]:
+    """Compute per-depth prefix reconstruction quality using ``forward_matryoshka``.
+
+    At prefix depth d the decoder receives only the first d+1 levels of the
+    hierarchy (deeper channels are zeroed), so we can observe how much each
+    successive level contributes to reconstruction.
+
+    Saves a visual grid (rows = original + one per depth, cols = sample images)
+    to ``<save_dir>/taxon_hierarchy/<run_name>/prefix_recon_grid.png``.
+
+    Returns dict with:
+      ``n_layers``       — number of hierarchy depths
+      ``mse_per_depth``  — list[float]: mean MSE per prefix depth
+      ``psnr_per_depth`` — list[float]: PSNR (dB); pixel range [-1,1] so MAX_VAL=2
+    """
+    if not hasattr(model, "forward_matryoshka"):
+        return {}
+    model.eval()
+
+    n_layers: Optional[int]       = None
+    mse_sums: Optional[List[float]] = None
+    n_batches  = 0
+    grid_saved = False
+
+    for batch_idx, (imgs, _) in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        imgs = imgs.to(device, non_blocking=True)
+        try:
+            prefix_recons, _ = model.forward_matryoshka(imgs)
+        except Exception as e:
+            print(f"    [prefix_recon] forward_matryoshka failed: {e}")
+            continue
+
+        if n_layers is None:
+            n_layers = len(prefix_recons)
+            mse_sums = [0.0] * n_layers
+
+        for d, recon_d in enumerate(prefix_recons):
+            mse_sums[d] += float(F.mse_loss(recon_d, imgs).item())
+
+        if not grid_saved:
+            safe     = run_name.replace("/", "_").replace(" ", "_")
+            grid_dir = save_dir / "taxon_hierarchy" / safe
+            grid_dir.mkdir(parents=True, exist_ok=True)
+            _save_prefix_recon_grid(
+                imgs[:max_visual_images],
+                [r[:max_visual_images] for r in prefix_recons],
+                grid_dir / "prefix_recon_grid.png",
+                run_name,
+            )
+            grid_saved = True
+        n_batches += 1
+
+    if n_batches == 0 or n_layers is None:
+        return {}
+
+    mse_per_depth  = [s / n_batches for s in mse_sums]
+    psnr_per_depth = [float(10 * math.log10(4.0 / max(m, 1e-10))) for m in mse_per_depth]
+    return {
+        "n_layers":       n_layers,
+        "mse_per_depth":  mse_per_depth,
+        "psnr_per_depth": psnr_per_depth,
+    }
+
+
+def _save_prefix_recon_grid(
+    imgs: torch.Tensor,
+    prefix_recons: List[torch.Tensor],
+    out_path: Path,
+    run_name: str,
+) -> None:
+    """Grid: rows = original + each prefix depth; cols = sample images."""
+    rows     = [imgs] + prefix_recons
+    n_images = imgs.shape[0]
+    n_rows   = len(rows)
+
+    fig, axes = plt.subplots(n_rows, n_images, figsize=(n_images * 1.6, n_rows * 1.6))
+    if n_rows   == 1: axes = axes[np.newaxis, :]
+    if n_images == 1: axes = axes[:, np.newaxis]
+
+    for row_idx, row_batch in enumerate(rows):
+        row_label = "Original" if row_idx == 0 else f"Prefix d={row_idx}"
+        for col_idx in range(n_images):
+            ax      = axes[row_idx, col_idx]
+            img_np  = (row_batch[col_idx].cpu().clamp(-1, 1) + 1.0) * 0.5
+            ax.imshow(img_np.permute(1, 2, 0).float().numpy(), interpolation="nearest")
+            ax.set_xticks([]); ax.set_yticks([])
+            if col_idx == 0:
+                ax.set_ylabel(row_label, fontsize=6.5, rotation=0,
+                              ha="right", va="center", labelpad=60)
+
+    fig.suptitle(f"Prefix Reconstruction — {run_name}", fontsize=9, fontweight="bold")
+    plt.tight_layout(rect=[0.08, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+def plot_taxon_hierarchy_depth_stats(result: dict, save_dir: Path) -> None:
+    """Four-panel hierarchy exploration chart for one taxon model.
+
+    Panels:
+    1. Node utilisation per depth (fraction with dataset-mean prob > threshold)
+    2. Normalised path entropy per depth (0=fully peaked, 1=uniform)
+    3. Dead node fraction per depth (never exceed threshold in any sample)
+    4. Leaf path distribution — sorted dominance histogram over sampled dataset
+    """
+    hs = result.get("hierarchy_stats")
+    if not hs or not hs.get("n_layers"):
+        return
+
+    n_layers    = hs["n_layers"]
+    depths      = list(range(1, n_layers + 1))
+    node_util   = hs["node_util"]
+    dead_nodes  = hs["dead_nodes"]
+    mean_ent    = hs["mean_entropy"]
+    leaf_util   = hs["leaf_utilization"]
+    leaf_counts = hs["leaf_counts"]
+
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4))
+
+    # 1 — node utilisation
+    ax = axes[0]
+    ax.bar(depths, node_util, color="#1f77b4", edgecolor="black", linewidth=0.4)
+    ax.axhline(leaf_util, color="red", lw=1.2, ls="--",
+               label=f"leaf util {leaf_util:.1%}")
+    ax.set_xlabel("Depth"); ax.set_ylabel("Fraction of nodes used")
+    ax.set_title(f"Node Utilisation\n(mean prob > {_HIER_PROB_THRESHOLD:.0%})")
+    ax.set_ylim(0, 1.05); ax.set_xticks(depths)
+    ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
+
+    # 2 — normalised entropy
+    ax = axes[1]
+    ax.bar(depths, mean_ent, color="#ff7f0e", edgecolor="black", linewidth=0.4)
+    ax.set_xlabel("Depth"); ax.set_ylabel("Normalised entropy")
+    ax.set_title("Per-depth Path Entropy\n(normalised: 0=peaked / 1=uniform)")
+    ax.set_ylim(0, 1.05); ax.set_xticks(depths); ax.grid(axis="y", alpha=0.3)
+
+    # 3 — dead node fraction
+    ax = axes[2]
+    ax.bar(depths, dead_nodes, color="#d62728", edgecolor="black", linewidth=0.4)
+    ax.set_xlabel("Depth"); ax.set_ylabel("Fraction never active")
+    ax.set_title("Dead Node Fraction per Depth")
+    ax.set_ylim(0, 1.05); ax.set_xticks(depths); ax.grid(axis="y", alpha=0.3)
+
+    # 4 — leaf distribution (rank-sorted)
+    ax       = axes[3]
+    n_leaves = len(leaf_counts)
+    sorted_c = np.sort(leaf_counts)[::-1]
+    n_used   = int(np.sum(sorted_c > 0))
+    ax.bar(np.arange(n_leaves), sorted_c,
+           color="#2ca02c", width=1.0, edgecolor="none", linewidth=0)
+    ax.set_xlabel("Leaf node (rank-sorted)")
+    ax.set_ylabel("Times dominant across dataset")
+    ax.set_title(f"Leaf Path Distribution\n({n_used}/{n_leaves} used = {leaf_util:.1%})")
+    ax.grid(axis="y", alpha=0.3)
+
+    fig.suptitle(f"Hierarchy Exploration — {result['short']}",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout()
+
+    safe    = result["short"].replace("/", "_").replace(" ", "_")
+    out_dir = save_dir / "taxon_hierarchy" / safe
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "depth_stats.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    Saved: {out.relative_to(save_dir)}")
+
+
+def plot_prefix_recon_curve(result: dict, save_dir: Path) -> None:
+    """MSE and PSNR vs prefix depth for one taxon model."""
+    pr = result.get("prefix_recon")
+    if not pr or not pr.get("n_layers"):
+        return
+
+    n_layers       = pr["n_layers"]
+    depths         = list(range(1, n_layers + 1))
+    mse_per_depth  = pr["mse_per_depth"]
+    psnr_per_depth = pr["psnr_per_depth"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(depths, mse_per_depth, marker="o", color="#1f77b4",
+                 linewidth=1.8, markersize=5)
+    axes[0].set_xlabel("Prefix depth"); axes[0].set_ylabel("MSE")
+    axes[0].set_title("Prefix Reconstruction MSE\n(lower = better)")
+    axes[0].set_xticks(depths); axes[0].grid(alpha=0.3)
+
+    axes[1].plot(depths, psnr_per_depth, marker="o", color="#ff7f0e",
+                 linewidth=1.8, markersize=5)
+    axes[1].set_xlabel("Prefix depth"); axes[1].set_ylabel("PSNR (dB)")
+    axes[1].set_title("Prefix Reconstruction PSNR\n(higher = better; range [-1, 1])")
+    axes[1].set_xticks(depths); axes[1].grid(alpha=0.3)
+
+    fig.suptitle(f"Prefix Reconstruction Quality — {result['short']}",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout()
+
+    safe    = result["short"].replace("/", "_").replace(" ", "_")
+    out_dir = save_dir / "taxon_hierarchy" / safe
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "prefix_recon_curve.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    Saved: {out.relative_to(save_dir)}")
+
+
 def _run_tsne(
     latents: np.ndarray,
     max_samples: int = 2000,
@@ -1293,8 +1640,9 @@ def parse_args() -> argparse.Namespace:
                    help="k values for KNN probing")
     p.add_argument("--force-recompute", action="store_true",
                    help="Ignore cached latents and recompute from scratch")
-    p.add_argument("--include-ablations", action="store_true",
-                   help="Include ablation runs in the analysis")
+    p.add_argument("--ablations", type=str, default=None, metavar="DIR",
+                   help="Path to ablations outputs directory to include alongside "
+                        "main runs (e.g. ./outputs/celeba_hq/ablations)")
     p.add_argument("--skip-sparsity", action="store_true",
                    help="Skip sparsity analysis (faster)")
     p.add_argument("--skip-knn", action="store_true",
@@ -1309,6 +1657,10 @@ def parse_args() -> argparse.Namespace:
                    help="t-SNE number of iterations")
     p.add_argument("--model-filter", type=str, default="",
                    help="Only process runs whose name contains this substring")
+    p.add_argument("--skip-hierarchy", action="store_true",
+                   help="Skip taxon hierarchy exploration analysis (bottleneck_topk_taxon only)")
+    p.add_argument("--skip-prefix-recon", action="store_true",
+                   help="Skip prefix reconstruction quality analysis (bottleneck_topk_taxon only)")
     return p.parse_args()
 
 
@@ -1326,11 +1678,23 @@ def main():
     print(f"  device      = {device}")
     print(f"  outputs_dir = {outputs_dir}")
     print(f"  save_dir    = {save_dir}")
+    if args.ablations:
+        print(f"  ablations   = {args.ablations}")
     print(f"  max_samples = {args.max_samples}")
     print("=" * 80)
 
     # ── discover runs ──────────────────────────────────────────────────────────
-    runs = discover_runs(outputs_dir, include_ablations=args.include_ablations)
+    runs = discover_runs(outputs_dir, include_ablations=False)
+    if args.ablations:
+        abl_dir = Path(args.ablations)
+        if abl_dir.exists():
+            abl_runs = discover_runs(abl_dir, include_ablations=True)
+            existing = {r["path"] for r in runs}
+            new_abl = [r for r in abl_runs if r["path"] not in existing]
+            runs.extend(new_abl)
+            print(f"  + {len(new_abl)} ablation run(s) from {abl_dir}")
+        else:
+            print(f"  WARNING: --ablations directory not found: {abl_dir}")
     if args.model_filter:
         runs = [r for r in runs if args.model_filter.lower() in r["name"].lower()]
     print(f"\nFound {len(runs)} runs to analyze:")
@@ -1452,6 +1816,40 @@ def main():
             except Exception as e:
                 print(f"  WARNING monosemanticity failed: {e}")
 
+        # ── taxon hierarchy exploration ────────────────────────────────────────
+        if (not args.skip_hierarchy
+                and run["type"] in _TAXON_HIERARCHY_TYPES
+                and attr_loader is not None):
+            print("  Computing taxon hierarchy stats...")
+            try:
+                result["hierarchy_stats"] = compute_taxon_hierarchy_stats(
+                    model, attr_loader, device,
+                    max_batches=args.max_batches_sparsity)
+                hs = result["hierarchy_stats"]
+                if hs:
+                    lu = hs["leaf_utilization"]
+                    nu = hs["node_util"][-1]
+                    print(f"  Hierarchy: leaf_util={lu:.1%}, node_util[last]={nu:.1%}")
+            except Exception as e:
+                print(f"  WARNING hierarchy stats failed: {e}")
+
+        # ── prefix reconstruction ───────────────────────────────────────────────
+        if (not args.skip_prefix_recon
+                and hasattr(model, "forward_matryoshka")
+                and attr_loader is not None):
+            print("  Computing prefix reconstruction quality...")
+            try:
+                result["prefix_recon"] = compute_prefix_reconstruction(
+                    model, attr_loader, device,
+                    save_dir=save_dir, run_name=run["name"],
+                    max_batches=30)
+                pr = result["prefix_recon"]
+                if pr:
+                    print(f"  Prefix recon: full MSE={pr['mse_per_depth'][-1]:.4f}, "
+                          f"PSNR={pr['psnr_per_depth'][-1]:.2f} dB")
+            except Exception as e:
+                print(f"  WARNING prefix recon failed: {e}")
+
         # Free model memory
         del model
         if device.type == "cuda":
@@ -1484,6 +1882,17 @@ def main():
     if has_mono:
         plot_monosemanticity_scatter(all_results, save_dir)
 
+    # ── taxon hierarchy and prefix reconstruction plots ───────────────────────
+    hier_results   = [r for r in all_results if r.get("hierarchy_stats")]
+    prefix_results = [r for r in all_results if r.get("prefix_recon")]
+    if hier_results or prefix_results:
+        print(f"\n[Taxon Hierarchy] {len(hier_results)} model(s) | "
+              f"[Prefix Recon] {len(prefix_results)} model(s)")
+        for r in hier_results:
+            plot_taxon_hierarchy_depth_stats(r, save_dir)
+        for r in prefix_results:
+            plot_prefix_recon_curve(r, save_dir)
+
     # ── taxon vs. non-taxon sparsity-matched comparisons ─────────────────────
     has_taxon    = any(_is_taxon(r) for r in all_results)
     has_baseline = any(not _is_taxon(r) for r in all_results)
@@ -1500,15 +1909,17 @@ def main():
         tsne_results = [r for r in all_results if r.get("_latents") is not None]
         if tsne_results:
             print(f"\n[t-SNE] {len(tsne_results)} model(s) eligible")
+            tsne_dir = save_dir / "tsne"
+            tsne_dir.mkdir(parents=True, exist_ok=True)
             tsne_kw = dict(
                 max_samples=args.tsne_max_samples,
                 perplexity=args.tsne_perplexity,
                 n_iter=args.tsne_n_iter,
             )
             for r in tsne_results:
-                plot_tsne_latents(r, save_dir, **tsne_kw)
+                plot_tsne_latents(r, tsne_dir, **tsne_kw)
             if len(tsne_results) > 1:
-                plot_tsne_comparison(all_results, save_dir, **tsne_kw)
+                plot_tsne_comparison(all_results, tsne_dir, **tsne_kw)
         else:
             print("\n[t-SNE] No eligible models with latents — skipping.")
 
