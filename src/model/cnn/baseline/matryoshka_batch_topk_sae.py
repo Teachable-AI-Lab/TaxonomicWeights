@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .matryoshka_batch_topk_sae_encoder import MatryoshkaBatchTopKSAEEncoder
 from ..taxon.decoder import TaxonResNetDecoder
@@ -68,6 +69,7 @@ class MatryoshkaBatchTopKSparseConvAutoencoder(nn.Module):
         k_aux: Optional[int] = None,
         use_aux_loss: bool = True,
         dead_threshold: float = 1e-3,
+        dead_steps: int = 200,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -89,6 +91,7 @@ class MatryoshkaBatchTopKSparseConvAutoencoder(nn.Module):
             k_aux=k_aux,
             use_aux_loss=use_aux_loss,
             dead_threshold=dead_threshold,
+            dead_steps=dead_steps,
             kernel_size=kernel_size,
             use_stem=use_stem,
             stem_channels=stem_channels,
@@ -168,7 +171,13 @@ class MatryoshkaBatchTopKSparseConvAutoencoder(nn.Module):
             latent, output_size=x.shape[-2:], return_details=return_details
         )
         recon = self._apply_output_activation(recon)
-        aux_loss = enc_details["sparsity"]
+        dead_latent = enc_details.get("dead_latent")
+        if dead_latent is not None and self.training:
+            dead_recon, _ = self.decoder(dead_latent, output_size=x.shape[-2:])
+            error = (x - recon).detach()
+            aux_loss = F.mse_loss(dead_recon, error)
+        else:
+            aux_loss = enc_details["sparsity"]
 
         if not return_details:
             return recon, aux_loss
@@ -212,7 +221,16 @@ class MatryoshkaBatchTopKSparseConvAutoencoder(nn.Module):
             recon = self._apply_output_activation(recon)
             recons.append(recon)
 
-        return recons, info["sparsity"]
+        # Decoder-based AuxK against the largest-k residual.
+        dead_latent = info.get("dead_latent")
+        if dead_latent is not None and self.training:
+            dead_recon, _ = self.decoder(dead_latent, output_size=(H, W))
+            error = (x - recons[0]).detach()
+            aux_loss = F.mse_loss(dead_recon, error)
+        else:
+            aux_loss = info["sparsity"]
+
+        return recons, aux_loss
 
 
 __all__ = ["MatryoshkaBatchTopKSparseConvAutoencoder"]

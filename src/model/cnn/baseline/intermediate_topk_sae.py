@@ -24,12 +24,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from ..taxon.encoder import resolve_resnet_stage_blocks
 from ..taxon.decoder import TaxonResNetDecoder
 from .sae_encoder import ConvSAEStage
-from .topk_sae_encoder import topk_activation, auxk_loss
+from .topk_sae_encoder import topk_activation, auxk_loss, make_dead_latent
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ class IntermediateTopKSAEEncoder(nn.Module):
         k_aux: Optional[int] = None,
         use_aux_loss: bool = True,
         dead_threshold: float = 1e-3,
+        dead_steps: int = 200,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -77,6 +79,7 @@ class IntermediateTopKSAEEncoder(nn.Module):
         self.k_aux = int(k_aux) if k_aux is not None else int(self.k_values[-1])
         self.use_aux_loss = bool(use_aux_loss)
         self.dead_threshold = float(dead_threshold)
+        self.dead_steps = int(dead_steps)
         self.use_stem = bool(use_stem)
         self.sparsity_type = "intermediate_topk"
 
@@ -150,22 +153,43 @@ class IntermediateTopKSAEEncoder(nn.Module):
             details["shape_trace"].append(("stem", tuple(h.shape)))
 
         latents: List[torch.Tensor] = []
-        sparsity = h.new_zeros(())
+        dead_latents: List[Optional[torch.Tensor]] = []
 
         for i, stage in enumerate(self.stages):
             pre = stage(h)
             sparse = topk_activation(pre, self.k_values[i])
             latents.append(sparse)
-            if self.use_aux_loss and self.training:
-                sparsity = sparsity + auxk_loss(
-                    pre, sparse, self.k_values[i], self.k_aux, self.dead_threshold
+
+            # Per-stage dead-channel tracking + AuxK dead latent
+            C = int(sparse.shape[1])
+            buf_name = f"_steps_since_active_{i}"
+            if not hasattr(self, buf_name) or getattr(self, buf_name).numel() != C:
+                self.register_buffer(
+                    buf_name,
+                    torch.zeros(C, dtype=torch.long, device=sparse.device),
+                    persistent=False,
                 )
+            buf = getattr(self, buf_name)
+            if self.training:
+                with torch.no_grad():
+                    any_active = sparse.amax(dim=(0, 2, 3)) > self.dead_threshold
+                    buf[any_active] = 0
+                    buf[~any_active] += 1
+            if self.use_aux_loss and self.training:
+                dead_latents.append(make_dead_latent(
+                    pre, buf, k_aux=self.k_aux,
+                    k=self.k_values[i], dead_steps=self.dead_steps,
+                ))
+            else:
+                dead_latents.append(None)
+
             h = sparse  # sparsified activation flows into next stage
             if return_details:
                 details["shape_trace"].append((f"stage{i}_topk_k{self.k_values[i]}", tuple(sparse.shape)))
                 details["stage_shapes"].append(tuple(sparse.shape))
 
-        details["sparsity"] = sparsity
+        details["sparsity"] = h.new_zeros(())   # back-compat (model computes real aux_loss)
+        details["dead_latents"] = dead_latents
         details["k_values"] = self.k_values
         details["latent_shape"] = tuple(latents[-1].shape)
         return latents, details
@@ -197,6 +221,7 @@ class IntermediateTopKSparseConvAutoencoder(nn.Module):
         k_aux: Optional[int] = None,
         use_aux_loss: bool = True,
         dead_threshold: float = 1e-3,
+        dead_steps: int = 200,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -218,6 +243,7 @@ class IntermediateTopKSparseConvAutoencoder(nn.Module):
             k_aux=k_aux,
             use_aux_loss=use_aux_loss,
             dead_threshold=dead_threshold,
+            dead_steps=dead_steps,
             kernel_size=kernel_size,
             use_stem=use_stem,
             stem_channels=stem_channels,
@@ -291,7 +317,16 @@ class IntermediateTopKSparseConvAutoencoder(nn.Module):
             latents[deepest], output_size=x.shape[-2:], return_details=return_details
         )
         recon = self._apply_output_activation(recon)
-        aux_loss = enc_details["sparsity"]
+
+        # Decoder-based AuxK on deepest stage (matches inference path).
+        dead_latents = enc_details.get("dead_latents", [None] * len(latents))
+        dl = dead_latents[deepest] if dead_latents else None
+        if dl is not None and self.training:
+            dead_recon, _ = self.decoders[deepest](dl, output_size=x.shape[-2:])
+            dead_recon = self._apply_output_activation(dead_recon)
+            aux_loss = F.mse_loss(dead_recon, (x - recon).detach())
+        else:
+            aux_loss = enc_details["sparsity"]
 
         if not return_details:
             return recon, aux_loss
@@ -341,7 +376,20 @@ class IntermediateTopKSparseConvAutoencoder(nn.Module):
                 recon = _decode(z, i)
             recons.append(recon)
 
-        return recons, info["sparsity"]
+        # Per-stage decoder-based AuxK summed across stages.
+        dead_latents = info.get("dead_latents", [None] * len(latents))
+        aux_loss = recons[0].new_zeros(())
+        if self.training:
+            for i, dl in enumerate(dead_latents):
+                if dl is None:
+                    continue
+                dead_recon, _ = self.decoders[i](dl, output_size=(H, W))
+                dead_recon = self._apply_output_activation(dead_recon)
+                aux_loss = aux_loss + F.mse_loss(
+                    dead_recon, (x - recons[i]).detach()
+                )
+
+        return recons, aux_loss
 
 
 __all__ = [

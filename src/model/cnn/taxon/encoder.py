@@ -909,8 +909,21 @@ class TopKTaxonResNetStage(nn.Module):
         self.k_aux = k_aux if k_aux is not None else self.n_taxonomy_layers
         self.dead_steps = int(dead_steps)
 
-        # Change E: learnable per-depth magnitude scales.
+        # Change E: learnable per-depth magnitude scales (init 1 = no-op).
         self.depth_scales = nn.Parameter(torch.ones(n_taxonomy_layers))
+
+        # Fixed per-channel normalisation for the TopK *ranking* step.
+        # Path probability at depth d is ~2^-(d+1), so depth-d nodes have
+        # activations ~2^(d+1)× smaller than depth-0 nodes.  We scale by
+        # 2^(d+1) when deciding which nodes win TopK, but apply the resulting
+        # binary mask to the *original* (unscaled) values so the decoder
+        # inputs are not inflated.  This eliminates structural dead neurons
+        # without changing output magnitudes or destabilising training.
+        _topk_norm = torch.cat([
+            torch.full((1 << (i + 1),), float(1 << (i + 1)))
+            for i in range(n_taxonomy_layers)
+        ])
+        self.register_buffer("_topk_norm_weights", _topk_norm)
 
         blocks: List[nn.Module] = []
         for idx in range(self.n_blocks):
@@ -1081,18 +1094,23 @@ class TopKTaxonResNetStage(nn.Module):
         flat = cat_output.permute(0, 2, 3, 1).reshape(-1, C)
         flat_relu = F.relu(flat)
         if k_current < C:
+            # Rank using probability-normalised activations so that deep nodes
+            # (attenuated by ~2^-(d+1)) compete fairly with shallow ones.
+            # The binary mask is then applied to the *original* flat_relu so
+            # decoder inputs are not scaled up.
+            flat_for_rank = flat_relu * self._topk_norm_weights  # [pos, C]
             if self.use_batch_topk:
                 # Change C: batch-level TopK — global threshold across all
                 # positions, allowing non-uniform activation counts.
-                flat_all = flat_relu.reshape(-1)              # [B*H*W*C]
+                flat_all = flat_for_rank.reshape(-1)          # [B*H*W*C]
                 total_keep = k_current * flat_relu.shape[0]   # k * (B*H*W)
                 if total_keep < flat_all.numel():
                     threshold = flat_all.topk(total_keep).values[-1]
-                    mask = (flat_relu >= threshold).float()
+                    mask = (flat_for_rank >= threshold).float()
                     flat_relu = flat_relu * mask
             else:
                 # Per-position TopK (original behaviour).
-                _, topk_idx = flat_relu.topk(k_current, dim=1)
+                _, topk_idx = flat_for_rank.topk(k_current, dim=1)
                 mask = torch.zeros_like(flat_relu)
                 mask.scatter_(1, topk_idx, 1.0)
                 flat_relu = flat_relu * mask
@@ -1139,10 +1157,16 @@ class TopKTaxonResNetStage(nn.Module):
             dead_vals = stage_logits * dead_float
 
         # Select top-k_aux among dead nodes.
+        # ReLU first: only positive activations carry a meaningful revival
+        # gradient; negative ones invert the loss signal (matching Gao et al.).
+        # Use _topk_norm_weights for ranking so deep dead nodes (structurally
+        # smaller activations) get a fair chance to be selected and revived.
         bsz, c, h, w = dead_vals.shape
         flat = dead_vals.permute(0, 2, 3, 1).reshape(-1, c)
+        flat_relu = F.relu(flat)
+        flat_for_rank = flat_relu * self._topk_norm_weights  # normalised ranking
         k_aux_eff = min(self.k_aux, n_dead)
-        _, aux_idx = flat.topk(k_aux_eff, dim=-1)
+        _, aux_idx = flat_for_rank.topk(k_aux_eff, dim=-1)
         aux_mask = torch.zeros_like(flat)
         aux_mask.scatter_(1, aux_idx, 1.0)
         aux_mask = aux_mask.reshape(bsz, h, w, c).permute(0, 3, 1, 2)

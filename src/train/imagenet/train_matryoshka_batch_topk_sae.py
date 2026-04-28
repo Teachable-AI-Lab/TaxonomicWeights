@@ -44,6 +44,7 @@ if str(ROOT) not in sys.path:
 from src.model.cnn.baseline.matryoshka_batch_topk_sae import (
     MatryoshkaBatchTopKSparseConvAutoencoder,
 )
+from src.train._baseline_dead_frac import compute_dead_frac
 from src.utils.dataloader import TinyImageNetLoader
 
 
@@ -104,12 +105,13 @@ def run_validation(
         num_batches  += 1
 
     if num_batches == 0:
-        return {"loss": 0.0, "recon_k0": 0.0, "sparsity": 0.0}
+        return {"loss": 0.0, "recon_k0": 0.0, "sparsity": 0.0, "dead_frac": compute_dead_frac(model)}
 
     return {
         "loss":     total_loss   / num_batches,
         **{f"recon_k{i}": total_recons[i] / num_batches for i in range(len(loss_weights))},
         "sparsity": total_sparse / num_batches,
+        "dead_frac": compute_dead_frac(model),
     }
 
 
@@ -142,7 +144,7 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
 
     k_values = history.get("k_values", [])
     n_levels = len(k_values)
-    fig, axes = plt.subplots(1, 2 + n_levels, figsize=(5 * (2 + n_levels), 4))
+    fig, axes = plt.subplots(1, 3 + n_levels, figsize=(5 * (3 + n_levels), 4))
 
     ax = axes[0]
     ax.plot(epochs, history["train_loss"], label="train", linewidth=1.5)
@@ -157,11 +159,17 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
         ax.set_title(f"Recon MSE (k={k})", fontsize=11)
         ax.set_xlabel("Epoch"); ax.set_ylabel("MSE"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
-    ax = axes[-1]
+    ax = axes[-2]
     ax.plot(epochs, history["train_sparsity"], label="train", linewidth=1.5)
     ax.plot(epochs, history["val_sparsity"],   label="val",   linewidth=1.5, linestyle="--")
     ax.set_title("AuxK loss", fontsize=11)
     ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[-1]
+    ax.plot(epochs, history["train_dead"], label="train", linewidth=1.5)
+    ax.plot(epochs, history["val_dead"],   label="val",   linewidth=1.5, linestyle="--")
+    ax.set_title("Dead frac", fontsize=11)
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Frac"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
     k_str = "-".join(str(k) for k in k_values)
     plt.suptitle(
@@ -330,6 +338,7 @@ def main() -> None:
         "k_values": k_values,
         "train_loss":    [], "val_loss":    [],
         "train_sparsity":[], "val_sparsity":[],
+        "train_dead":    [], "val_dead":    [],
         **{f"train_recon_k{i}": [] for i in range(len(k_values))},
         **{f"val_recon_k{i}":   [] for i in range(len(k_values))},
     }
@@ -360,6 +369,7 @@ def main() -> None:
         running_loss   = 0.0
         running_recons = [0.0] * len(k_values)
         running_sparse = 0.0
+        running_dead   = 0.0
         num_batches    = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
@@ -380,6 +390,7 @@ def main() -> None:
             for i, rl in enumerate(recon_losses):
                 running_recons[i] += float(rl.item())
             running_sparse += float(aux_loss.item())
+            running_dead   += compute_dead_frac(model)
             num_batches    += 1
             global_step    += 1
 
@@ -389,7 +400,8 @@ def main() -> None:
                 print(
                     f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                     f"lr={lr:.3e} loss={running_loss/num_batches:.5f} "
-                    f"recon_k0={recon0:.5f} aux={running_sparse/num_batches:.5f}"
+                    f"recon_k0={recon0:.5f} aux={running_sparse/num_batches:.5f} "
+                    f"dead={running_dead/num_batches:.3f}"
                 )
 
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
@@ -400,6 +412,7 @@ def main() -> None:
             "loss":     running_loss   / nb,
             **{f"recon_k{i}": running_recons[i] / nb for i in range(len(k_values))},
             "sparsity": running_sparse / nb,
+            "dead":     running_dead   / nb,
         }
         val_stats = run_validation(model, val_loader, device, loss_weights, args.sparsity_weight)
 
@@ -408,8 +421,10 @@ def main() -> None:
             f"epoch={epoch:03d} time={elapsed:.1f}s "
             f"train_loss={train_stats['loss']:.5f} "
             f"train_recon_k0={train_stats['recon_k0']:.5f} "
+            f"train_dead={train_stats['dead']:.3f} "
             f"val_loss={val_stats['loss']:.5f} "
-            f"val_recon_k0={val_stats['recon_k0']:.5f}"
+            f"val_recon_k0={val_stats['recon_k0']:.5f} "
+            f"val_dead={val_stats['dead_frac']:.3f}"
         )
 
         history["epochs"].append(epoch)
@@ -417,6 +432,8 @@ def main() -> None:
         history["val_loss"].append(val_stats["loss"])
         history["train_sparsity"].append(train_stats["sparsity"])
         history["val_sparsity"].append(val_stats["sparsity"])
+        history["train_dead"].append(train_stats["dead"])
+        history["val_dead"].append(val_stats["dead_frac"])
         for i in range(len(k_values)):
             history[f"train_recon_k{i}"].append(train_stats[f"recon_k{i}"])
             history[f"val_recon_k{i}"].append(val_stats[f"recon_k{i}"])

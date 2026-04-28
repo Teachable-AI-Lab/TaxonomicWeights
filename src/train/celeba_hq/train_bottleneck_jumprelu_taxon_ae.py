@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Train BottleneckTopKTaxonAutoencoder on CelebA-HQ.
+"""Train BottleneckJumpReLUTaxonAutoencoder on CelebA-HQ.
 
-Plain ResNet stages followed by a single TopK taxon stage at the bottleneck
-(single hierarchy, hierarchical pairwise softmax + TopK + AuxK revival).
+Plain ResNet stages followed by a single JumpReLU taxon stage at the
+bottleneck — same hierarchical pairwise softmax + DKL/entropy regularisers
+as the TopK variant, but the per-path sparsity is enforced by a learned
+per-channel JumpReLU threshold instead of batch-TopK + AuxK revival.
 
-Loss = recon + auxk_w*auxk + dkl_w*dkl
+Loss = recon + sparsity_w * (L̂₀ − target_l0)² + dkl_w * dkl
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.bottleneck_topk_taxon_ae import BottleneckTopKTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_jumprelu_taxon_ae import BottleneckJumpReLUTaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 
 
@@ -52,28 +54,27 @@ def build_scheduler(optimizer, steps_per_epoch, epochs, warmup_epochs) -> Lambda
 
 
 @torch.no_grad()
-def run_validation(model, loader, device, auxk_w, dkl_w=0.0) -> dict:
+def run_validation(model, loader, device, sparsity_w, dkl_w=0.0) -> dict:
     model.eval()
-    tot_loss = tot_recon = tot_auxk = tot_dead = tot_dkl = 0.0
+    tot_loss = tot_recon = tot_sparsity = tot_dead = tot_dkl = tot_l0 = 0.0
     nb = 0
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        if dkl_w > 0:
-            recon, dead_frac, details = model(images, return_details=True)
-            dkl = float(details["encoder"]["dkl"].item())
-        else:
-            recon, dead_frac = model(images)
-            dkl = 0.0
+        recon, info = model(images)
         recon_loss = F.mse_loss(recon, images)
-        auxk_loss = model.compute_auxk_loss(images, recon)
-        loss = recon_loss + auxk_w*auxk_loss + dkl_w*dkl
+        sparsity = info["sparsity"]
+        dkl = info["dkl"]
+        loss = recon_loss + sparsity_w*sparsity + dkl_w*dkl
         tot_loss += float(loss.item()); tot_recon += float(recon_loss.item())
-        tot_auxk += float(auxk_loss.item()); tot_dead += float(dead_frac.item())
-        tot_dkl += dkl; nb += 1
+        tot_sparsity += float(sparsity.item()); tot_dead += float(info["dead_frac"].item())
+        tot_dkl += float(dkl.item()); tot_l0 += float(info["l0_hat"].item())
+        nb += 1
     if nb == 0:
-        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0, "dkl": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0,
+                "dead_frac": 0.0, "dkl": 0.0, "l0": 0.0}
     return {"loss": tot_loss/nb, "recon": tot_recon/nb,
-            "auxk": tot_auxk/nb, "dead_frac": tot_dead/nb, "dkl": tot_dkl/nb}
+            "sparsity": tot_sparsity/nb, "dead_frac": tot_dead/nb,
+            "dkl": tot_dkl/nb, "l0": tot_l0/nb}
 
 
 def save_recon_preview(model, loader, device, save_path, num_images=8) -> None:
@@ -95,18 +96,19 @@ def save_training_curves(history, output_dir) -> None:
         return
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(25, 4))
     panels = [
         ("Total loss", "train_loss", "val_loss"),
         ("Recon", "train_recon", "val_recon"),
-        ("AuxK", "train_auxk", "val_auxk"),
+        ("Sparsity (L̂₀-target)²", "train_sparsity", "val_sparsity"),
+        ("Mean L̂₀", "train_l0", "val_l0"),
         ("DKL", "train_dkl", "val_dkl"),
     ]
     for ax, (title, tk, vk) in zip(axes, panels):
         ax.plot(epochs, history[tk], label="train")
         ax.plot(epochs, history[vk], label="val", linestyle="--")
         ax.set_title(title); ax.set_xlabel("Epoch"); ax.legend(); ax.grid(True, alpha=0.3)
-    plt.suptitle("Bottleneck TopK Taxon AE")
+    plt.suptitle("Bottleneck JumpReLU Taxon AE")
     plt.tight_layout()
     plt.savefig(output_dir / "training_curves.png", dpi=150)
     plt.close()
@@ -127,7 +129,7 @@ def parse_args():
     p.add_argument("--config", type=str, default="")
     p.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
     p.add_argument("--output-dir", type=str,
-                   default=o.get("output_dir", "./outputs/bottleneck_topk_taxon_ae_celeba_hq"))
+                   default=o.get("output_dir", "./outputs/bottleneck_jumprelu_taxon_ae_celeba_hq"))
     p.add_argument("--image-size", type=int, default=d.get("image_size", 256))
     p.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
     p.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
@@ -136,7 +138,7 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
     p.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
     p.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
-    p.add_argument("--auxk-weight", type=float, default=t.get("auxk_weight", 0.01))
+    p.add_argument("--sparsity-weight", type=float, default=t.get("sparsity_weight", 1e-3))
     p.add_argument("--dkl-weight", type=float, default=t.get("dkl_weight", 0.0))
     p.add_argument("--decoder-max-norm", type=float, default=t.get("decoder_max_norm", 1.0))
     p.add_argument("--save-every", type=int, default=t.get("save_every", 5))
@@ -150,7 +152,7 @@ def main() -> None:
     args, _mc = parse_args()
     seed_everything(args.seed)
 
-    L = int(_mc.get("bottleneck_n_taxonomy_layers", 6))
+    L = int(_mc.get("bottleneck_n_taxonomy_layers", 8))
     run_suffix = f"_L{L}"
     output_dir = Path(args.output_dir + run_suffix)
     ckpt_dir = output_dir / "checkpoints"; preview_dir = output_dir / "previews"
@@ -173,7 +175,7 @@ def main() -> None:
     if val_loader is None:
         raise RuntimeError("val_split must be > 0")
 
-    model = BottleneckTopKTaxonAutoencoder(
+    model = BottleneckJumpReLUTaxonAutoencoder(
         in_channels=_mc.get("in_channels", 3),
         plain_stage_channels=tuple(_mc.get("plain_stage_channels", [64, 128, 256])),
         plain_stage_blocks=tuple(_mc.get("plain_stage_blocks", [2, 2, 2])),
@@ -181,22 +183,18 @@ def main() -> None:
         bottleneck_n_taxonomy_layers=L,
         bottleneck_n_blocks=int(_mc.get("bottleneck_n_blocks", 2)),
         bottleneck_stride=int(_mc.get("bottleneck_stride", 2)),
-        topk_k_multiplier=float(_mc.get("topk_k_multiplier", 1.0)),
-        k_aux=_mc.get("k_aux", None),
-        dead_steps=int(_mc.get("dead_steps", 2000)),
+        target_l0=float(_mc.get("target_l0", 8.0)),
+        bandwidth=float(_mc.get("bandwidth", 0.001)),
+        theta_init=float(_mc.get("theta_init", 0.05)),
         kernel_size=int(_mc.get("kernel_size", 3)),
         use_stem=bool(_mc.get("use_stem", True)),
         stem_channels=int(_mc.get("stem_channels", 64)),
         stem_stride=int(_mc.get("stem_stride", 2)),
         use_stem_maxpool=bool(_mc.get("use_stem_maxpool", True)),
         output_activation=str(_mc.get("output_activation", "none")),
-        temperature=float(_mc.get("temperature", 1.0)),
+        temperature=float(_mc.get("temperature", 0.5)),
         hard=bool(_mc.get("hard", False)),
         depth_decay=float(_mc.get("depth_decay", 0.5)),
-        use_batch_topk=bool(_mc.get("use_batch_topk", True)),
-        warmup_steps=int(_mc.get("warmup_steps", 0)),
-        k_leaves=int(_mc.get("k_leaves", 0)),
-        use_gate_value=bool(_mc.get("use_gate_value", False)),
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate,
@@ -215,33 +213,29 @@ def main() -> None:
         best_val = float(state.get("best_val", float("inf")))
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Bottleneck TopK Taxon AE: device={device} n_params={n_params:,} L={L} "
-          f"latent_ch={model.encoder.final_channels} batch={args.batch_size} epochs={args.epochs} "
-          f"output={output_dir}")
+    print(f"Bottleneck JumpReLU Taxon AE: device={device} n_params={n_params:,} L={L} "
+          f"latent_ch={model.encoder.final_channels} target_l0={_mc.get('target_l0', 8.0)} "
+          f"batch={args.batch_size} epochs={args.epochs} output={output_dir}")
 
     history = {"epochs": [],
-               "train_loss": [], "train_recon": [], "train_auxk": [],
-               "train_dead": [], "train_dkl": [],
-               "val_loss": [], "val_recon": [], "val_auxk": [],
-               "val_dead": [], "val_dkl": []}
+               "train_loss": [], "train_recon": [], "train_sparsity": [],
+               "train_dead": [], "train_dkl": [], "train_l0": [],
+               "val_loss": [], "val_recon": [], "val_sparsity": [],
+               "val_dead": [], "val_dkl": [], "val_l0": []}
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
-        running = {k: 0.0 for k in ("loss", "recon", "auxk", "dead", "dkl")}
+        running = {k: 0.0 for k in ("loss", "recon", "sparsity", "dead", "dkl", "l0")}
         nb = 0
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            if args.dkl_weight > 0:
-                recon, dead_frac, details = model(images, return_details=True)
-                dkl = details["encoder"]["dkl"]
-            else:
-                recon, dead_frac = model(images)
-                dkl = images.new_zeros(())
+            recon, info = model(images)
             recon_loss = F.mse_loss(recon, images)
-            auxk_loss = model.compute_auxk_loss(images, recon)
-            loss = recon_loss + args.auxk_weight*auxk_loss + args.dkl_weight*dkl
+            sparsity = info["sparsity"]
+            dkl = info["dkl"]
+            loss = recon_loss + args.sparsity_weight*sparsity + args.dkl_weight*dkl
             loss.backward()
             optimizer.step(); scheduler.step()
             if args.decoder_max_norm > 0:
@@ -253,33 +247,37 @@ def main() -> None:
                             scale = norms.clamp(min=args.decoder_max_norm) / args.decoder_max_norm
                             module.weight.div_(scale.view(-1, 1, 1, 1))
             running["loss"] += float(loss.item()); running["recon"] += float(recon_loss.item())
-            running["auxk"] += float(auxk_loss.item()); running["dead"] += float(dead_frac.item())
-            running["dkl"] += float(dkl.item()) if torch.is_tensor(dkl) else float(dkl)
+            running["sparsity"] += float(sparsity.item())
+            running["dead"] += float(info["dead_frac"].item())
+            running["dkl"] += float(dkl.item())
+            running["l0"] += float(info["l0_hat"].item())
             nb += 1; global_step += 1
             if batch_idx % 50 == 0:
                 avg = {k: v/nb for k, v in running.items()}
                 lr = optimizer.param_groups[0]["lr"]
                 print(f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                       f"lr={lr:.3e} loss={avg['loss']:.5f} recon={avg['recon']:.5f} "
-                      f"auxk={avg['auxk']:.5f} dead={avg['dead']:.3f}")
+                      f"l0={avg['l0']:.2f} sparsity={avg['sparsity']:.3f} "
+                      f"dead={avg['dead']:.3f}")
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                 break
 
         train_stats = {k: v/max(1, nb) for k, v in running.items()}
         val_stats = run_validation(model, val_loader, device,
-                                   args.auxk_weight, args.dkl_weight)
+                                   args.sparsity_weight, args.dkl_weight)
         elapsed = time.time() - epoch_start
         print(f"epoch={epoch:03d} time={elapsed:.1f}s "
               f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
-              f"dead={val_stats['dead_frac']:.3f}")
+              f"val_l0={val_stats['l0']:.2f} dead={val_stats['dead_frac']:.3f}")
 
         history["epochs"].append(epoch)
         for split, stats in (("train", train_stats), ("val", val_stats)):
             history[f"{split}_loss"].append(stats["loss"])
             history[f"{split}_recon"].append(stats["recon"])
-            history[f"{split}_auxk"].append(stats["auxk"])
+            history[f"{split}_sparsity"].append(stats["sparsity"])
             history[f"{split}_dead"].append(stats.get("dead", stats.get("dead_frac", 0.0)))
             history[f"{split}_dkl"].append(stats.get("dkl", 0.0))
+            history[f"{split}_l0"].append(stats.get("l0", 0.0))
 
         state = {"epoch": epoch, "global_step": global_step,
                  "model_state": model.state_dict(),

@@ -19,9 +19,10 @@ conda activate taxon-weights
 cd /nethome/ksingara3/flash/TaxonomicWeights
 
 # ── Run training ───────────────────────────────────────────────────────────────
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_topk_sae_imagenet (job $SLURM_JOB_ID)"
+CONFIG="${1:-configs/imagenet/topk_sae_imagenet.json}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting train_topk_sae_imagenet (job $SLURM_JOB_ID) config=$CONFIG"
 
 python src/train/imagenet/train_topk_sae.py \
-    --config configs/imagenet/topk_sae_imagenet.json
+    --config "$CONFIG"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished train_topk_sae_imagenet (job $SLURM_JOB_ID)"

@@ -34,6 +34,7 @@ import torch.nn.functional as F
 
 from ..taxon.encoder import resolve_resnet_stage_blocks
 from .sae_encoder import ConvSAEStage
+from .topk_sae_encoder import make_dead_latent
 
 
 # ---------------------------------------------------------------------------
@@ -91,40 +92,14 @@ def batch_auxk_loss(
     k_aux: int,
     dead_threshold: float = 1e-3,
 ) -> torch.Tensor:
-    """AuxK auxiliary loss for the Batch-TopK setting.
+    """Deprecated.
 
-    Encourages dead channels (mean activation below ``dead_threshold`` across
-    the entire batch and spatial dims) to produce larger pre-activation values
-    so they can eventually compete in the global selection.
-
-    Args:
-        pre_relu: Pre-ReLU feature map ``[B, C, H, W]``.
-        latent: Batch-TopK latent (post-activation) ``[B, C, H, W]``.
-        k: Active channels per position used by main TopK.
-        k_aux: Number of auxiliary features for AuxK loss.
-        dead_threshold: Mean abs-activation threshold for "dead" channels.
-
-    Returns:
-        Scalar auxiliary loss (0 when no dead features exist).
+    Old per-batch magnitude formulation kept only for backward import
+    compatibility.  Returns 0; use :func:`make_dead_latent` from
+    :mod:`topk_sae_encoder` together with a decoder-based residual MSE in
+    the model's forward instead.
     """
-    B, C, H, W = pre_relu.shape
-    k_aux = min(k_aux, max(1, C - k))
-
-    mean_act = latent.abs().mean(dim=(0, 2, 3))   # [C]
-    dead_mask = mean_act < dead_threshold
-
-    n_dead = int(dead_mask.sum().item())
-    if n_dead == 0:
-        return pre_relu.new_zeros(())
-
-    dead_idx = dead_mask.nonzero(as_tuple=True)[0]     # [n_dead]
-    dead_pre = pre_relu[:, dead_idx, :, :]              # [B, n_dead, H, W]
-
-    k_aux_eff = min(k_aux, n_dead)
-    flat_dead = dead_pre.permute(0, 2, 3, 1).reshape(-1, n_dead)  # [N, n_dead]
-    topk_aux_vals, _ = flat_dead.topk(k_aux_eff, dim=1)
-
-    return (topk_aux_vals ** 2).mean()
+    return pre_relu.new_zeros(())
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +146,7 @@ class MatryoshkaBatchTopKSAEEncoder(nn.Module):
         k_aux: Optional[int] = None,
         use_aux_loss: bool = True,
         dead_threshold: float = 1e-3,
+        dead_steps: int = 200,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -203,6 +179,7 @@ class MatryoshkaBatchTopKSAEEncoder(nn.Module):
         self.k_aux = int(k_aux) if k_aux is not None else int(self.k_values[0])
         self.use_aux_loss = bool(use_aux_loss)
         self.dead_threshold = float(dead_threshold)
+        self.dead_steps = int(dead_steps)
         self.sparsity_type = "matryoshka_batch_topk"
         self.use_stem = bool(use_stem)
 
@@ -254,6 +231,34 @@ class MatryoshkaBatchTopKSAEEncoder(nn.Module):
     # Internal helpers
     # -----------------------------------------------------------------------
 
+    def _ensure_dead_buffer(self, latent: torch.Tensor) -> None:
+        C = int(latent.shape[1])
+        if not hasattr(self, "_steps_since_active") or self._steps_since_active.numel() != C:
+            self.register_buffer(
+                "_steps_since_active",
+                torch.zeros(C, dtype=torch.long, device=latent.device),
+                persistent=False,
+            )
+
+    def _update_dead_buffer(self, latent: torch.Tensor) -> None:
+        self._ensure_dead_buffer(latent)
+        if not self.training:
+            return
+        with torch.no_grad():
+            any_active = latent.amax(dim=(0, 2, 3)) > self.dead_threshold
+            self._steps_since_active[any_active] = 0
+            self._steps_since_active[~any_active] += 1
+
+    def _maybe_dead_latent(
+        self, pre_relu: torch.Tensor, k: int
+    ) -> Optional[torch.Tensor]:
+        if not (self.use_aux_loss and self.training):
+            return None
+        return make_dead_latent(
+            pre_relu, self._steps_since_active,
+            k_aux=self.k_aux, k=k, dead_steps=self.dead_steps,
+        )
+
     def _backbone(self, x: torch.Tensor) -> torch.Tensor:
         """Run stem + all stages, returning the pre-activation feature map."""
         x = self.stem(x)
@@ -289,15 +294,13 @@ class MatryoshkaBatchTopKSAEEncoder(nn.Module):
         k0 = self.k_values[0]
         latent = batch_topk_activation(pre_relu, k0)
 
-        if self.use_aux_loss and self.training:
-            sparsity = batch_auxk_loss(
-                pre_relu, latent, k0, self.k_aux, self.dead_threshold
-            )
-        else:
-            sparsity = pre_relu.new_zeros(())
+        self._update_dead_buffer(latent)
+        dead_latent = self._maybe_dead_latent(pre_relu, k0)
 
         details["latent_shape"] = tuple(latent.shape)
-        details["sparsity"] = sparsity
+        details["sparsity"] = pre_relu.new_zeros(())   # back-compat (model computes real aux_loss)
+        details["dead_latent"] = dead_latent
+        details["n_dead"] = int((self._steps_since_active >= self.dead_steps).sum().item())
         details["k_values"] = self.k_values
 
         return latent, details
@@ -330,16 +333,15 @@ class MatryoshkaBatchTopKSAEEncoder(nn.Module):
         for k in self.k_values:
             latents.append(batch_topk_activation(pre_relu, k))
 
-        if self.use_aux_loss and self.training:
-            sparsity = batch_auxk_loss(
-                pre_relu, latents[0], self.k_values[0], self.k_aux, self.dead_threshold
-            )
-        else:
-            sparsity = pre_relu.new_zeros(())
+        # Use the largest-k latent (most lenient) for dead-channel tracking.
+        self._update_dead_buffer(latents[0])
+        dead_latent = self._maybe_dead_latent(pre_relu, self.k_values[0])
 
         info: Dict[str, object] = {
             "latent_shape": tuple(latents[0].shape),
-            "sparsity": sparsity,
+            "sparsity": pre_relu.new_zeros(()),
+            "dead_latent": dead_latent,
+            "n_dead": int((self._steps_since_active >= self.dead_steps).sum().item()),
             "k_values": self.k_values,
         }
         return latents, info

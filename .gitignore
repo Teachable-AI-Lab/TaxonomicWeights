@@ -13,3 +13,5 @@ hf_token
 cached_activations
 downloaded_saes
 artifacts
+cache
+paper_graphics_*/*

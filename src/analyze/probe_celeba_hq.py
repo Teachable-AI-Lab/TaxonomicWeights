@@ -1091,7 +1091,7 @@ def plot_monosemanticity_scatter(all_results: List[dict], save_dir: Path):
 
 # ─── taxon hierarchy exploration ──────────────────────────────────────────────
 
-_TAXON_HIERARCHY_TYPES = {"bottleneck_topk_taxon"}
+_TAXON_HIERARCHY_TYPES = {"bottleneck_topk_taxon", "bottleneck_taxon"}
 _HIER_PROB_THRESHOLD   = 0.01   # "active" node: dataset-mean path-prob > 1%
 
 
@@ -1841,7 +1841,7 @@ def main():
             try:
                 result["prefix_recon"] = compute_prefix_reconstruction(
                     model, attr_loader, device,
-                    save_dir=save_dir, run_name=run["name"],
+                    save_dir=save_dir, run_name=run["short"],
                     max_batches=30)
                 pr = result["prefix_recon"]
                 if pr:

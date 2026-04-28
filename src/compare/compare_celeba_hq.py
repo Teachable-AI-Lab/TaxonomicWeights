@@ -64,6 +64,7 @@ from src.model.cnn.taxon.bottleneck_topk_multi_taxon_ae import BottleneckTopKMul
 from src.model.cnn.taxon.bottleneck_taxon_ae import BottleneckTaxonAutoencoder
 from src.model.cnn.taxon.bottleneck_multi_taxon_ae import BottleneckMultiTaxonAutoencoder
 from src.model.cnn.taxon.bottleneck_topk_taxon_ae import BottleneckTopKTaxonAutoencoder
+from src.model.cnn.taxon.bottleneck_jumprelu_taxon_ae import BottleneckJumpReLUTaxonAutoencoder
 from src.model.cnn.baseline.intermediate_topk_sae import IntermediateTopKSparseConvAutoencoder
 from src.model.cnn.baseline.sae import SparseConvAutoencoder
 from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
@@ -242,6 +243,8 @@ def _model_type(run_dir: str) -> str:
         return "bottleneck_topk_multi_taxon"
     if run_dir.startswith("bottleneck_topk_taxon_"):
         return "bottleneck_topk_taxon"
+    if run_dir.startswith("bottleneck_jumprelu_taxon_"):
+        return "bottleneck_jumprelu_taxon"
     if run_dir.startswith("bottleneck_multi_taxon_"):
         return "bottleneck_multi_taxon"
     if run_dir.startswith("bottleneck_taxon_"):
@@ -346,6 +349,7 @@ def discover_runs(outputs_dir: Path, include_ablations: bool = False) -> List[Di
         "taxon": 0, "topk_taxon": 1, "bias_taxon": 2,
         "multi_taxon": 3, "topk_multi_taxon": 4, "bias_multi_taxon": 5,
         "bottleneck_taxon": 5.1, "bottleneck_multi_taxon": 5.2, "bottleneck_topk_taxon": 5.3,
+        "bottleneck_jumprelu_taxon": 5.4,
         "bottleneck_topk_multi_taxon": 5.5,
         "sae": 6, "intermediate_topk_sae": 6.5, "topk_sae": 7, "gated_sae": 8, "jumprelu_sae": 9,
         "matryoshka_batch_topk_sae": 10, "matryoshka_intermediate_topk_sae": 10.5,
@@ -810,6 +814,51 @@ def load_bottleneck_topk_taxon_model(
         use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
     )
     model.load_state_dict(ckpt["model_state"], strict=False)
+    # Checkpoints trained before the _topk_norm_weights fix don't have this
+    # buffer in their state dict.  Loading with strict=False leaves the buffer
+    # at its __init__ value ([2, 4, ..., 2^L]), which changes which neurons are
+    # selected at inference relative to training.  Reset to ones so TopK falls
+    # back to the original unweighted ranking used during training.
+    if not any("topk_norm_weights" in k for k in ckpt["model_state"]):
+        for name, buf in model.named_buffers():
+            if "topk_norm_weights" in name:
+                buf.fill_(1.0)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_bottleneck_jumprelu_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[BottleneckJumpReLUTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    s = ckpt["model_state"]
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers")
+    if bn_layers is None:
+        bn_layers = _infer_bottleneck_n_taxonomy_layers(s)
+    model = BottleneckJumpReLUTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        plain_stage_channels=tuple(a.get("plain_stage_channels", mcfg.get("plain_stage_channels", [64, 128, 256]))),
+        plain_stage_blocks=tuple(a.get("plain_stage_blocks", mcfg.get("plain_stage_blocks", [2, 2, 2]))),
+        plain_stage_strides=tuple(a.get("plain_stage_strides", mcfg.get("plain_stage_strides", [1, 2, 2]))),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 2)),
+        bottleneck_stride=a.get("bottleneck_stride", mcfg.get("bottleneck_stride", 2)),
+        target_l0=a.get("target_l0", mcfg.get("target_l0", 8.0)),
+        bandwidth=a.get("bandwidth", mcfg.get("bandwidth", 0.001)),
+        theta_init=a.get("theta_init", mcfg.get("theta_init", 0.05)),
+        kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
+        use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
+        stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
+        stem_stride=a.get("stem_stride", mcfg.get("stem_stride", 2)),
+        use_stem_maxpool=a.get("use_stem_maxpool", mcfg.get("use_stem_maxpool", True)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.to(device).eval()
     return model, ckpt
 
@@ -928,6 +977,8 @@ def load_model(run: Dict, device: torch.device):
         return load_bottleneck_multi_taxon_model(run["best_ckpt"], device)
     if run["type"] == "bottleneck_topk_taxon":
         return load_bottleneck_topk_taxon_model(run["best_ckpt"], device)
+    if run["type"] == "bottleneck_jumprelu_taxon":
+        return load_bottleneck_jumprelu_taxon_model(run["best_ckpt"], device)
     if run["type"] == "topk_taxon":
         return load_topk_taxon_model(run["best_ckpt"], device)
     if run["type"] == "topk_multi_taxon":
@@ -973,6 +1024,8 @@ def compute_live_metrics(
             recon, _, _, _, _ = model(imgs)
         elif run["type"] in ("topk_taxon", "topk_multi_taxon", "bottleneck_topk_multi_taxon",
                               "bottleneck_topk_taxon"):
+            recon, _ = model(imgs)
+        elif run["type"] == "bottleneck_jumprelu_taxon":
             recon, _ = model(imgs)
         elif run["type"] in ("bias_taxon", "bias_multi_taxon"):
             (recon,) = model(imgs)
@@ -1585,6 +1638,7 @@ def make_page4_sparsity_tradeoff(
         "bottleneck_multi_taxon":         ("D",  "Bottleneck Multi-Taxon",      "#b07ed9"),
         "bottleneck_topk_taxon":          ("v",  "Bottleneck TopK Taxon",       "#00b4d8"),
         "bottleneck_topk_multi_taxon":    ("H",  "Bottleneck TopK Multi-Taxon", "#000080"),
+        "bottleneck_jumprelu_taxon":      ("P",  "Bottleneck JumpReLU Taxon",   "#9b59b6"),
         "bias_taxon":                     ("s",  "Bias-Taxon",                  "#06d6a0"),
         "bias_multi_taxon":               ("p",  "Bias Multi-Taxon",            "#e63946"),
         "sae":                            ("*",  "L1-SAE",                      "#ff7f0e"),
@@ -1601,6 +1655,7 @@ def make_page4_sparsity_tradeoff(
         "taxon", "multi_taxon", "topk_taxon", "topk_multi_taxon",
         "bottleneck_taxon", "bottleneck_multi_taxon",
         "bottleneck_topk_taxon", "bottleneck_topk_multi_taxon",
+        "bottleneck_jumprelu_taxon",
         "bias_taxon", "bias_multi_taxon",
         "sae", "topk_sae", "gated_sae", "jumprelu_sae",
         "matryoshka_batch_topk_sae", "matryoshka_intermediate_topk_sae",

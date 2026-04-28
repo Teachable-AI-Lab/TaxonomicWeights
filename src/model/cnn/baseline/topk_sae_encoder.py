@@ -82,6 +82,54 @@ def topk_activation(x: torch.Tensor, k: int) -> torch.Tensor:
 # AuxK auxiliary loss
 # ---------------------------------------------------------------------------
 
+def make_dead_latent(
+    pre_relu: torch.Tensor,
+    steps_since_active: torch.Tensor,
+    k_aux: int,
+    k: int,
+    dead_steps: int,
+) -> Optional[torch.Tensor]:
+    """Build a "dead-only" sparse latent for proper AuxK reconstruction.
+
+    The result has the same shape as ``pre_relu`` but only the top-``k_aux``
+    pre-ReLU values **among dead channels** are kept at each spatial
+    position; everything else is zero.  Returning this tensor lets the
+    model decode it through the same decoder and compute
+
+        aux_loss = MSE(decode(dead_latent), (x - recon).detach())
+
+    which is the standard Anthropic / Gao-et-al. AuxK formulation
+    (encourages dead features to actually predict residual error, instead
+    of merely growing in magnitude).
+
+    A channel is "dead" iff its post-TopK output has been zero for at
+    least ``dead_steps`` consecutive training steps (tracked by the
+    encoder's ``_steps_since_active`` buffer).
+
+    Returns ``None`` when no channels are dead.
+    """
+    B, C, H, W = pre_relu.shape
+    dead_mask = steps_since_active >= dead_steps        # [C] bool
+    n_dead = int(dead_mask.sum().item())
+    if n_dead == 0:
+        return None
+    k_aux_eff = min(k_aux, n_dead, max(1, C - k))
+
+    dead_idx = dead_mask.nonzero(as_tuple=True)[0]      # [n_dead]
+    dead_pre = pre_relu[:, dead_idx, :, :]              # [B, n_dead, H, W]
+
+    # Top-k_aux per spatial position among dead channels.
+    flat = dead_pre.permute(0, 2, 3, 1).reshape(-1, n_dead)   # [N, n_dead]
+    top_vals, top_pos = flat.topk(k_aux_eff, dim=1)
+    keep = torch.zeros_like(flat)
+    keep.scatter_(1, top_pos, top_vals.relu())
+    dead_kept = keep.reshape(B, H, W, n_dead).permute(0, 3, 1, 2)  # [B, n_dead, H, W]
+
+    dead_latent = pre_relu.new_zeros(B, C, H, W)
+    dead_latent[:, dead_idx, :, :] = dead_kept
+    return dead_latent
+
+
 def auxk_loss(
     pre_relu: torch.Tensor,
     latent: torch.Tensor,
@@ -89,55 +137,14 @@ def auxk_loss(
     k_aux: int,
     dead_threshold: float = 1e-3,
 ) -> torch.Tensor:
-    """AuxK auxiliary loss to prevent feature death.
+    """Deprecated.
 
-    For features that are underutilised (mean activation below
-    ``dead_threshold``), compute how much reconstruction error they could
-    explain and penalise their non-activation proportionally.
-
-    This is a simplified convolutional adaptation of the Gao et al. AuxK:
-
-    1. Find "dead" channel indices: those whose mean absolute activation
-       across the current batch & spatial dims is below ``dead_threshold``.
-    2. Among those dead channels, keep the top-``k_aux`` by *pre-relu*
-       activation at each position.
-    3. AuxK loss = mean squared pre-relu value of those top-``k_aux`` dead
-       channel activations (encourages them to grow larger so they will
-       eventually be selected by the main TopK).
-
-    Args:
-        pre_relu: Pre-ReLU feature map ``[B, C, H, W]``.
-        latent:   Main TopK latent (post-activation) ``[B, C, H, W]``.
-        k:        Number of features selected by main TopK.
-        k_aux:    Number of auxiliary features for AuxK loss.
-        dead_threshold: Mean abs-activation below which a channel is "dead".
-
-    Returns:
-        Scalar auxiliary loss (0 when no dead features exist).
+    Old per-batch magnitude formulation kept only for backward import
+    compatibility.  Returns 0; do **not** call from new code.  Use
+    :func:`make_dead_latent` together with a decoder-based residual MSE
+    in the model's forward pass instead.
     """
-    B, C, H, W = pre_relu.shape
-    k_aux = min(k_aux, max(1, C - k))
-
-    # Identify dead channels (per batch)
-    mean_act = latent.abs().mean(dim=(0, 2, 3))   # [C]
-    dead_mask = (mean_act < dead_threshold)        # [C] bool
-
-    n_dead = int(dead_mask.sum().item())
-    if n_dead == 0:
-        return pre_relu.new_zeros(())
-
-    # Extract dead channel pre-relu activations
-    dead_idx = dead_mask.nonzero(as_tuple=True)[0]  # [n_dead]
-    dead_pre = pre_relu[:, dead_idx, :, :]           # [B, n_dead, H, W]
-
-    # TopK-aux per position among dead features
-    k_aux_eff = min(k_aux, n_dead)
-    flat_dead = dead_pre.permute(0, 2, 3, 1).reshape(-1, n_dead)  # [N, n_dead]
-    topk_aux_vals, _ = flat_dead.top_k(k_aux_eff, dim=1) if False else (
-        flat_dead.topk(k_aux_eff, dim=1)
-    )
-    # AuxK loss: encourage these values to grow
-    return (topk_aux_vals ** 2).mean()
+    return pre_relu.new_zeros(())
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +189,7 @@ class TopKSAEEncoder(nn.Module):
         k_aux: Optional[int] = None,
         use_aux_loss: bool = True,
         dead_threshold: float = 1e-3,
+        dead_steps: int = 200,
         kernel_size: int = 3,
         use_stem: bool = True,
         stem_channels: int = 64,
@@ -210,6 +218,7 @@ class TopKSAEEncoder(nn.Module):
         self.k_aux = int(k_aux) if k_aux is not None else int(topk_k)
         self.use_aux_loss = bool(use_aux_loss)
         self.dead_threshold = float(dead_threshold)
+        self.dead_steps = int(dead_steps)
         self.sparsity_type = "topk"   # for compatibility with analysis / compare scripts
         self.use_stem = bool(use_stem)
 
@@ -291,14 +300,33 @@ class TopKSAEEncoder(nn.Module):
         k_eff = self.topk_k if self.topk_k > 0 else int(x.shape[1])
         latent = topk_activation(pre_relu, k_eff)
 
-        # Compute AuxK auxiliary loss
+        # ----- Track per-channel deadness over training time -----
+        C = int(latent.shape[1])
+        if not hasattr(self, "_steps_since_active") or self._steps_since_active.numel() != C:
+            self.register_buffer(
+                "_steps_since_active",
+                torch.zeros(C, dtype=torch.long, device=latent.device),
+                persistent=False,
+            )
+        if self.training:
+            with torch.no_grad():
+                any_active = latent.amax(dim=(0, 2, 3)) > self.dead_threshold
+                self._steps_since_active[any_active] = 0
+                self._steps_since_active[~any_active] += 1
+
+        # ----- AuxK: emit a dead-only sparse latent (decoded by the model) -----
         if self.use_aux_loss and self.training:
-            sparsity = auxk_loss(pre_relu, latent, k_eff, self.k_aux, self.dead_threshold)
+            dead_latent = make_dead_latent(
+                pre_relu, self._steps_since_active,
+                k_aux=self.k_aux, k=k_eff, dead_steps=self.dead_steps,
+            )
         else:
-            sparsity = pre_relu.new_zeros(())
+            dead_latent = None
 
         details["latent_shape"] = tuple(latent.shape)
-        details["sparsity"] = sparsity
+        details["sparsity"] = pre_relu.new_zeros(())   # back-compat (model computes real aux_loss)
+        details["dead_latent"] = dead_latent
+        details["n_dead"] = int((self._steps_since_active >= self.dead_steps).sum().item())
         details["topk_k"] = k_eff
 
         return latent, details
@@ -307,5 +335,6 @@ class TopKSAEEncoder(nn.Module):
 __all__ = [
     "topk_activation",
     "auxk_loss",
+    "make_dead_latent",
     "TopKSAEEncoder",
 ]

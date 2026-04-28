@@ -63,6 +63,182 @@ def _import_sklearn():
     return LogisticRegression, KNeighborsClassifier, StandardScaler, accuracy_score
 
 
+# ─── Tiny-ImageNet class names ────────────────────────────────────────────────
+
+# Ordered synset IDs matching label indices 0..199 in zh-plus/tiny-imagenet.
+_TINY_IMAGENET_WNIDS: List[str] = [
+    "n01443537", "n01629819", "n01641577", "n01644900", "n01698640",
+    "n01742172", "n01768244", "n01770393", "n01774384", "n01774750",
+    "n01784675", "n01882714", "n01910747", "n01917289", "n01944390",
+    "n01950731", "n01983481", "n01984695", "n02002724", "n02056570",
+    "n02058221", "n02074367", "n02094433", "n02099601", "n02099712",
+    "n02106662", "n02113799", "n02123045", "n02123394", "n02124075",
+    "n02125311", "n02129165", "n02132136", "n02165456", "n02226429",
+    "n02231487", "n02233338", "n02236044", "n02268443", "n02279972",
+    "n02281406", "n02321529", "n02364673", "n02395406", "n02403003",
+    "n02410509", "n02415577", "n02423022", "n02437312", "n02480495",
+    "n02481823", "n02486410", "n02504458", "n02509815", "n02666347",
+    "n02669723", "n02699494", "n02769748", "n02788148", "n02791270",
+    "n02793495", "n02795169", "n02802426", "n02808440", "n02814533",
+    "n02814860", "n02815834", "n02823428", "n02837789", "n02841315",
+    "n02843684", "n02883205", "n02892201", "n02909870", "n02917067",
+    "n02927161", "n02948072", "n02950826", "n02963159", "n02977058",
+    "n02988304", "n03014705", "n03026506", "n03042490", "n03085013",
+    "n03089624", "n03100240", "n03126707", "n03160309", "n03179701",
+    "n03201208", "n03255030", "n03355925", "n03373237", "n03388043",
+    "n03393912", "n03400231", "n03404251", "n03424325", "n03444034",
+    "n03447447", "n03544143", "n03584254", "n03599486", "n03617480",
+    "n03637318", "n03649909", "n03662601", "n03670208", "n03706229",
+    "n03733131", "n03763968", "n03770439", "n03796401", "n03814639",
+    "n03837869", "n03838899", "n03854065", "n03891332", "n03902125",
+    "n03930313", "n03937543", "n03970156", "n03977966", "n03980874",
+    "n03983396", "n03992509", "n04008634", "n04023962", "n04070727",
+    "n04074963", "n04099969", "n04118538", "n04133789", "n04146614",
+    "n04149813", "n04179913", "n04251144", "n04254777", "n04259630",
+    "n04265275", "n04275548", "n04285008", "n04311004", "n04328186",
+    "n04356056", "n04366367", "n04371430", "n04376876", "n04398044",
+    "n04399382", "n04417672", "n04456115", "n04465666", "n04486054",
+    "n04487081", "n04501370", "n04507155", "n04532106", "n04532670",
+    "n04540053", "n04560804", "n04562935", "n04596742", "n04598010",
+    "n06596364", "n07056680", "n07583066", "n07614500", "n07615774",
+    "n07646821", "n07647870", "n07657664", "n07695742", "n07711569",
+    "n07715103", "n07720875", "n07749582", "n07753592", "n07768694",
+    "n07871810", "n07873807", "n07875152", "n07920052", "n07975909",
+    "n08496334", "n08620881", "n08742578", "n09193705", "n09246464",
+    "n09256479", "n09332890", "n09428293", "n12267677", "n12520864",
+    "n13001041", "n13652335", "n13652994", "n13719102", "n14991210",
+]
+
+# Short human-readable names for each synset (from standard Tiny-ImageNet words.txt).
+_WNID_SHORT_NAMES: Dict[str, str] = {
+    "n01443537": "goldfish",        "n01629819": "fire salamander",
+    "n01641577": "bullfrog",         "n01644900": "tailed frog",
+    "n01698640": "alligator",        "n01742172": "boa constrictor",
+    "n01768244": "trilobite",        "n01770393": "scorpion",
+    "n01774384": "garden spider",    "n01774750": "black widow",
+    "n01784675": "tarantula",        "n01882714": "koala",
+    "n01910747": "jellyfish",        "n01917289": "brain coral",
+    "n01944390": "snail",            "n01950731": "slug",
+    "n01983481": "lobster",          "n01984695": "spiny lobster",
+    "n02002724": "black stork",      "n02056570": "king penguin",
+    "n02058221": "albatross",        "n02074367": "dugong",
+    "n02094433": "Yorkshire terrier","n02099601": "golden retriever",
+    "n02099712": "Labrador retriever","n02106662": "German shepherd",
+    "n02113799": "standard poodle", "n02123045": "tabby cat",
+    "n02123394": "Persian cat",      "n02124075": "Egyptian cat",
+    "n02125311": "cougar",           "n02129165": "lion",
+    "n02132136": "brown bear",       "n02165456": "ladybug",
+    "n02226429": "grasshopper",      "n02231487": "walking stick",
+    "n02233338": "cockroach",        "n02236044": "mantis",
+    "n02268443": "dragonfly",        "n02279972": "monarch butterfly",
+    "n02281406": "sulphur butterfly","n02321529": "sea cucumber",
+    "n02364673": "guinea pig",       "n02395406": "hog",
+    "n02403003": "ox",               "n02410509": "bison",
+    "n02415577": "bighorn sheep",    "n02423022": "gazelle",
+    "n02437312": "Arabian camel",    "n02480495": "orangutan",
+    "n02481823": "chimpanzee",       "n02486410": "baboon",
+    "n02504458": "elephant",         "n02509815": "red panda",
+    "n02666347": "abacus",           "n02669723": "academic gown",
+    "n02699494": "altar",            "n02769748": "backpack",
+    "n02788148": "bannister",        "n02791270": "barbershop",
+    "n02793495": "barn",             "n02795169": "barrel",
+    "n02802426": "basketball",       "n02808440": "bathtub",
+    "n02814533": "beach wagon",      "n02814860": "beacon",
+    "n02815834": "beaker",           "n02823428": "beer bottle",
+    "n02837789": "bikini",           "n02841315": "binoculars",
+    "n02843684": "birdhouse",        "n02883205": "bow tie",
+    "n02892201": "brass plaque",     "n02909870": "broom",
+    "n02917067": "bullet train",     "n02927161": "butcher shop",
+    "n02948072": "candle",           "n02950826": "cannon",
+    "n02963159": "cardigan",         "n02977058": "ATM",
+    "n02988304": "CD player",        "n03014705": "chest",
+    "n03026506": "Xmas stocking",    "n03042490": "cliff dwelling",
+    "n03085013": "keyboard",         "n03089624": "candy store",
+    "n03100240": "convertible",      "n03126707": "crane",
+    "n03160309": "dam",              "n03179701": "desk",
+    "n03201208": "dining table",     "n03255030": "dumbbell",
+    "n03355925": "flagpole",         "n03373237": "fly",
+    "n03388043": "freight car",      "n03393912": "frying pan",
+    "n03400231": "fur coat",         "n03404251": "garbage truck",
+    "n03424325": "go-kart",          "n03444034": "gondola",
+    "n03447447": "grille",           "n03544143": "hourglass",
+    "n03584254": "iPod",             "n03599486": "iron",
+    "n03617480": "jeans",            "n03637318": "lamp",
+    "n03649909": "laptop",           "n03662601": "lemon",
+    "n03670208": "lifeboat",         "n03706229": "compass",
+    "n03733131": "maypole",          "n03763968": "military uniform",
+    "n03770439": "miniskirt",        "n03796401": "moving van",
+    "n03814639": "mushroom",         "n03837869": "nail",
+    "n03838899": "neck brace",       "n03854065": "obelisk",
+    "n03891332": "orange",           "n03902125": "organ",
+    "n03930313": "picket fence",     "n03937543": "pill bottle",
+    "n03970156": "plunger",          "n03977966": "police van",
+    "n03980874": "poncho",           "n03983396": "pool table",
+    "n03992509": "pot",              "n04008634": "projectile",
+    "n04023962": "punching bag",     "n04070727": "refrigerator",
+    "n04074963": "remote control",   "n04099969": "rocking chair",
+    "n04118538": "rubber eraser",    "n04133789": "running shoe",
+    "n04146614": "school bus",       "n04149813": "scoreboard",
+    "n04179913": "sewing machine",   "n04251144": "snorkel",
+    "n04254777": "sock",             "n04259630": "sombrero",
+    "n04265275": "space heater",     "n04275548": "spider web",
+    "n04285008": "sports car",       "n04311004": "steel arch bridge",
+    "n04328186": "stopwatch",        "n04356056": "sunglasses",
+    "n04366367": "suspension bridge","n04371430": "swimming trunks",
+    "n04376876": "syringe",          "n04398044": "table lamp",
+    "n04399382": "tank",             "n04417672": "teddy bear",
+    "n04456115": "teapot",           "n04465666": "toaster",
+    "n04486054": "tractor",          "n04487081": "trailer truck",
+    "n04501370": "triumphal arch",   "n04507155": "trolleybus",
+    "n04532106": "umbrella",         "n04532670": "upright piano",
+    "n04540053": "vase",             "n04560804": "volcano",
+    "n04562935": "volleyball",       "n04596742": "water jug",
+    "n04598010": "water tower",      "n06596364": "comic book",
+    "n07056680": "pretzel",          "n07583066": "guacamole",
+    "n07614500": "ice cream",        "n07615774": "ice lolly",
+    "n07646821": "orange",           "n07647870": "lemon",
+    "n07657664": "fig",              "n07695742": "pretzel",
+    "n07711569": "mashed potato",    "n07715103": "cauliflower",
+    "n07720875": "bell pepper",      "n07749582": "lemon",
+    "n07753592": "banana",           "n07768694": "pineapple",
+    "n07871810": "meat loaf",        "n07873807": "pizza",
+    "n07875152": "potpie",           "n07920052": "espresso",
+    "n07975909": "mushroom",         "n08496334": "cliff",
+    "n08620881": "valley",           "n08742578": "alp",
+    "n09193705": "mountain",         "n09246464": "cliff",
+    "n09256479": "coral reef",       "n09332890": "lakeside",
+    "n09428293": "seashore",         "n12267677": "daisy",
+    "n12520864": "ear of corn",      "n13001041": "bolete",
+    "n13652335": "bolete",           "n13652994": "ear",
+    "n13719102": "coral fungus",     "n14991210": "stone wall",
+}
+
+
+def _build_class_names(data_root: str) -> List[str]:
+    """Return 200 readable class names for Tiny-ImageNet, indexed by label 0..199.
+
+    Tries to confirm synset order from the cached dataset_info.json; falls back
+    to the hardcoded ``_TINY_IMAGENET_WNIDS`` list if the file is unavailable.
+    """
+    import json as _json
+    import glob as _glob
+    wnids: Optional[List[str]] = None
+    try:
+        pattern = str(
+            Path(data_root) / "zh-plus___tiny-imagenet" / "**" / "dataset_info.json"
+        )
+        matches = _glob.glob(pattern, recursive=True)
+        if matches:
+            with open(matches[0]) as _f:
+                _info = _json.load(_f)
+            wnids = _info["features"]["label"]["names"]
+    except Exception:
+        pass
+    if not wnids or len(wnids) != 200:
+        wnids = _TINY_IMAGENET_WNIDS
+    return [_WNID_SHORT_NAMES.get(w, w) for w in wnids]
+
+
 # ─── data loading ─────────────────────────────────────────────────────────────
 
 def _load_tiny_imagenet_val(
@@ -526,7 +702,11 @@ def plot_sparsity_results(all_results, save_dir: Path):
     print(f"  Saved: {out.name}")
 
 
-def plot_class_heatmap(all_results: List[dict], save_dir: Path):
+def plot_class_heatmap(
+    all_results: List[dict],
+    save_dir: Path,
+    class_names: Optional[List[str]] = None,
+):
     """Heatmap: rows = models, columns = 200 Tiny-ImageNet classes, value = per-class accuracy."""
     rows = [r for r in all_results if r.get("linear")]
     if not rows:
@@ -535,11 +715,16 @@ def plot_class_heatmap(all_results: List[dict], save_dir: Path):
     matrix = np.stack([r["linear"]["per_class_accuracy"] for r in rows], axis=0)  # (M, 200)
     fig, ax = plt.subplots(figsize=(max(20, 200 * 0.12), max(4, len(rows) * 0.55)))
     im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=0.0, vmax=1.0)
-    ax.set_xticks(range(0, 200, 10))
-    ax.set_xticklabels([str(c) for c in range(0, 200, 10)], rotation=90, fontsize=7)
+    tick_ids = list(range(0, 200, 10))
+    ax.set_xticks(tick_ids)
+    if class_names:
+        tick_labels = [f"{c}:{class_names[c][:12]}" for c in tick_ids]
+    else:
+        tick_labels = [str(c) for c in tick_ids]
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=6)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels(names, fontsize=8)
-    ax.set_xlabel("Class ID (Tiny-ImageNet 0–199)", fontsize=9)
+    ax.set_xlabel("Class (Tiny-ImageNet 0–199)", fontsize=9)
     ax.set_title("Per-Class Linear Probe Accuracy (rows=models, cols=classes)", fontsize=10)
     plt.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
     plt.tight_layout()
@@ -798,7 +983,11 @@ def plot_matched_pairs(all_results: List[dict], save_dir: Path):
     print(f"  Saved: {out.name}")
 
 
-def plot_taxon_class_compare(all_results: List[dict], save_dir: Path):
+def plot_taxon_class_compare(
+    all_results: List[dict],
+    save_dir: Path,
+    class_names: Optional[List[str]] = None,
+):
     """Per-class accuracy heatmap interleaving each taxon model with its matched baseline.
 
     Rows alternate: [Taxon] model then [Base] matched non-taxon.  Dashed horizontal
@@ -832,11 +1021,16 @@ def plot_taxon_class_compare(all_results: List[dict], save_dir: Path):
         figsize=(max(20, 200 * 0.12), max(4, len(row_models) * 0.55))
     )
     im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=0.0, vmax=1.0)
-    ax.set_xticks(range(0, 200, 10))
-    ax.set_xticklabels([str(c) for c in range(0, 200, 10)], rotation=90, fontsize=7)
+    tick_ids = list(range(0, 200, 10))
+    ax.set_xticks(tick_ids)
+    if class_names:
+        tick_labels = [f"{c}:{class_names[c][:12]}" for c in tick_ids]
+    else:
+        tick_labels = [str(c) for c in tick_ids]
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=6)
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels, fontsize=8)
-    ax.set_xlabel("Class ID (Tiny-ImageNet 0–199)", fontsize=9)
+    ax.set_xlabel("Class (Tiny-ImageNet 0–199)", fontsize=9)
 
     for ytick, color in zip(ax.get_yticklabels(), row_colors):
         ytick.set_color(color)
@@ -1024,6 +1218,7 @@ def plot_tsne_latents(
     perplexity: float = 30.0,
     n_iter: int = 1000,
     n_classes: int = _TSNE_N_CLASSES,
+    class_names: Optional[List[str]] = None,
 ):
     """Per-model t-SNE grid: one panel per top-N class coloured by binary membership.
 
@@ -1058,7 +1253,8 @@ def plot_tsne_latents(
 
     for i, c in enumerate(top_classes):
         binary = (labels_sub == c).astype(np.int32)
-        _tsne_scatter_ax(axes_flat[i], emb, binary, f"class {c}")
+        lbl = class_names[c] if (class_names and c < len(class_names)) else f"class {c}"
+        _tsne_scatter_ax(axes_flat[i], emb, binary, lbl)
 
     for ax in axes_flat[len(top_classes):]:
         ax.set_visible(False)
@@ -1084,6 +1280,7 @@ def plot_tsne_comparison(
     max_samples: int = 2000,
     perplexity: float = 30.0,
     n_iter: int = 1000,
+    class_names: Optional[List[str]] = None,
 ):
     """Cross-model t-SNE comparison for headline classes.
 
@@ -1130,7 +1327,8 @@ def plot_tsne_comparison(
             binary = (labels_sub == c).astype(np.int32)
             _tsne_scatter_ax(ax, emb, binary, "")
             if row_idx == 0:
-                ax.set_title(f"cls {c}", fontsize=8, fontweight="bold")
+                col_lbl = class_names[c] if (class_names and c < len(class_names)) else f"cls {c}"
+                ax.set_title(col_lbl, fontsize=7, fontweight="bold")
             if col_idx == 0:
                 ax.set_ylabel(result["short"], fontsize=7, rotation=0,
                               ha="right", va="center", labelpad=60)
@@ -1301,6 +1499,10 @@ def main():
         print("  Linear probing and KNN will be skipped.")
         val_loader = None
 
+    print("\n[Step 2] Building Tiny-ImageNet class name lookup...")
+    class_names = _build_class_names(args.data_root)
+    print(f"  {len(class_names)} classes (e.g. 0='{class_names[0]}', 99='{class_names[99]}', 199='{class_names[199]}')")
+
     # ── process each run ────────────────────────────────────────────────────────
     all_results = []
 
@@ -1421,7 +1623,7 @@ def main():
 
     if has_linear:
         plot_linear_results(all_results, save_dir)
-        plot_class_heatmap(all_results, save_dir)
+        plot_class_heatmap(all_results, save_dir, class_names=class_names)
     if has_knn:
         plot_knn_results(all_results, save_dir)
     if has_sp:
@@ -1440,7 +1642,7 @@ def main():
             plot_taxon_scatter(all_results, save_dir)
         plot_matched_pairs(all_results, save_dir)
         if has_linear:
-            plot_taxon_class_compare(all_results, save_dir)
+            plot_taxon_class_compare(all_results, save_dir, class_names=class_names)
 
     # ── t-SNE visualisations ────────────────────────────────────────────────
     if not args.skip_tsne:
@@ -1455,9 +1657,9 @@ def main():
                 n_iter=args.tsne_n_iter,
             )
             for r in tsne_eligible:
-                plot_tsne_latents(r, tsne_dir, **tsne_kw)
+                plot_tsne_latents(r, tsne_dir, **tsne_kw, class_names=class_names)
             if len(tsne_eligible) > 1:
-                plot_tsne_comparison(all_results, tsne_dir, **tsne_kw)
+                plot_tsne_comparison(all_results, tsne_dir, **tsne_kw, class_names=class_names)
         else:
             print("\n[t-SNE] No eligible models with latents — skipping.")
 

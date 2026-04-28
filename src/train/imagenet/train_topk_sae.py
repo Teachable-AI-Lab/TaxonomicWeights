@@ -36,6 +36,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.model.cnn.baseline.topk_sae import TopKSparseConvAutoencoder
+from src.train._baseline_dead_frac import compute_dead_frac
 from src.utils.dataloader import TinyImageNetLoader
 
 
@@ -89,13 +90,15 @@ def run_validation(
         total_sparse += float(aux_loss.item())
         num_batches  += 1
 
+    dead_frac = compute_dead_frac(model)
     if num_batches == 0:
-        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0, "dead_frac": dead_frac}
 
     return {
         "loss":     total_loss   / num_batches,
         "recon":    total_recon  / num_batches,
         "sparsity": total_sparse / num_batches,
+        "dead_frac": dead_frac,
     }
 
 
@@ -126,11 +129,12 @@ def save_training_curves(history: dict, output_dir: Path) -> None:
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
     panels = [
         ("Total loss",    "train_loss",     "val_loss"),
         ("Recon loss",    "train_recon",    "val_recon"),
         ("AuxK loss",     "train_sparsity", "val_sparsity"),
+        ("Dead frac",     "train_dead",     "val_dead"),
     ]
     for ax, (title, tk, vk) in zip(axes, panels):
         ax.plot(epochs, history[tk], label="train", linewidth=1.5)
@@ -287,14 +291,14 @@ def main() -> None:
 
     history: dict = {
         "epochs": [], "topk_k": args.topk_k,
-        "train_loss": [], "train_recon": [], "train_sparsity": [],
-        "val_loss":   [], "val_recon":   [], "val_sparsity":   [],
+        "train_loss": [], "train_recon": [], "train_sparsity": [], "train_dead": [],
+        "val_loss":   [], "val_recon":   [], "val_sparsity":   [], "val_dead":   [],
     }
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
-        running_loss = running_recon = running_sparse = 0.0
+        running_loss = running_recon = running_sparse = running_dead = 0.0
         num_batches = 0
 
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
@@ -312,6 +316,7 @@ def main() -> None:
             running_loss   += float(loss.item())
             running_recon  += float(recon_loss.item())
             running_sparse += float(aux_loss.item())
+            running_dead   += compute_dead_frac(model)
             num_batches    += 1
             global_step    += 1
 
@@ -320,7 +325,8 @@ def main() -> None:
                 print(
                     f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                     f"lr={lr:.3e} loss={running_loss/num_batches:.5f} "
-                    f"recon={running_recon/num_batches:.5f} aux={running_sparse/num_batches:.5f}"
+                    f"recon={running_recon/num_batches:.5f} aux={running_sparse/num_batches:.5f} "
+                    f"dead={running_dead/num_batches:.3f}"
                 )
 
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
@@ -330,6 +336,7 @@ def main() -> None:
             "loss":     running_loss   / max(1, num_batches),
             "recon":    running_recon  / max(1, num_batches),
             "sparsity": running_sparse / max(1, num_batches),
+            "dead":     running_dead   / max(1, num_batches),
         }
         val_stats = run_validation(model, val_loader, device, args.sparsity_weight)
 
@@ -337,16 +344,20 @@ def main() -> None:
         print(
             f"epoch={epoch:03d} time={elapsed:.1f}s "
             f"train_loss={train_stats['loss']:.5f} train_recon={train_stats['recon']:.5f} "
-            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f}"
+            f"train_dead={train_stats['dead']:.3f} "
+            f"val_loss={val_stats['loss']:.5f} val_recon={val_stats['recon']:.5f} "
+            f"val_dead={val_stats['dead_frac']:.3f}"
         )
 
         history["epochs"].append(epoch)
         history["train_loss"].append(train_stats["loss"])
         history["train_recon"].append(train_stats["recon"])
         history["train_sparsity"].append(train_stats["sparsity"])
+        history["train_dead"].append(train_stats["dead"])
         history["val_loss"].append(val_stats["loss"])
         history["val_recon"].append(val_stats["recon"])
         history["val_sparsity"].append(val_stats["sparsity"])
+        history["val_dead"].append(val_stats["dead_frac"])
 
         # Save model args for checkpoint reconstruction
         _args_dict = {
