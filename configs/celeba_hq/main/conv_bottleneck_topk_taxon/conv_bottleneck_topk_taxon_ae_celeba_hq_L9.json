@@ -1,0 +1,40 @@
+{
+    "experiment_name": "conv_bottleneck_topk_taxon_ae_celeba_hq_L9",
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "model": {
+        "in_channels": 3,
+        "bottleneck_n_taxonomy_layers": 9,
+        "bottleneck_n_blocks": 1,
+        "topk_k_multiplier": 1.0,
+        "dead_steps": 2000,
+        "temperature": 0.5,
+        "hard": false,
+        "depth_decay": 0.5,
+        "use_batch_topk": true,
+        "warmup_steps": 5000,
+        "output_activation": "none",
+        "k_leaves": 1,
+        "use_gate_value": false
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "auxk_weight": 0.01,
+        "dkl_weight": 0.01,
+        "decoder_max_norm": 1.0,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "output": {
+        "output_dir": "./outputs/celeba_hq/main/conv_bottleneck_topk_taxon_ae_celeba_hq"
+    }
+}

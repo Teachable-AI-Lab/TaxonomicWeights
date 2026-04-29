@@ -1,5 +1,5 @@
 {
-    "experiment_name": "bottleneck_jumprelu_taxon_ae_celeba_hq_r18_v1_main_L8",
+    "experiment_name": "bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_3layer_L7_dkl",
     "data": {
         "data_root": "./data/celeba_hq",
         "image_size": 256,
@@ -11,26 +11,21 @@
         "in_channels": 3,
         "plain_stage_channels": [
             64,
-            128,
-            256
+            128
         ],
         "plain_stage_blocks": [
-            2,
             2,
             2
         ],
         "plain_stage_strides": [
             1,
-            2,
             2
         ],
-        "bottleneck_n_taxonomy_layers": 8,
+        "bottleneck_n_taxonomy_layers": 7,
         "bottleneck_n_blocks": 2,
         "bottleneck_stride": 2,
-        "target_l0": 8.0,
-        "bandwidth": 0.01,
-        "theta_init": 0.001,
-        "l0_surrogate_temp": 1.0,
+        "topk_k_multiplier": 1.0,
+        "dead_steps": 2000,
         "kernel_size": 3,
         "use_stem": true,
         "stem_channels": 64,
@@ -39,21 +34,25 @@
         "output_activation": "none",
         "temperature": 0.5,
         "hard": false,
-        "depth_decay": 0.5
+        "depth_decay": 0.5,
+        "use_batch_topk": true,
+        "warmup_steps": 5000,
+        "k_leaves": 0,
+        "use_gate_value": false
     },
     "training": {
         "epochs": 90,
         "learning_rate": 0.0003,
         "weight_decay": 0.0001,
         "warmup_epochs": 3,
-        "sparsity_weight": 0.05,
-        "dkl_weight": 0.0,
+        "auxk_weight": 0.0,
+        "dkl_weight": 0.01,
         "decoder_max_norm": 1.0,
         "save_every": 5,
         "seed": 42,
         "max_train_steps": 0
     },
     "output": {
-        "output_dir": "./outputs/celeba_hq/main/bottleneck_jumprelu_taxon_ae_celeba_hq_r18_v1_main"
+        "output_dir": "./outputs/celeba_hq/main/bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_3layer_dkl"
     }
 }

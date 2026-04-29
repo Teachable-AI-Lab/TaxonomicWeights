@@ -1055,12 +1055,23 @@ class TopKTaxonResNetStage(nn.Module):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
+            # BUGFIX 5 (prob floor): Without a floor, a dead channel at depth d
+            # has prob_d → 0 because its ancestors route away. AuxK can train its
+            # raw logit to be high (see compute_auxk_loss), but at inference
+            # logits * prob ≈ 0 → TopK never selects it → permanent death.
+            # Setting a structural floor of 0.5^(d+1) (the uniform-routing prob)
+            # ensures every channel has a non-zero, depth-normalised contribution.
+            # _topk_norm_weights was designed for exactly this floor, so the
+            # ranking step is unaffected. Live channels (prob >> floor) are
+            # unaffected; only structurally dead ones are rescued.
+            floor_d = 0.5 ** (depth_idx + 1)
+            prob_gated = prob.clamp(min=floor_d)
             if self.use_gate_value:
                 # Routing controls the mask; values are free from the value head.
-                out = value_per_depth[depth_idx] * prob
+                out = value_per_depth[depth_idx] * prob_gated
             else:
                 # Change E: per-depth learnable scale before concatenation.
-                out = logits * prob * self.depth_scales[depth_idx]
+                out = logits * prob_gated * self.depth_scales[depth_idx]
 
             entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
@@ -1092,34 +1103,43 @@ class TopKTaxonResNetStage(nn.Module):
             k_current = k_eff
 
         flat = cat_output.permute(0, 2, 3, 1).reshape(-1, C)
-        flat_relu = F.relu(flat)
+        # BUGFIX 1: Do NOT apply ReLU before TopK. The pairwise-softmax routed
+        # outputs (logits * prob) are signed and roughly zero-centred, so a
+        # pre-TopK ReLU would unconditionally kill ~half the channels before
+        # any competition. TopK already produces a sparse mask; the mask alone
+        # zeroes out the losers. Signed activations flow to the decoder.
         if k_current < C:
             # Rank using probability-normalised activations so that deep nodes
             # (attenuated by ~2^-(d+1)) compete fairly with shallow ones.
-            # The binary mask is then applied to the *original* flat_relu so
-            # decoder inputs are not scaled up.
-            flat_for_rank = flat_relu * self._topk_norm_weights  # [pos, C]
+            flat_for_rank = flat * self._topk_norm_weights  # [pos, C], signed
             if self.use_batch_topk:
                 # Change C: batch-level TopK — global threshold across all
                 # positions, allowing non-uniform activation counts.
                 flat_all = flat_for_rank.reshape(-1)          # [B*H*W*C]
-                total_keep = k_current * flat_relu.shape[0]   # k * (B*H*W)
+                total_keep = k_current * flat.shape[0]        # k * (B*H*W)
                 if total_keep < flat_all.numel():
                     threshold = flat_all.topk(total_keep).values[-1]
                     mask = (flat_for_rank >= threshold).float()
-                    flat_relu = flat_relu * mask
+                else:
+                    mask = torch.ones_like(flat)
             else:
                 # Per-position TopK (original behaviour).
                 _, topk_idx = flat_for_rank.topk(k_current, dim=1)
-                mask = torch.zeros_like(flat_relu)
+                mask = torch.zeros_like(flat)
                 mask.scatter_(1, topk_idx, 1.0)
-                flat_relu = flat_relu * mask
-        cat_output = flat_relu.reshape(B, H, W, C).permute(0, 3, 1, 2)
+            flat = flat * mask
+        else:
+            mask = torch.ones_like(flat)
+        cat_output = flat.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
-        # Track dead nodes: a channel is active if it survives TopK
-        # at any spatial location for any sample in the batch.
+        # BUGFIX 2: Track dead nodes via the TopK *selection mask*, not via the
+        # output magnitude. With signed activations a selected channel may have
+        # a negative value, which would falsely register as dead under an
+        # ``amax > 0`` check. A channel is alive iff TopK selected it at any
+        # (batch, spatial) position.
         if self.training:
-            any_active = cat_output.amax(dim=(0, 2, 3)) > 0
+            sel_mask = mask.reshape(B, H, W, C).permute(0, 3, 1, 2).bool()
+            any_active = sel_mask.amax(dim=(0, 2, 3))
             self._steps_since_active[any_active] = 0
             self._steps_since_active[~any_active] += 1
 
@@ -1147,24 +1167,41 @@ class TopKTaxonResNetStage(nn.Module):
         if n_dead == 0:
             return stage_input.new_zeros(())
 
-        # Re-run feature extraction (shares params, so gradients flow).
-        stage_logits = self._stage_features(stage_input)
-        dead_float = dead_mask_nodes.float().view(1, -1, 1, 1)
+        # BUGFIX 4 (revised): Re-run the forward pass (with the same prob floor
+        # as the main forward — see BUGFIX 5) so AuxK is consistent with
+        # inference.  With the floor, dead channels have prob_gated >= 0.5^(d+1)
+        # (non-zero), so both the forward value AND the gradient to the conv
+        # logit are non-vanishing.  _topk_norm_weights still applies because it
+        # was designed for exactly this floor (uniform routing probability).
+        routing_per_depth = self._taxon_logits_per_depth(stage_input)
         if self.use_gate_value:
-            # AuxK signal should flow through the value head, not routing logits.
-            dead_vals = self.value_conv(stage_logits) * dead_float
-        else:
-            dead_vals = stage_logits * dead_float
+            value_feats = self.value_conv(torch.cat(routing_per_depth, dim=1))
+            value_per_depth = list(torch.split(value_feats, self.layer_channels, dim=1))
+        outputs_aux: List[torch.Tensor] = []
+        prev_aux: Optional[torch.Tensor] = None
+        for depth_idx, logits in enumerate(routing_per_depth):
+            log_cond = self._pairwise_log_softmax(logits, tau=self.temperature)
+            logp = log_cond if prev_aux is None else log_cond + prev_aux.repeat_interleave(2, dim=1)
+            prob = logp.exp()
+            floor_d = 0.5 ** (depth_idx + 1)   # structural floor (matches forward BUGFIX 5)
+            prob_gated = prob.clamp(min=floor_d)
+            if self.use_gate_value:
+                out = value_per_depth[depth_idx] * prob_gated
+            else:
+                out = logits * prob_gated * self.depth_scales[depth_idx]
+            outputs_aux.append(out)
+            prev_aux = logp
+        cat_full = torch.cat(outputs_aux, dim=1)           # [B, C, H, W]
+        dead_float = dead_mask_nodes.float().view(1, -1, 1, 1)
+        dead_vals = cat_full * dead_float
 
-        # Select top-k_aux among dead nodes.
-        # ReLU first: only positive activations carry a meaningful revival
-        # gradient; negative ones invert the loss signal (matching Gao et al.).
-        # Use _topk_norm_weights for ranking so deep dead nodes (structurally
-        # smaller activations) get a fair chance to be selected and revived.
+        # Per-position TopK among dead channels only. Rank with _topk_norm_weights
+        # (designed for the floor=uniform-prob case) so depths compete fairly.
         bsz, c, h, w = dead_vals.shape
-        flat = dead_vals.permute(0, 2, 3, 1).reshape(-1, c)
-        flat_relu = F.relu(flat)
-        flat_for_rank = flat_relu * self._topk_norm_weights  # normalised ranking
+        flat = dead_vals.permute(0, 2, 3, 1).reshape(-1, c)             # [B*H*W, C]
+        flat_for_rank = flat * self._topk_norm_weights                  # compensate depth
+        live_cols = (~dead_mask_nodes).view(1, -1).expand_as(flat_for_rank)
+        flat_for_rank = flat_for_rank.masked_fill(live_cols, float("-inf"))
         k_aux_eff = min(self.k_aux, n_dead)
         _, aux_idx = flat_for_rank.topk(k_aux_eff, dim=-1)
         aux_mask = torch.zeros_like(flat)

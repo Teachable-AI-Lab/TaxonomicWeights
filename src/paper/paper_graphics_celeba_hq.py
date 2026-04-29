@@ -68,6 +68,8 @@ from src.compare.compare_celeba_hq import (   # noqa: E402
     _to_display,
     load_bottleneck_topk_taxon_model,
     load_bottleneck_topk_multi_taxon_model,
+    load_conv_topk_sae_model,
+    load_conv_bottleneck_topk_taxon_model,
     load_sae_model,
     load_baseline_model,
 )
@@ -114,14 +116,23 @@ MAIN_CONFIG_RELPATHS: List[str] = [
     "configs/celeba_hq/sae_celeba_hq.json",
     "configs/celeba_hq/jumprelu_sae_celeba_hq.json",
     "configs/celeba_hq/topk_sae_celeba_hq.json",
+    "configs/celeba_hq/main/topk_sae/topk_sae_celeba_hq_r18_k7_ch254_3layer.json",
     "configs/celeba_hq/matryoshka_batch_topk_sae_celeba_hq.json",
     "configs/celeba_hq/main/bottleneck_topk_taxon/bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_L8.json",
     "configs/celeba_hq/main/bottleneck_topk_taxon/bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_L8_dkl1e2.json",
+    "configs/celeba_hq/main/bottleneck_topk_taxon/bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_3layer_L7.json",
+    "configs/celeba_hq/main/bottleneck_topk_taxon/bottleneck_topk_taxon_ae_celeba_hq_r18_v1_main_3layer_L7_dkl.json",
     "configs/celeba_hq/main/bottleneck_jumprelu_taxon/bottleneck_jumprelu_taxon_ae_celeba_hq_r18_v1_main_L8.json",
+    "configs/celeba_hq/main/bottleneck_taxon/bottleneck_taxon_ae_celeba_hq_r18_v1_main_dkl1e-02_temp0p001.json",
+    "configs/celeba_hq/main/bottleneck_taxon/bottleneck_taxon_ae_celeba_hq_r18_v1_main_dkl1e-02_temp0p01.json",
+    "configs/celeba_hq/main/bottleneck_taxon/bottleneck_taxon_ae_celeba_hq_r18_v1_main_dkl1e-02_temp0p1.json",
+    "configs/celeba_hq/main/bottleneck_taxon/bottleneck_taxon_ae_celeba_hq_r18_v1_main_dkl1e-02_temp0p1_hard.json",
     "configs/celeba_hq/main/bottleneck_topk_multi_taxon/bottleneck_topk_multi_taxon_ae_celeba_hq_r18_v6_main_K4_L6_gate4.json",
     "configs/celeba_hq/main/bottleneck_topk_multi_taxon/bottleneck_topk_multi_taxon_ae_celeba_hq_r18_v6_main_K4_L8_gate1.json",
     "configs/celeba_hq/main/bottleneck_topk_multi_taxon/bottleneck_topk_multi_taxon_ae_celeba_hq_r18_v6_main_K6_L8_gate1.json",
     "configs/celeba_hq/main/bottleneck_topk_multi_taxon/bottleneck_topk_multi_taxon_ae_celeba_hq_r18_v6_main_K8_L8_gate1.json",
+    "configs/celeba_hq/main/conv_topk_sae/conv_topk_sae_ae_celeba_hq_k9.json",
+    "configs/celeba_hq/main/conv_bottleneck_topk_taxon/conv_bottleneck_topk_taxon_ae_celeba_hq_L9.json",
 ]
 
 ABLATION_TAXON_RELPATHS: List[str] = [
@@ -158,6 +169,8 @@ _PALETTE = {
     "bottleneck_topk_multi_taxon":"#000080",
     "bottleneck_taxon":           "#003f5c",
     "bottleneck_multi_taxon":     "#5e2d79",
+    "conv_topk_sae":              "#e6550d",
+    "conv_bottleneck_topk_taxon": "#084081",
 }
 
 _MULTI_TAXON_COLOURS = [
@@ -180,6 +193,14 @@ def _training_suffix_for_config(cfg: dict) -> str:
     exp = cfg.get("experiment_name", "")
     variant = mc.get("model_variant", None)
 
+    # ── conv topk sae ─────────────────────────────────────────────────────────
+    if exp.startswith("conv_topk_sae_"):
+        k = int(mc.get("topk_k", 64))
+        return f"_k{k}"
+    # ── conv bottleneck topk taxon ────────────────────────────────────────────
+    if exp.startswith("conv_bottleneck_topk_taxon_"):
+        L = int(mc.get("bottleneck_n_taxonomy_layers", 9))
+        return f"_L{L}"
     # ── bottleneck topk taxon ─────────────────────────────────────────────────
     if exp.startswith("bottleneck_topk_taxon_"):
         L = int(mc.get("bottleneck_n_taxonomy_layers", 6))
@@ -198,10 +219,8 @@ def _training_suffix_for_config(cfg: dict) -> str:
         return f"_K{K}_L{L}{gate_tag}"
     # ── bottleneck taxon / multi-taxon (non-topk) ─────────────────────────────
     if exp.startswith("bottleneck_taxon_") or exp.startswith("bottleneck_multi_taxon_"):
-        base_name = Path(cfg.get("output", {}).get("output_dir", "")).name
-        if base_name and exp.startswith(base_name):
-            return exp[len(base_name):]
-        return ""
+        L = int(mc.get("bottleneck_n_taxonomy_layers", 6))
+        return f"_L{L}"
 
     # ── SAE family ────────────────────────────────────────────────────────────
     if variant is not None:
@@ -385,7 +404,11 @@ def collect_latents_and_recon_safe(
 
         # Forward: get z and recon
         try:
-            if mtype in ("bottleneck_topk_taxon", "bottleneck_topk_multi_taxon"):
+            if mtype == "conv_bottleneck_topk_taxon":
+                recon_out, _, _ = model(imgs)
+            elif mtype == "conv_topk_sae":
+                recon_out, _, _ = model(imgs)
+            elif mtype in ("bottleneck_topk_taxon", "bottleneck_topk_multi_taxon"):
                 recon_out, _ = model(imgs)
             elif mtype in ("bottleneck_taxon",):
                 recon_out, _, _ = model(imgs)
@@ -432,14 +455,46 @@ def _psnr(mse: float, max_val: float = 1.0) -> float:
     return 10 * math.log10(max_val ** 2 / mse)
 
 
-def compute_sparsity_metrics(Z: np.ndarray, threshold: float = 1e-6) -> Dict:
+def compute_sparsity_metrics(Z: np.ndarray, threshold: float = 1e-6,
+                             model: Optional[object] = None) -> Dict:
+    """Compute L0 and dead-frac sparsity metrics.
+
+    Dead-frac alignment: if the model has a ``_steps_since_active`` buffer
+    (TopK taxon / TopK SAE family), use it directly — this matches the training
+    script which counts consecutive non-selection steps. Falls back to the
+    magnitude-threshold approach for models without such a buffer (plain SAE,
+    baseline, etc.).
+    """
+    import torch as _torch
     l0_per = (np.abs(Z) > threshold).sum(axis=1).astype(float)
-    max_act = np.abs(Z).max(axis=0)
-    dead_frac = float((max_act < threshold).mean())
+    # Prefer model-internal dead tracker when available
+    dead_frac_val: Optional[float] = None
+    if model is not None:
+        # Collect all _steps_since_active buffers in the model
+        for name, buf in model.named_buffers():
+            if "steps_since_active" in name:
+                dead_steps = None
+                # Find matching dead_steps attribute on the owning module
+                # Walk the module hierarchy by prefix
+                parts = name.split(".")
+                owner = model
+                for part in parts[:-1]:
+                    owner = getattr(owner, part, owner)
+                dead_steps = getattr(owner, "dead_steps", None)
+                if dead_steps is None:
+                    # Try one level up (bottleneck_stage.dead_steps)
+                    dead_steps = getattr(model, "dead_steps", None)
+                if dead_steps is not None:
+                    dead_frac_val = float((buf >= dead_steps).float().mean().item())
+                break  # use first found buffer
+    if dead_frac_val is None:
+        # Magnitude fallback: a feature is dead if it never activates above threshold
+        max_act = np.abs(Z).max(axis=0)
+        dead_frac_val = float((max_act < threshold).mean())
     return dict(
         l0_mean=float(l0_per.mean()),
         l0_median=float(np.median(l0_per)),
-        dead_frac=dead_frac,
+        dead_frac=dead_frac_val,
         n_features=int(Z.shape[1]),
     )
 
@@ -506,7 +561,7 @@ def compute_all_metrics(
     mse_mean = float(data["mse"].mean())
     psnr_mean = _psnr(mse_mean, max_val=2.0)   # images in [-1,1], range=2
 
-    sp = compute_sparsity_metrics(Z)
+    sp = compute_sparsity_metrics(Z, model=model)
 
     metrics: Dict = dict(
         mse_mean=mse_mean,
@@ -995,13 +1050,13 @@ def fig_neuron_steering_celeba(
     model.eval()
 
     fig, axes = plt.subplots(
-        n_attrs, 1 + n_scales,
-        figsize=((1 + n_scales) * 2.5, n_attrs * 2.8),
+        n_attrs, 2 + n_scales,
+        figsize=((2 + n_scales) * 2.5, n_attrs * 2.8),
     )
     if n_attrs == 1:
         axes = axes[np.newaxis, :]
 
-    col_labels = ["Original"] + [f"steer ×{s:.0f}" for s in scales]
+    col_labels = ["Original", "Recon"] + [f"steer ×{s:.0f}" for s in scales]
     for col_j, lbl in enumerate(col_labels):
         axes[0, col_j].set_title(lbl, fontsize=8)
 
@@ -1010,7 +1065,7 @@ def fig_neuron_steering_celeba(
         ax.imshow(np_img); ax.axis("off")
 
     for row_i, a_idx in enumerate(chosen_attrs):
-        neuron_idx = sel[a_idx][0] if isinstance(sel[a_idx], list) else int(sel[a_idx])
+        flat_idx = sel[a_idx][0] if isinstance(sel[a_idx], list) else int(sel[a_idx])
         attr_name = CELEBA_ATTR_NAMES[a_idx].replace("_", " ")
 
         # Find images that are *negative* for this attribute.
@@ -1031,33 +1086,61 @@ def fig_neuron_steering_celeba(
         with torch.no_grad():
             z_raw, *_ = model.encode(imgs_neg)   # [B, C, H, W] or [B, D]
 
-        z_shape = z_raw.shape   # remember for decode
-        z_flat = z_raw.flatten(start_dim=1).clone()   # [B, D]
+        z_shape = z_raw.shape
 
-        # ref_val = 95th-percentile absolute activation for this neuron in the batch
-        p95 = float(torch.quantile(z_flat[:, neuron_idx].abs().float(), 0.95).item())
-        ref_val = max(p95, 1e-3)
+        # Selectivity is computed on the FLATTENED latent (see _extract_probe_features
+        # in paper_analysis_celeba.py).  For conv-shaped latents [B, C, H, W] this
+        # means flat_idx points to a single (channel, h, w) position.  Editing
+        # one scalar in a ~130k-element latent has no visible effect on the
+        # decoded image, so we map back to the *channel* and overwrite the
+        # entire spatial map of that channel — this is what matches the intent
+        # of "steering neuron k".
+        if z_raw.dim() == 4:
+            B, C, H, W = z_shape
+            channel_idx = int(flat_idx) // (H * W)
+            # ref_val = 95th-percentile absolute activation of this channel
+            ch_acts = z_raw[:, channel_idx].abs().float().flatten()
+            p95 = float(torch.quantile(ch_acts, 0.95).item())
+            ref_val = max(p95, 1e-3)
+            label_idx = channel_idx
+        else:
+            z_flat = z_raw.flatten(start_dim=1)
+            channel_idx = None
+            p95 = float(torch.quantile(z_flat[:, int(flat_idx)].abs().float(), 0.95).item())
+            ref_val = max(p95, 1e-3)
+            label_idx = int(flat_idx)
 
         # Show original image with attribute label annotated inside the cell
         ax_orig = axes[row_i, 0]
         _show(ax_orig, imgs_neg[0].cpu())
         ax_orig.text(
-            0.03, 0.97, f"{attr_name}\n(n°{neuron_idx})",
+            0.03, 0.97, f"{attr_name}\n(n°{label_idx})",
             transform=ax_orig.transAxes,
             fontsize=7, color="white", va="top", ha="left",
             bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.55, lw=0),
         )
 
+        # Unsteered baseline reconstruction (sanity check column).
+        with torch.no_grad():
+            recon_base = model.decode(z_raw)
+            if isinstance(recon_base, (tuple, list)):
+                recon_base = recon_base[0]
+        _show(axes[row_i, 1], recon_base[0].cpu())
+
         for col_j, scale in enumerate(scales):
-            z_edit = z_flat.clone()
-            z_edit[:, neuron_idx] = scale * ref_val
-            # Reshape back to original latent shape for decode
-            z_decode = z_edit.reshape(z_shape).to(device)
+            z_edit = z_raw.clone()
+            if channel_idx is not None:
+                # Overwrite the entire spatial map of the chosen channel.
+                z_edit[:, channel_idx, :, :] = scale * ref_val
+            else:
+                z_edit_flat = z_edit.flatten(start_dim=1)
+                z_edit_flat[:, int(flat_idx)] = scale * ref_val
+                z_edit = z_edit_flat.reshape(z_shape)
             with torch.no_grad():
-                recon = model.decode(z_decode)
+                recon = model.decode(z_edit.to(device))
                 if isinstance(recon, (tuple, list)):
                     recon = recon[0]
-            _show(axes[row_i, 1 + col_j], recon[0].cpu())
+            _show(axes[row_i, 2 + col_j], recon[0].cpu())
 
     del model
     fig.suptitle(f"Neuron Steering — {run['short']} — CelebA-HQ",
@@ -1160,6 +1243,83 @@ def fig_hierarchy_prefix_recon(
     title = f"Prefix Reconstruction — {run_short}" if run_short else "Prefix Reconstruction"
     fig.suptitle(title, fontsize=9, fontweight="bold")
     plt.tight_layout(rect=[0.08, 0, 1, 0.97])
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved {save_path}")
+
+
+def fig_flat_activations(
+    model, val_loader: DataLoader, device: torch.device, save_path: Path,
+    run_short: str = "",
+) -> None:
+    """Per-dimension mean activation bar chart for any autoencoder.
+
+    For hierarchical taxon models the bars are coloured by depth and depth
+    boundaries are marked with dashed vertical lines.  For all other models a
+    single colour is used.  The x-axis is always the flat channel / dimension
+    index (no depth grouping).
+    """
+    _apply_style()
+    model.eval()
+
+    # ── Try hierarchy-aware channel collection ──────────────────────────────
+    try:
+        metas = discover_hierarchies(model)
+    except (RuntimeError, AttributeError):
+        metas = []
+
+    if metas:
+        meta = metas[0]
+        acts_dict, _ = collect_node_activations(
+            model, val_loader, [meta], device, max_samples=2000)
+        mean_acts = acts_dict[meta.label].mean(axis=0)   # [n_channels]
+
+        fig, ax = plt.subplots(1, 1, figsize=(14, 3))
+        colors_per_level = plt.cm.Blues(np.linspace(0.3, 0.9, meta.n_levels))
+        offs = _depth_offsets(meta.layer_channels)
+        x_pos = np.arange(len(mean_acts))
+        bar_colors = np.empty((len(mean_acts), 4))
+        for d in range(meta.n_levels):
+            start = offs[d]
+            end = start + meta.layer_channels[d]
+            bar_colors[start:end] = colors_per_level[d]
+        ax.bar(x_pos, mean_acts, color=bar_colors, width=1.0)
+        # depth boundary vertical lines
+        for d in range(1, meta.n_levels):
+            ax.axvline(x=offs[d] - 0.5, color="gray", linewidth=0.6, linestyle="--", alpha=0.6)
+        # legend patches
+        import matplotlib.patches as mpatches
+        patches = [mpatches.Patch(color=colors_per_level[d], label=f"Depth {d+1}")
+                   for d in range(meta.n_levels)]
+        ax.legend(handles=patches, fontsize=7, ncol=min(meta.n_levels, 8), loc="upper right")
+        ax.set_xlabel("Channel index", fontsize=9)
+    else:
+        # Non-hierarchical model: collect mean absolute activation per dim
+        all_z: list = []
+        n_seen = 0
+        max_samples = 2000
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="    flat activations", leave=False):
+                if n_seen >= max_samples:
+                    break
+                imgs = batch[0].to(device)
+                take = min(imgs.shape[0], max_samples - n_seen)
+                imgs = imgs[:take]
+                z, *_ = model.encode(imgs)
+                all_z.append(z.detach().cpu().flatten(start_dim=1).float().numpy())
+                n_seen += take
+        Z = np.concatenate(all_z, axis=0)   # [N, D]
+        mean_acts = np.abs(Z).mean(axis=0)   # [D]
+
+        fig, ax = plt.subplots(1, 1, figsize=(14, 3))
+        ax.bar(np.arange(len(mean_acts)), mean_acts, color="#2171b5", width=1.0)
+        ax.set_xlabel("Latent dimension index", fontsize=9)
+
+    ax.set_ylabel("Mean activation", fontsize=9)
+    title = f"Per-dimension Mean Activation — {run_short}" if run_short else "Per-dimension Mean Activation"
+    ax.set_title(title, fontsize=10)
+    ax.grid(axis="y", alpha=0.2)
+    plt.tight_layout()
     plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close()
     print(f"  Saved {save_path}")
@@ -1302,8 +1462,9 @@ def main() -> None:
     ablation_dir = out_dir / "ablation"
     taxonomy_dir = out_dir / "taxonomy"
     case_study_dir = out_dir / "case_studies"
+    activations_dir = out_dir / "activations"
     cache_dir = out_dir / "cache"
-    for d in (main_dir, ablation_dir, taxonomy_dir, case_study_dir, cache_dir):
+    for d in (main_dir, ablation_dir, taxonomy_dir, case_study_dir, activations_dir, cache_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Load run dicts ────────────────────────────────────────────────────────
@@ -1422,7 +1583,9 @@ def main() -> None:
     # ── Taxonomy exploration ──────────────────────────────────────────────────
     if not args.skip_hierarchy:
         taxon_runs = [r for r in main_runs
-                      if r["type"] in ("bottleneck_topk_taxon", "bottleneck_topk_multi_taxon")]
+                      if r["type"] in ("bottleneck_jumprelu_taxon", "bottleneck_topk_taxon",
+                                       "bottleneck_topk_multi_taxon", "conv_bottleneck_topk_taxon",
+                                       "bottleneck_taxon")]
         for run in taxon_runs:
             run_tax_dir = taxonomy_dir / run["name"]
             run_tax_dir.mkdir(parents=True, exist_ok=True)
@@ -1454,6 +1617,29 @@ def main() -> None:
                 run_tax_dir / "fig11_gradcam.png",
                 n_images=args.n_hier_images)
 
+            del model
+
+    # ── Flat per-dimension activation charts for ALL autoencoders ─────────────
+    if not args.skip_hierarchy:
+        print("\n=== Flat activation charts (all models) ===")
+        for run in main_runs:
+            run_act_dir = activations_dir / run["name"]
+            run_act_dir.mkdir(parents=True, exist_ok=True)
+            save_path = run_act_dir / "fig10_flat_activations.png"
+            print(f"\n  Flat activations for {run['short']} ...")
+            try:
+                model, _ = _load_model_from_run_dict(run, device)
+                model.eval()
+            except Exception as e:
+                print(f"    [skip] could not load: {e}")
+                continue
+            try:
+                fig_flat_activations(
+                    model, val_loader, device, save_path,
+                    run_short=run["short"],
+                )
+            except Exception as e:
+                print(f"    [warn] flat activations failed: {e}")
             del model
 
     print(f"\n✓ All paper graphics saved to {out_dir}/")

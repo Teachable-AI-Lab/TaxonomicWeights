@@ -84,7 +84,12 @@ def _hier_n_levels(stage, is_multi: bool, hier_idx: int) -> int:
 
 def discover_hierarchies(model: nn.Module) -> List[HierarchyMeta]:
     """Return a HierarchyMeta for every (stage, hierarchy) tree in the model."""
-    enc = model.encoder
+    # ConvBottleneckTopKTaxonAutoencoder has bottleneck_stage directly on model
+    # (no .encoder wrapper); handle this before touching model.encoder.
+    if _has(model, "bottleneck_stage") and not _has(model, "encoder"):
+        enc = model
+    else:
+        enc = model.encoder
     metas: List[HierarchyMeta] = []
 
     if _has(enc, "bottleneck_stage"):
@@ -150,6 +155,12 @@ def _forward_to_target_stage(
 
     Returns the raw (concatenated) output of the target taxon stage.
     """
+    # ConvBottleneckTopKTaxonAutoencoder: encoder_net + bottleneck_stage at top level
+    if _has(model, "encoder_net") and not _has(model, "encoder"):
+        feat = model.encoder_net(x)
+        out, *_ = model.bottleneck_stage(feat)
+        return out
+
     enc = model.encoder
     feat = enc.stem(x)
 

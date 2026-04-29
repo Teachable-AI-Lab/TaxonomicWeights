@@ -1,0 +1,32 @@
+{
+    "experiment_name": "conv_topk_sae_ae_celeba_hq_k9",
+    "data": {
+        "data_root": "./data/celeba_hq",
+        "image_size": 256,
+        "batch_size": 32,
+        "num_workers": 8,
+        "val_split": 0.05
+    },
+    "model": {
+        "in_channels": 3,
+        "topk_k": 9,
+        "dead_steps": 2000,
+        "output_activation": "none",
+        "use_batch_topk": true,
+        "warmup_steps": 5000
+    },
+    "training": {
+        "epochs": 90,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "warmup_epochs": 3,
+        "auxk_weight": 0.01,
+        "decoder_max_norm": 1.0,
+        "save_every": 5,
+        "seed": 42,
+        "max_train_steps": 0
+    },
+    "output": {
+        "output_dir": "./outputs/celeba_hq/main/conv_topk_sae_ae_celeba_hq"
+    }
+}

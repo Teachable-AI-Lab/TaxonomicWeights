@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Train BottleneckJumpReLUTaxonAutoencoder on CelebA-HQ.
+"""Train ConvTopKSAEAutoencoder on CelebA-HQ.
 
-Plain ResNet stages followed by a single JumpReLU taxon stage at the
-bottleneck — same hierarchical pairwise softmax + DKL/entropy regularisers
-as the TopK variant, but the per-path sparsity is enforced by a learned
-per-channel JumpReLU threshold instead of batch-TopK + AuxK revival.
+Strided-conv encoder/decoder (no ResNet) with a channel-wise TopK bottleneck
+and AuxK dead-node revival.
 
-Loss = recon + sparsity_w * (L̂₀ − target_l0)² + dkl_w * dkl
+Loss = recon_mse + auxk_weight * auxk
 """
 
 from __future__ import annotations
@@ -34,12 +32,14 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.model.cnn.taxon.bottleneck_jumprelu_taxon_ae import BottleneckJumpReLUTaxonAutoencoder
+from src.model.cnn.conv_topk_sae_ae import ConvTopKSAEAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 
 
 def seed_everything(seed: int) -> None:
-    random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def build_scheduler(optimizer, steps_per_epoch, epochs, warmup_epochs) -> LambdaLR:
@@ -54,27 +54,22 @@ def build_scheduler(optimizer, steps_per_epoch, epochs, warmup_epochs) -> Lambda
 
 
 @torch.no_grad()
-def run_validation(model, loader, device, sparsity_w, dkl_w=0.0) -> dict:
+def run_validation(model, loader, device, auxk_w) -> dict:
     model.eval()
-    tot_loss = tot_recon = tot_sparsity = tot_dead = tot_dkl = tot_l0 = 0.0
+    tot_loss = tot_recon = tot_auxk = tot_dead = 0.0
     nb = 0
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        recon, info = model(images)
+        recon, dead_frac, _ = model(images)
         recon_loss = F.mse_loss(recon, images)
-        sparsity = info["sparsity"]
-        dkl = info["dkl"]
-        loss = recon_loss + sparsity_w*sparsity + dkl_w*dkl
-        tot_loss += float(loss.item()); tot_recon += float(recon_loss.item())
-        tot_sparsity += float(sparsity.item()); tot_dead += float(info["dead_frac"].item())
-        tot_dkl += float(dkl.item()); tot_l0 += float(info["l0_hat"].item())
-        nb += 1
+        auxk_loss = model.compute_auxk_loss(images, recon)
+        loss = recon_loss + auxk_w * auxk_loss
+        tot_loss += float(loss); tot_recon += float(recon_loss)
+        tot_auxk += float(auxk_loss); tot_dead += float(dead_frac); nb += 1
     if nb == 0:
-        return {"loss": 0.0, "recon": 0.0, "sparsity": 0.0,
-                "dead_frac": 0.0, "dkl": 0.0, "l0": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0}
     return {"loss": tot_loss/nb, "recon": tot_recon/nb,
-            "sparsity": tot_sparsity/nb, "dead_frac": tot_dead/nb,
-            "dkl": tot_dkl/nb, "l0": tot_l0/nb}
+            "auxk": tot_auxk/nb, "dead_frac": tot_dead/nb}
 
 
 def save_recon_preview(model, loader, device, save_path, num_images=8) -> None:
@@ -82,7 +77,7 @@ def save_recon_preview(model, loader, device, save_path, num_images=8) -> None:
     images, _ = next(iter(loader))
     images = images[:num_images].to(device)
     with torch.no_grad():
-        recon, _ = model(images)
+        recon, _, _ = model(images)
     vis_input = (images.clamp(-1, 1) + 1.0) * 0.5
     vis_recon = (recon.clamp(-1, 1) + 1.0) * 0.5
     grid = make_grid(torch.cat([vis_input, vis_recon], dim=0), nrow=num_images)
@@ -91,24 +86,21 @@ def save_recon_preview(model, loader, device, save_path, num_images=8) -> None:
 
 
 def save_training_curves(history, output_dir) -> None:
-    epochs = history["epochs"]
-    if not epochs:
+    if not history["epochs"]:
         return
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
-    fig, axes = plt.subplots(1, 5, figsize=(25, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     panels = [
         ("Total loss", "train_loss", "val_loss"),
-        ("Recon", "train_recon", "val_recon"),
-        ("Sparsity (L̂₀-target)²", "train_sparsity", "val_sparsity"),
-        ("Mean L̂₀", "train_l0", "val_l0"),
-        ("DKL", "train_dkl", "val_dkl"),
+        ("Recon MSE", "train_recon", "val_recon"),
+        ("AuxK",      "train_auxk",  "val_auxk"),
     ]
     for ax, (title, tk, vk) in zip(axes, panels):
-        ax.plot(epochs, history[tk], label="train")
-        ax.plot(epochs, history[vk], label="val", linestyle="--")
+        ax.plot(history["epochs"], history[tk], label="train")
+        ax.plot(history["epochs"], history[vk], label="val", linestyle="--")
         ax.set_title(title); ax.set_xlabel("Epoch"); ax.legend(); ax.grid(True, alpha=0.3)
-    plt.suptitle("Bottleneck JumpReLU Taxon AE")
+    plt.suptitle("Conv TopK SAE AE")
     plt.tight_layout()
     plt.savefig(output_dir / "training_curves.png", dpi=150)
     plt.close()
@@ -127,35 +119,34 @@ def parse_args():
 
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="")
-    p.add_argument("--data-root", type=str, default=d.get("data_root", "./data/celeba_hq"))
-    p.add_argument("--output-dir", type=str,
-                   default=o.get("output_dir", "./outputs/bottleneck_jumprelu_taxon_ae_celeba_hq"))
-    p.add_argument("--image-size", type=int, default=d.get("image_size", 256))
-    p.add_argument("--batch-size", type=int, default=d.get("batch_size", 32))
-    p.add_argument("--num-workers", type=int, default=d.get("num_workers", 8))
-    p.add_argument("--val-split", type=float, default=d.get("val_split", 0.05))
-    p.add_argument("--epochs", type=int, default=t.get("epochs", 90))
-    p.add_argument("--learning-rate", type=float, default=t.get("learning_rate", 3e-4))
-    p.add_argument("--weight-decay", type=float, default=t.get("weight_decay", 1e-4))
-    p.add_argument("--warmup-epochs", type=int, default=t.get("warmup_epochs", 3))
-    p.add_argument("--sparsity-weight", type=float, default=t.get("sparsity_weight", 1e-3))
-    p.add_argument("--dkl-weight", type=float, default=t.get("dkl_weight", 0.0))
+    p.add_argument("--data-root",   type=str,   default=d.get("data_root", "./data/celeba_hq"))
+    p.add_argument("--output-dir",  type=str,   default=o.get("output_dir", "./outputs/conv_topk_sae_ae_celeba_hq"))
+    p.add_argument("--image-size",  type=int,   default=d.get("image_size", 256))
+    p.add_argument("--batch-size",  type=int,   default=d.get("batch_size", 32))
+    p.add_argument("--num-workers", type=int,   default=d.get("num_workers", 8))
+    p.add_argument("--val-split",   type=float, default=d.get("val_split", 0.05))
+    p.add_argument("--epochs",      type=int,   default=t.get("epochs", 90))
+    p.add_argument("--learning-rate",   type=float, default=t.get("learning_rate", 3e-4))
+    p.add_argument("--weight-decay",    type=float, default=t.get("weight_decay", 1e-4))
+    p.add_argument("--warmup-epochs",   type=int,   default=t.get("warmup_epochs", 3))
+    p.add_argument("--auxk-weight",     type=float, default=t.get("auxk_weight", 0.01))
     p.add_argument("--decoder-max-norm", type=float, default=t.get("decoder_max_norm", 1.0))
-    p.add_argument("--save-every", type=int, default=t.get("save_every", 5))
-    p.add_argument("--seed", type=int, default=t.get("seed", 42))
+    p.add_argument("--save-every", type=int,  default=t.get("save_every", 5))
+    p.add_argument("--seed",       type=int,  default=t.get("seed", 42))
     p.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
     p.add_argument("--resume", type=str, default="")
     return p.parse_args(), m
 
 
 def main() -> None:
-    args, _mc = parse_args()
+    args, mc = parse_args()
     seed_everything(args.seed)
 
-    L = int(_mc.get("bottleneck_n_taxonomy_layers", 8))
-    run_suffix = f"_L{L}"
+    k = int(mc.get("topk_k", 64))
+    run_suffix = f"_k{k}"
     output_dir = Path(args.output_dir + run_suffix)
-    ckpt_dir = output_dir / "checkpoints"; preview_dir = output_dir / "previews"
+    ckpt_dir = output_dir / "checkpoints"
+    preview_dir = output_dir / "previews"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     preview_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,7 +154,7 @@ def main() -> None:
     tf = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
         transforms.ToTensor(),
-        transforms.Normalize((0.5,)*3, (0.5,)*3),
+        transforms.Normalize((0.5,) * 3, (0.5,) * 3),
     ])
     celeba_loader = CelebAHQLoader(
         data_root=args.data_root, batch_size=args.batch_size,
@@ -175,27 +166,14 @@ def main() -> None:
     if val_loader is None:
         raise RuntimeError("val_split must be > 0")
 
-    model = BottleneckJumpReLUTaxonAutoencoder(
-        in_channels=_mc.get("in_channels", 3),
-        plain_stage_channels=tuple(_mc.get("plain_stage_channels", [64, 128, 256])),
-        plain_stage_blocks=tuple(_mc.get("plain_stage_blocks", [2, 2, 2])),
-        plain_stage_strides=tuple(_mc.get("plain_stage_strides", [1, 2, 2])),
-        bottleneck_n_taxonomy_layers=L,
-        bottleneck_n_blocks=int(_mc.get("bottleneck_n_blocks", 2)),
-        bottleneck_stride=int(_mc.get("bottleneck_stride", 2)),
-        target_l0=float(_mc.get("target_l0", 8.0)),
-        bandwidth=float(_mc.get("bandwidth", 0.001)),
-        theta_init=float(_mc.get("theta_init", 0.05)),
-        l0_surrogate_temp=float(_mc.get("l0_surrogate_temp", 0.05)),
-        kernel_size=int(_mc.get("kernel_size", 3)),
-        use_stem=bool(_mc.get("use_stem", True)),
-        stem_channels=int(_mc.get("stem_channels", 64)),
-        stem_stride=int(_mc.get("stem_stride", 2)),
-        use_stem_maxpool=bool(_mc.get("use_stem_maxpool", True)),
-        output_activation=str(_mc.get("output_activation", "none")),
-        temperature=float(_mc.get("temperature", 0.5)),
-        hard=bool(_mc.get("hard", False)),
-        depth_decay=float(_mc.get("depth_decay", 0.5)),
+    model = ConvTopKSAEAutoencoder(
+        in_channels=int(mc.get("in_channels", 3)),
+        topk_k=k,
+        k_aux=mc.get("k_aux", None),
+        dead_steps=int(mc.get("dead_steps", 2000)),
+        output_activation=str(mc.get("output_activation", "none")),
+        use_batch_topk=bool(mc.get("use_batch_topk", True)),
+        warmup_steps=int(mc.get("warmup_steps", 5000)),
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate,
@@ -214,71 +192,62 @@ def main() -> None:
         best_val = float(state.get("best_val", float("inf")))
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Bottleneck JumpReLU Taxon AE: device={device} n_params={n_params:,} L={L} "
-          f"latent_ch={model.encoder.final_channels} target_l0={_mc.get('target_l0', 8.0)} "
-          f"batch={args.batch_size} epochs={args.epochs} output={output_dir}")
+    print(f"Conv TopK SAE AE: device={device} n_params={n_params:,} k={k} "
+          f"latent_ch={model.latent_channels} batch={args.batch_size} "
+          f"epochs={args.epochs} output={output_dir}")
 
     history = {"epochs": [],
-               "train_loss": [], "train_recon": [], "train_sparsity": [],
-               "train_dead": [], "train_dkl": [], "train_l0": [],
-               "val_loss": [], "val_recon": [], "val_sparsity": [],
-               "val_dead": [], "val_dkl": [], "val_l0": []}
+               "train_loss": [], "train_recon": [], "train_auxk": [], "train_dead": [],
+               "val_loss":   [], "val_recon":   [], "val_auxk":   [], "val_dead":   []}
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
-        running = {k: 0.0 for k in ("loss", "recon", "sparsity", "dead", "dkl", "l0")}
+        running = {k: 0.0 for k in ("loss", "recon", "auxk", "dead")}
         nb = 0
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            recon, info = model(images)
+            recon, dead_frac, _ = model(images)
             recon_loss = F.mse_loss(recon, images)
-            sparsity = info["sparsity"]
-            dkl = info["dkl"]
-            loss = recon_loss + args.sparsity_weight*sparsity + args.dkl_weight*dkl
+            auxk_loss = model.compute_auxk_loss(images, recon)
+            loss = recon_loss + args.auxk_weight * auxk_loss
             loss.backward()
-            optimizer.step(); scheduler.step()
+            optimizer.step()
+            scheduler.step()
             if args.decoder_max_norm > 0:
                 with torch.no_grad():
-                    for module in model.decoder.modules():
-                        if isinstance(module, nn.Conv2d) and module.weight.requires_grad:
+                    for module in model.decoder_net.modules():
+                        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)) and module.weight.requires_grad:
                             w = module.weight
                             norms = w.flatten(1).norm(dim=1, keepdim=True).clamp(min=1e-8)
                             scale = norms.clamp(min=args.decoder_max_norm) / args.decoder_max_norm
                             module.weight.div_(scale.view(-1, 1, 1, 1))
-            running["loss"] += float(loss.item()); running["recon"] += float(recon_loss.item())
-            running["sparsity"] += float(sparsity.item())
-            running["dead"] += float(info["dead_frac"].item())
-            running["dkl"] += float(dkl.item())
-            running["l0"] += float(info["l0_hat"].item())
+            running["loss"] += float(loss); running["recon"] += float(recon_loss)
+            running["auxk"] += float(auxk_loss); running["dead"] += float(dead_frac)
             nb += 1; global_step += 1
             if batch_idx % 50 == 0:
-                avg = {k: v/nb for k, v in running.items()}
+                avg = {k: v / nb for k, v in running.items()}
                 lr = optimizer.param_groups[0]["lr"]
                 print(f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
                       f"lr={lr:.3e} loss={avg['loss']:.5f} recon={avg['recon']:.5f} "
-                      f"l0={avg['l0']:.2f} sparsity={avg['sparsity']:.3f} "
-                      f"dead={avg['dead']:.3f}")
+                      f"auxk={avg['auxk']:.5f} dead={avg['dead']:.3f}")
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                 break
 
-        train_stats = {k: v/max(1, nb) for k, v in running.items()}
-        val_stats = run_validation(model, val_loader, device,
-                                   args.sparsity_weight, args.dkl_weight)
+        train_stats = {k: v / max(1, nb) for k, v in running.items()}
+        val_stats = run_validation(model, val_loader, device, args.auxk_weight)
         elapsed = time.time() - epoch_start
         print(f"epoch={epoch:03d} time={elapsed:.1f}s "
               f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
-              f"val_l0={val_stats['l0']:.2f} dead={val_stats['dead_frac']:.3f}")
+              f"dead={val_stats['dead_frac']:.3f}")
 
         history["epochs"].append(epoch)
         for split, stats in (("train", train_stats), ("val", val_stats)):
             history[f"{split}_loss"].append(stats["loss"])
             history[f"{split}_recon"].append(stats["recon"])
-            history[f"{split}_sparsity"].append(stats["sparsity"])
+            history[f"{split}_auxk"].append(stats["auxk"])
             history[f"{split}_dead"].append(stats.get("dead", stats.get("dead_frac", 0.0)))
-            history[f"{split}_dkl"].append(stats.get("dkl", 0.0))
-            history[f"{split}_l0"].append(stats.get("l0", 0.0))
 
         state = {"epoch": epoch, "global_step": global_step,
                  "model_state": model.state_dict(),
@@ -292,8 +261,7 @@ def main() -> None:
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]; state["best_val"] = best_val
             torch.save(state, ckpt_dir / "best.pt")
-        save_recon_preview(model, val_loader, device,
-                           preview_dir / f"epoch_{epoch:03d}.png")
+        save_recon_preview(model, val_loader, device, preview_dir / f"epoch_{epoch:03d}.png")
         if args.max_train_steps > 0 and global_step >= args.max_train_steps:
             break
 

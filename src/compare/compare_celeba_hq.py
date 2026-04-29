@@ -76,6 +76,8 @@ from src.model.cnn.baseline.matryoshka_intermediate_topk_sae import (
 )
 from src.model.cnn.baseline.softmax_sae import SoftmaxSparseConvAutoencoder
 from src.model.cnn.baseline.baseline_ae import BaselineConvAutoencoder
+from src.model.cnn.conv_topk_sae_ae import ConvTopKSAEAutoencoder
+from src.model.cnn.conv_bottleneck_topk_taxon_ae import ConvBottleneckTopKTaxonAutoencoder
 from src.utils.dataloader import CelebAHQLoader
 from torchvision import transforms  # noqa: F401 (used in transform construction)
 
@@ -188,6 +190,10 @@ def model_colour(run_name: str, model_type: str, idx_within_type: int) -> str:
     if model_type == "matryoshka_batch_topk_sae":
         _MAT_PALETTE = ["#1a9850", "#66c2a5", "#abdda4"]
         return _MAT_PALETTE[idx_within_type % len(_MAT_PALETTE)]
+    if model_type == "conv_topk_sae":
+        return ["#e6550d", "#fd8d3c", "#fdae6b"][idx_within_type % 3]
+    if model_type == "conv_bottleneck_topk_taxon":
+        return ["#084081", "#0868ac", "#2b8cbe"][idx_within_type % 3]
     if model_type == "softmax_sae":
         _SOFTMAX_PALETTE = ["#f4a261", "#e76f51", "#e9c46a"]
         return _SOFTMAX_PALETTE[idx_within_type % len(_SOFTMAX_PALETTE)]
@@ -213,7 +219,9 @@ def _short_name(run_dir: str, version: str = "") -> str:
     """Make a readable short name for plot labels."""
     mtype = _model_type(run_dir)
     n = run_dir
-    for prefix in ("bottleneck_topk_multi_taxon_ae_celeba_hq_r18_",
+    for prefix in ("conv_bottleneck_topk_taxon_ae_celeba_hq_",
+                   "conv_topk_sae_ae_celeba_hq_",
+                   "bottleneck_topk_multi_taxon_ae_celeba_hq_r18_",
                    "bottleneck_topk_taxon_ae_celeba_hq_r18_",
                    "bottleneck_multi_taxon_ae_celeba_hq_r18_",
                    "bottleneck_taxon_ae_celeba_hq_r18_",
@@ -239,6 +247,10 @@ def _short_name(run_dir: str, version: str = "") -> str:
 
 
 def _model_type(run_dir: str) -> str:
+    if run_dir.startswith("conv_bottleneck_topk_taxon_"):
+        return "conv_bottleneck_topk_taxon"
+    if run_dir.startswith("conv_topk_sae_"):
+        return "conv_topk_sae"
     if run_dir.startswith("bottleneck_topk_multi_taxon_"):
         return "bottleneck_topk_multi_taxon"
     if run_dir.startswith("bottleneck_topk_taxon_"):
@@ -848,6 +860,7 @@ def load_bottleneck_jumprelu_taxon_model(
         target_l0=a.get("target_l0", mcfg.get("target_l0", 8.0)),
         bandwidth=a.get("bandwidth", mcfg.get("bandwidth", 0.001)),
         theta_init=a.get("theta_init", mcfg.get("theta_init", 0.05)),
+        l0_surrogate_temp=a.get("l0_surrogate_temp", mcfg.get("l0_surrogate_temp", 0.05)),
         kernel_size=a.get("kernel_size", mcfg.get("kernel_size", 3)),
         use_stem=a.get("use_stem", mcfg.get("use_stem", True)),
         stem_channels=a.get("stem_channels", mcfg.get("stem_channels", 64)),
@@ -859,6 +872,58 @@ def load_bottleneck_jumprelu_taxon_model(
         depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
     )
     model.load_state_dict(ckpt["model_state"], strict=False)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_conv_topk_sae_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[ConvTopKSAEAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    model = ConvTopKSAEAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        topk_k=a.get("topk_k", mcfg.get("topk_k", 64)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device).eval()
+    return model, ckpt
+
+
+def load_conv_bottleneck_topk_taxon_model(
+    ckpt_path: Path, device: torch.device,
+) -> Tuple[ConvBottleneckTopKTaxonAutoencoder, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    a = ckpt.get("args", {})
+    mcfg = _model_cfg_from_config(a.get("config", ""))
+    bn_layers = a.get("bottleneck_n_taxonomy_layers") or mcfg.get("bottleneck_n_taxonomy_layers", 9)
+    model = ConvBottleneckTopKTaxonAutoencoder(
+        in_channels=a.get("in_channels", mcfg.get("in_channels", 3)),
+        bottleneck_n_taxonomy_layers=bn_layers,
+        bottleneck_n_blocks=a.get("bottleneck_n_blocks", mcfg.get("bottleneck_n_blocks", 1)),
+        topk_k_multiplier=a.get("topk_k_multiplier", mcfg.get("topk_k_multiplier", 1.0)),
+        k_aux=a.get("k_aux", mcfg.get("k_aux", None)),
+        dead_steps=a.get("dead_steps", mcfg.get("dead_steps", 2000)),
+        temperature=a.get("temperature", mcfg.get("temperature", 0.5)),
+        hard=a.get("hard", mcfg.get("hard", False)),
+        depth_decay=a.get("depth_decay", mcfg.get("depth_decay", 0.5)),
+        use_batch_topk=a.get("use_batch_topk", mcfg.get("use_batch_topk", True)),
+        warmup_steps=a.get("warmup_steps", mcfg.get("warmup_steps", 0)),
+        output_activation=a.get("output_activation", mcfg.get("output_activation", "none")),
+        k_leaves=a.get("k_leaves", mcfg.get("k_leaves", 0)),
+        use_gate_value=a.get("use_gate_value", mcfg.get("use_gate_value", False)),
+    )
+    model.load_state_dict(ckpt["model_state"], strict=False)
+    if not any("topk_norm_weights" in k for k in ckpt["model_state"]):
+        for name, buf in model.named_buffers():
+            if "topk_norm_weights" in name:
+                buf.fill_(1.0)
     model.to(device).eval()
     return model, ckpt
 
@@ -969,6 +1034,10 @@ def load_baseline_model(ckpt_path: Path, device: torch.device) -> Tuple[Baseline
 
 
 def load_model(run: Dict, device: torch.device):
+    if run["type"] == "conv_topk_sae":
+        return load_conv_topk_sae_model(run["best_ckpt"], device)
+    if run["type"] == "conv_bottleneck_topk_taxon":
+        return load_conv_bottleneck_topk_taxon_model(run["best_ckpt"], device)
     if run["type"] == "bottleneck_topk_multi_taxon":
         return load_bottleneck_topk_multi_taxon_model(run["best_ckpt"], device)
     if run["type"] == "bottleneck_taxon":
@@ -1024,6 +1093,10 @@ def compute_live_metrics(
             recon, _, _, _, _ = model(imgs)
         elif run["type"] in ("topk_taxon", "topk_multi_taxon", "bottleneck_topk_multi_taxon",
                               "bottleneck_topk_taxon"):
+            recon, _ = model(imgs)
+        elif run["type"] == "conv_bottleneck_topk_taxon":
+            recon, _, _ = model(imgs)
+        elif run["type"] == "conv_topk_sae":
             recon, _ = model(imgs)
         elif run["type"] == "bottleneck_jumprelu_taxon":
             recon, _ = model(imgs)

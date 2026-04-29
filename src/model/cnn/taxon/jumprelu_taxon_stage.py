@@ -9,9 +9,24 @@ Each output channel has its own learnable threshold ``θ_c = exp(log_theta_c)``:
 
     latent_c = relu(z_c) · H(z_c − θ_c)
 
-with a Straight-Through Estimator for the gradient through the Heaviside
-step (Rajamanoharan et al. 2024 — "Jumping Ahead").  Sparsity is encouraged
-by penalising ``(L̂₀ − target_l0)²``.
+The forward path uses the sharp Heaviside step (preserves true L0 sparsity
+at inference) via :class:`_JumpReLUActivation` (Rajamanoharan et al. 2024
+"Jumping Ahead" — STE rectangle-kernel gradient through θ for the *activation*
+path).
+
+For the **L0 sparsity penalty** we deliberately do *not* use the rectangle-
+kernel STE surrogate from the SAE encoder.  That surrogate has zero gradient
+on ``log_theta`` for any channel whose pre-activation is more than
+``bandwidth/2`` away from the current threshold, which leads to threshold
+freezing: live channels (z ≫ θ) cannot have their threshold raised, and dead
+channels (z ≪ θ) cannot have it lowered.  Instead we use a temperature-
+scaled **sigmoid surrogate** that is differentiable everywhere::
+
+    L̂₀_soft = mean_{b,h,w} Σ_c σ((z_c − θ_c) / τ)
+
+This gradient pushes ``θ`` up wherever ``z`` is large (when above target) and
+down wherever ``z`` is small (when below target), so the L0 budget is
+actually enforced.
 
 The pre-activation ``z`` is the routing-gated taxon output
 ``logits * prob * depth_scales`` (same as in the TopK variant).
@@ -26,7 +41,7 @@ import torch
 import torch.nn as nn
 
 from .encoder import ResidualConvBlock
-from ..baseline.jumprelu_sae_encoder import _JumpReLUActivation, _L0SurrogateFunction
+from ..baseline.jumprelu_sae_encoder import _JumpReLUActivation
 
 
 class JumpReLUTaxonResNetStage(nn.Module):
@@ -39,7 +54,7 @@ class JumpReLUTaxonResNetStage(nn.Module):
       * ``depth_decay``-weighted local entropy / coverage_kl regularisers
 
     The TopK + AuxK + dead-node tracking are replaced by a per-channel
-    learned threshold ``θ_c`` (JumpReLU).
+    learned threshold ``θ_c`` (JumpReLU) with a sigmoid L0 surrogate.
     """
 
     def __init__(
@@ -52,6 +67,7 @@ class JumpReLUTaxonResNetStage(nn.Module):
         target_l0: float = 8.0,
         bandwidth: float = 0.001,
         theta_init: float = 0.05,
+        l0_surrogate_temp: float = 1.0,
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
@@ -70,6 +86,7 @@ class JumpReLUTaxonResNetStage(nn.Module):
         self.target_l0 = float(target_l0)
         self.bandwidth = float(bandwidth)
         self.theta_init = float(theta_init)
+        self.l0_surrogate_temp = float(l0_surrogate_temp)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -178,7 +195,12 @@ class JumpReLUTaxonResNetStage(nn.Module):
             log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
-            out = logits * prob * self.depth_scales[depth_idx]
+            # Same prob floor as TopKTaxonResNetStage (BUGFIX 5): without this,
+            # deep-node pre-activations are attenuated by ~2^-(d+1), so JumpReLU
+            # thresholds settle above them and all deep channels die permanently.
+            floor_d = 0.5 ** (depth_idx + 1)
+            prob_gated = prob.clamp(min=floor_d)
+            out = logits * prob_gated * self.depth_scales[depth_idx]
 
             entropy_i, dkl_i = self._regularization_terms(prob, logp)
             depth_weight = self.depth_decay ** depth_idx
@@ -192,9 +214,49 @@ class JumpReLUTaxonResNetStage(nn.Module):
         cat_output = torch.cat(outputs, dim=1)
 
         # ── JumpReLU sparsity ─────────────────────────────────────────────
+        # Clamp log_theta to a finite range to prevent runaway thresholds
+        # (causes exp() overflow / val-loss explosion when the sparsity term
+        # transiently dominates).  Clamp is differentiable in the interior;
+        # outside it the gradient is zero, which is fine because we *want*
+        # to keep θ inside this band.
+        log_theta_c = self.log_theta.clamp(-10.0, 5.0)
+        theta = log_theta_c.exp().view(1, -1, 1, 1)
+
+        # Forward path: sharp Heaviside step, true L0 sparsity at inference.
+        # Note: _JumpReLUActivation reads its own log_theta param; pass the
+        # unclamped one (clamp range is wide enough that this is consistent).
         latent = _JumpReLUActivation.apply(cat_output, self.log_theta, self.bandwidth)
-        l0_hat = _L0SurrogateFunction.apply(cat_output, self.log_theta, self.bandwidth)
-        sparsity = (l0_hat - self.target_l0) ** 2
+
+        # Diagnostics: true (non-differentiable) L0 count for logging.
+        with torch.no_grad():
+            l0_true = (cat_output > theta).float().sum(dim=1).mean()
+
+        # L0 surrogate for the sparsity penalty.  Two design choices critical
+        # for stability:
+        #   1. **Wide sigmoid (τ ≳ 1):** σ' is non-negligible far from θ, so
+        #      gradients flow to *dead* channels (z ≪ θ) and they can be
+        #      revived by lowering θ.  Narrow τ (e.g. 0.1) recreates the
+        #      rectangle-STE dead-zone problem in disguise.
+        #   2. **Linear hinge above target:** penalize only when over-budget.
+        #      A quadratic ``(l0_soft − target)²`` term has loss ~250 000 at
+        #      init (l0_soft ≈ N_channels) and dominates recon by 10³, so
+        #      the optimizer slams every threshold up and kills the network.
+        #      With a hinge, once l0_soft ≤ target the sparsity gradient is
+        #      zero and the recon loss alone pulls thresholds back down,
+        #      automatically reviving over-suppressed channels.
+        l0_soft = torch.sigmoid(
+            (cat_output - theta) / self.l0_surrogate_temp
+        ).sum(dim=1).mean()
+        # Asymmetric hinge: strong push down when over-budget, weak push up
+        # when under-budget.  The under-budget term is necessary because
+        # _JumpReLUActivation's rectangle STE provides ZERO recon-gradient on
+        # θ for dead channels (|z−θ| ≫ bandwidth/2), so the recon loss alone
+        # cannot revive them.  The wide sigmoid (τ=1) does have gradient on
+        # dead channels, so a small revival weight is enough to gradually
+        # lower θ for any channel that has been killed.
+        over = torch.relu(l0_soft - self.target_l0)
+        under = torch.relu(self.target_l0 - l0_soft)
+        sparsity = over + 0.05 * under
 
         # Dead-frac = fraction of channels that never fire over the batch.
         with torch.no_grad():
@@ -208,7 +270,8 @@ class JumpReLUTaxonResNetStage(nn.Module):
                 "entropy": total_entropy,
                 "dkl": total_dkl,
                 "dead_frac": dead_frac,
-                "l0_hat": l0_hat,
+                "l0_hat": l0_true,
+                "l0_soft": l0_soft.detach(),
                 "sparsity": sparsity,
             },
         )
