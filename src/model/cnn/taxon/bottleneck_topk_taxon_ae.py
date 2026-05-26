@@ -44,6 +44,8 @@ class BottleneckTopKTaxonAutoencoder(nn.Module):
         warmup_steps: int = 0,
         k_leaves: int = 0,
         use_gate_value: bool = False,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__()
         self.output_activation = output_activation.lower()
@@ -73,6 +75,8 @@ class BottleneckTopKTaxonAutoencoder(nn.Module):
             out_channels=in_channels,
             k_leaves=k_leaves,
             use_gate_value=use_gate_value,
+            gumbel=gumbel,
+            resample_min_count=resample_min_count,
         )
         self.decoder = TaxonResNetDecoder(
             latent_channels=self.encoder.final_channels,
@@ -90,6 +94,13 @@ class BottleneckTopKTaxonAutoencoder(nn.Module):
 
     def decode(self, z, output_size=None, return_details=False):
         return self.decoder(z, output_size=output_size, return_details=return_details)
+
+    def set_tau(self, tau: float) -> None:
+        """Forward tau update to bottleneck stage (used by trainer for annealing)."""
+        self.encoder.bottleneck_stage.set_tau(tau)
+
+    def maybe_resample_dead_leaves(self) -> int:
+        return self.encoder.bottleneck_stage.maybe_resample_dead_leaves()
 
     def _apply_output_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.output_activation == "tanh":

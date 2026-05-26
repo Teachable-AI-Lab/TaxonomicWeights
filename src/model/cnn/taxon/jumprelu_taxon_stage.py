@@ -71,6 +71,8 @@ class JumpReLUTaxonResNetStage(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -87,6 +89,8 @@ class JumpReLUTaxonResNetStage(nn.Module):
         self.bandwidth = float(bandwidth)
         self.theta_init = float(theta_init)
         self.l0_surrogate_temp = float(l0_surrogate_temp)
+        self.gumbel = bool(gumbel)
+        self.resample_min_count = int(resample_min_count)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -114,6 +118,17 @@ class JumpReLUTaxonResNetStage(nn.Module):
             torch.full((self.total_out_channels,), init_log)
         )
 
+        # Per-leaf activation count (rolling, reset by maybe_resample_dead_leaves).
+        n_leaves = 1 << self.n_taxonomy_layers
+        self.register_buffer(
+            "_leaf_count", torch.zeros(n_leaves, dtype=torch.long)
+        )
+
+    # ------------------------------------------------------------------ tau
+    def set_tau(self, tau: float) -> None:
+        """External temperature override (used by trainer for tau annealing)."""
+        self.temperature = float(tau)
+
     @staticmethod
     def output_channels(n_taxonomy_layers: int) -> int:
         return (1 << (n_taxonomy_layers + 1)) - 2
@@ -140,7 +155,13 @@ class JumpReLUTaxonResNetStage(nn.Module):
         tau: Optional[float] = None,
         hard: Optional[bool] = None,
         eps: float = 1e-8,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (log_cond_probs [B,C,H,W], soft_pair [B,n_pairs,2,H,W], hard_pair).
+
+        Soft and hard probabilities are returned in pair-shaped form for use in
+        the Switch-Transformer balance loss.  ``log_cond_probs`` is what the
+        rest of the forward pass consumes (with optional STE if ``hard``).
+        """
         if tau is None:
             tau = self.temperature
         if hard is None:
@@ -153,16 +174,23 @@ class JumpReLUTaxonResNetStage(nn.Module):
 
         bsz, channels, h, w = logits.shape
         pair_logits = logits.view(bsz, channels // 2, 2, h, w)
-        y_soft = torch.softmax(pair_logits / tau, dim=2)
+        if self.gumbel and self.training:
+            u = torch.rand_like(pair_logits).clamp_(1e-9, 1.0 - 1e-9)
+            g = -torch.log(-torch.log(u))
+            y_soft = torch.softmax((pair_logits + g) / tau, dim=2)
+        else:
+            y_soft = torch.softmax(pair_logits / tau, dim=2)
+
+        argmax = y_soft.argmax(dim=2, keepdim=True)
+        y_hard = torch.zeros_like(pair_logits).scatter_(2, argmax, 1.0)
 
         if hard:
-            argmax = y_soft.argmax(dim=2, keepdim=True)
-            y_hard = torch.zeros_like(pair_logits).scatter_(2, argmax, 1.0)
             probs = y_hard - y_soft.detach() + y_soft
         else:
             probs = y_soft
 
-        return probs.clamp_min(eps).log().view(bsz, channels, h, w)
+        log_cond = probs.clamp_min(eps).log().view(bsz, channels, h, w)
+        return log_cond, y_soft, y_hard
 
     def _regularization_terms(
         self,
@@ -189,12 +217,28 @@ class JumpReLUTaxonResNetStage(nn.Module):
 
         total_entropy = x.new_zeros(())
         total_dkl = x.new_zeros(())
+        balance_terms: List[torch.Tensor] = []
 
         routing_per_depth = self._taxon_logits_per_depth(x)
         for depth_idx, logits in enumerate(routing_per_depth):
-            log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
+            log_cond, soft_pair, hard_pair = self._pairwise_log_softmax(
+                logits, tau=self.temperature, hard=hard
+            )
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
+
+            # Switch-style balance loss restricted to ancestor-active pairs.
+            # Ancestor weight per child = parent's cumulative prob (shape
+            # [B, C_d, H, W] obtained by repeat_interleave on prev.exp()).
+            if prev is None:
+                anc_pair = torch.ones_like(soft_pair)
+            else:
+                anc = prev.exp().repeat_interleave(2, dim=1)
+                anc_pair = anc.view_as(soft_pair)
+            denom = anc_pair.sum(dim=(0, 3, 4)).clamp_min(1.0)  # [n_pairs, 2]
+            p_mean = (soft_pair * anc_pair).sum(dim=(0, 3, 4)) / denom
+            f_mean = (hard_pair * anc_pair).sum(dim=(0, 3, 4)) / denom
+            balance_terms.append((2.0 * (f_mean * p_mean).sum(dim=-1)).mean())
             # Same prob floor as TopKTaxonResNetStage (BUGFIX 5): without this,
             # deep-node pre-activations are attenuated by ~2^-(d+1), so JumpReLU
             # thresholds settle above them and all deep channels die permanently.
@@ -212,6 +256,23 @@ class JumpReLUTaxonResNetStage(nn.Module):
             prev = logp
 
         cat_output = torch.cat(outputs, dim=1)
+
+        # Deepest-depth leaf assignment for dead-leaf bookkeeping.
+        if logps:
+            with torch.no_grad():
+                leaf_idx = logps[-1].argmax(dim=1)  # [B, H, W]
+                if self.training:
+                    n_leaves = 1 << self.n_taxonomy_layers
+                    counts = torch.bincount(
+                        leaf_idx.reshape(-1), minlength=n_leaves
+                    )
+                    self._leaf_count += counts
+
+        balance_loss = (
+            torch.stack(balance_terms).mean()
+            if balance_terms
+            else cat_output.new_zeros(())
+        )
 
         # ── JumpReLU sparsity ─────────────────────────────────────────────
         # Clamp log_theta to a finite range to prevent runaway thresholds
@@ -273,8 +334,73 @@ class JumpReLUTaxonResNetStage(nn.Module):
                 "l0_hat": l0_true,
                 "l0_soft": l0_soft.detach(),
                 "sparsity": sparsity,
+                "balance_loss": balance_loss,
             },
         )
+
+    # ----------------------------------------------------------- resampling
+    @torch.no_grad()
+    def maybe_resample_dead_leaves(self) -> int:
+        """Re-initialise final-block conv rows for paths to dead leaves.
+
+        A leaf is "dead" if it was selected fewer than ``self.resample_min_count``
+        times since the last reset.  For each dead leaf, we reset the rows of
+        the final ResidualConvBlock's last Conv2d that correspond to every
+        ancestor channel along the leaf's path; this breaks the symmetry that
+        let the leaf collapse, without disturbing live leaves.  The leaf-count
+        buffer is zeroed afterwards.  Returns the number of resampled leaves.
+        """
+        if self.resample_min_count <= 0:
+            return 0
+        counts = self._leaf_count
+        dead = (counts < self.resample_min_count).nonzero(as_tuple=False).flatten()
+        n_dead = int(dead.numel())
+        if n_dead == 0:
+            self._leaf_count.zero_()
+            return 0
+
+        # Locate the final conv with full output_channels = total_out_channels.
+        final_block = self.blocks[-1]
+        final_conv: Optional[nn.Conv2d] = None
+        for m in reversed(list(final_block.main)):
+            if isinstance(m, nn.Conv2d) and m.out_channels == self.total_out_channels:
+                final_conv = m
+                break
+        if final_conv is None:
+            self._leaf_count.zero_()
+            return 0
+
+        L = self.n_taxonomy_layers
+        offset = 0
+        # Map (depth, leaf_idx) -> absolute channel index in the catted output.
+        for d in range(L):
+            n_d = 1 << (d + 1)
+            shift = (L - 1 - d)
+            ancestors = (dead >> shift).unique()  # nodes at depth d under any dead leaf
+            for node in ancestors.tolist():
+                ch = offset + int(node)
+                # Kaiming-fan-in re-init for this output channel only.
+                fan_in = final_conv.weight.shape[1] * final_conv.weight.shape[2] * final_conv.weight.shape[3]
+                std = (2.0 / fan_in) ** 0.5
+                final_conv.weight.data[ch].normal_(0.0, std)
+            offset += n_d
+
+        # Also lower θ for the dead-leaf path channels so JumpReLU can fire again.
+        offset = 0
+        for d in range(L):
+            n_d = 1 << (d + 1)
+            shift = (L - 1 - d)
+            ancestors = (dead >> shift).unique()
+            for node in ancestors.tolist():
+                ch = offset + int(node)
+                # Reset to initial threshold (typically very small).
+                self.log_theta.data[ch] = float(
+                    torch.tensor(self.theta_init).log().item()
+                )
+            offset += n_d
+
+        self._leaf_count.zero_()
+        return n_dead
 
 
 __all__ = ["JumpReLUTaxonResNetStage"]

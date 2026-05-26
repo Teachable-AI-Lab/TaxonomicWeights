@@ -880,6 +880,8 @@ class TopKTaxonResNetStage(nn.Module):
         out_channels: int = 3,
         k_leaves: int = 0,
         use_gate_value: bool = False,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__()
         if n_taxonomy_layers < 1:
@@ -896,6 +898,8 @@ class TopKTaxonResNetStage(nn.Module):
         self.use_gate_value = bool(use_gate_value)
         self.warmup_steps = int(warmup_steps)
         self.k_leaves = int(k_leaves)
+        self.gumbel = bool(gumbel)
+        self.resample_min_count = int(resample_min_count)
 
         self.layer_channels: List[int] = [1 << (i + 1) for i in range(self.n_taxonomy_layers)]
         self.total_out_channels = self.output_channels(self.n_taxonomy_layers)
@@ -963,6 +967,17 @@ class TopKTaxonResNetStage(nn.Module):
         # Change G: progressive warm-up step counter.
         self.register_buffer("_warmup_step", torch.zeros(1, dtype=torch.long))
 
+        # Per-leaf activation count (rolling, reset by maybe_resample_dead_leaves).
+        n_leaves = 1 << self.n_taxonomy_layers
+        self.register_buffer(
+            "_leaf_count", torch.zeros(n_leaves, dtype=torch.long)
+        )
+
+    # ------------------------------------------------------------------ tau
+    def set_tau(self, tau: float) -> None:
+        """External temperature override (used by trainer for tau annealing)."""
+        self.temperature = float(tau)
+
     @staticmethod
     def output_channels(n_taxonomy_layers: int) -> int:
         return (1 << (n_taxonomy_layers + 1)) - 2
@@ -989,6 +1004,26 @@ class TopKTaxonResNetStage(nn.Module):
         hard: Optional[bool] = None,
         eps: float = 1e-8,
     ) -> torch.Tensor:
+        log_cond, _, _ = self._pairwise_log_softmax_full(
+            logits, tau=tau, hard=hard, eps=eps, allow_gumbel=False,
+        )
+        return log_cond
+
+    def _pairwise_log_softmax_full(
+        self,
+        logits: torch.Tensor,
+        tau: Optional[float] = None,
+        hard: Optional[bool] = None,
+        eps: float = 1e-8,
+        allow_gumbel: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (log_cond [B,C,H,W], soft_pair [B,n_pairs,2,H,W], hard_pair).
+
+        Used by ``forward`` to also produce the soft / hard pair tensors needed
+        for the Switch-Transformer balance loss.  The compatibility wrapper
+        ``_pairwise_log_softmax`` (used by AuxK) discards the pair tensors and
+        suppresses Gumbel noise so AuxK behaviour is unchanged.
+        """
         if tau is None:
             tau = self.temperature
         if hard is None:
@@ -1001,16 +1036,23 @@ class TopKTaxonResNetStage(nn.Module):
 
         bsz, channels, h, w = logits.shape
         pair_logits = logits.view(bsz, channels // 2, 2, h, w)
-        y_soft = torch.softmax(pair_logits / tau, dim=2)
+        if allow_gumbel and self.gumbel and self.training:
+            u = torch.rand_like(pair_logits).clamp_(1e-9, 1.0 - 1e-9)
+            g = -torch.log(-torch.log(u))
+            y_soft = torch.softmax((pair_logits + g) / tau, dim=2)
+        else:
+            y_soft = torch.softmax(pair_logits / tau, dim=2)
+
+        argmax = y_soft.argmax(dim=2, keepdim=True)
+        y_hard = torch.zeros_like(pair_logits).scatter_(2, argmax, 1.0)
 
         if hard:
-            argmax = y_soft.argmax(dim=2, keepdim=True)
-            y_hard = torch.zeros_like(pair_logits).scatter_(2, argmax, 1.0)
             probs = y_hard - y_soft.detach() + y_soft
         else:
             probs = y_soft
 
-        return probs.clamp_min(eps).log().view(bsz, channels, h, w)
+        log_cond = probs.clamp_min(eps).log().view(bsz, channels, h, w)
+        return log_cond, y_soft, y_hard
 
     def _regularization_terms(
         self,
@@ -1044,6 +1086,7 @@ class TopKTaxonResNetStage(nn.Module):
 
         total_entropy = x.new_zeros(())
         total_dkl = x.new_zeros(())
+        balance_terms: List[torch.Tensor] = []
 
         routing_per_depth = self._taxon_logits_per_depth(x)
         if self.use_gate_value:
@@ -1052,7 +1095,9 @@ class TopKTaxonResNetStage(nn.Module):
             value_per_depth = list(torch.split(value_feats, self.layer_channels, dim=1))
 
         for depth_idx, logits in enumerate(routing_per_depth):
-            log_cond = self._pairwise_log_softmax(logits, tau=self.temperature, hard=hard)
+            log_cond, soft_pair, hard_pair = self._pairwise_log_softmax_full(
+                logits, tau=self.temperature, hard=hard, allow_gumbel=True,
+            )
             logp = log_cond if prev is None else log_cond + prev.repeat_interleave(2, dim=1)
             prob = logp.exp()
             # BUGFIX 5 (prob floor): Without a floor, a dead channel at depth d
@@ -1077,6 +1122,20 @@ class TopKTaxonResNetStage(nn.Module):
             depth_weight = self.depth_decay ** depth_idx
             total_entropy = total_entropy + depth_weight * entropy_i
             total_dkl = total_dkl + depth_weight * dkl_i
+
+            # Switch-style balance loss: importance (mean soft prob) x load
+            # (mean hard routed fraction), per pair, restricted to ancestor-
+            # active pairs.  Ancestor weight per child = parent's cumulative
+            # prob (uniform 1.0 at depth 0).
+            if prev is None:
+                anc_pair = torch.ones_like(soft_pair)
+            else:
+                anc = prev.exp().repeat_interleave(2, dim=1)
+                anc_pair = anc.view_as(soft_pair)
+            denom = anc_pair.sum(dim=(0, 3, 4)).clamp_min(1.0)
+            p_mean = (soft_pair * anc_pair).sum(dim=(0, 3, 4)) / denom
+            f_mean = (hard_pair * anc_pair).sum(dim=(0, 3, 4)) / denom
+            balance_terms.append((2.0 * (f_mean * p_mean).sum(dim=-1)).mean())
 
             all_probs.append(prob)
             outputs.append(out)
@@ -1143,13 +1202,88 @@ class TopKTaxonResNetStage(nn.Module):
             self._steps_since_active[any_active] = 0
             self._steps_since_active[~any_active] += 1
 
+            # Per-leaf bookkeeping for resampling: argmax over the deepest
+            # cumulative log-prob gives the chosen root-to-leaf path.
+            if logps:
+                with torch.no_grad():
+                    leaf_idx = logps[-1].argmax(dim=1)  # [B, H, W]
+                    n_leaves = 1 << self.n_taxonomy_layers
+                    counts = torch.bincount(
+                        leaf_idx.reshape(-1), minlength=n_leaves
+                    )
+                    self._leaf_count += counts
+
         dead_frac = (self._steps_since_active >= self.dead_steps).float().mean()
+
+        balance_loss = (
+            torch.stack(balance_terms).mean()
+            if balance_terms
+            else cat_output.new_zeros(())
+        )
 
         return (
             cat_output,
             torch.cat(logps, dim=1),
-            {"entropy": total_entropy, "dkl": total_dkl, "dead_frac": dead_frac},
+            {
+                "entropy": total_entropy,
+                "dkl": total_dkl,
+                "dead_frac": dead_frac,
+                "balance_loss": balance_loss,
+            },
         )
+
+    # ----------------------------------------------------------- resampling
+    @torch.no_grad()
+    def maybe_resample_dead_leaves(self) -> int:
+        """Re-init final-block conv rows for paths to dead leaves.
+
+        A leaf is "dead" if it was selected fewer than ``self.resample_min_count``
+        times since the last reset.  For each dead leaf, we Kaiming-re-init the
+        rows of the final ResidualConvBlock's last Conv2d for every ancestor
+        channel along that leaf's path, breaking the symmetry that let the leaf
+        collapse without disturbing live leaves.  Also resets the per-channel
+        ``_steps_since_active`` counter for those channels so AuxK does not
+        immediately treat them as dead again.  The leaf-count buffer is zeroed.
+        Returns the number of resampled leaves.
+        """
+        if self.resample_min_count <= 0:
+            return 0
+        counts = self._leaf_count
+        dead = (counts < self.resample_min_count).nonzero(as_tuple=False).flatten()
+        n_dead = int(dead.numel())
+        if n_dead == 0:
+            self._leaf_count.zero_()
+            return 0
+
+        final_block = self.blocks[-1]
+        final_conv: Optional[nn.Conv2d] = None
+        for m in reversed(list(final_block.main)):
+            if isinstance(m, nn.Conv2d) and m.out_channels == self.total_out_channels:
+                final_conv = m
+                break
+        if final_conv is None:
+            self._leaf_count.zero_()
+            return 0
+
+        L = self.n_taxonomy_layers
+        offset = 0
+        for d in range(L):
+            n_d = 1 << (d + 1)
+            shift = (L - 1 - d)
+            ancestors = (dead >> shift).unique()
+            for node in ancestors.tolist():
+                ch = offset + int(node)
+                fan_in = (final_conv.weight.shape[1] *
+                          final_conv.weight.shape[2] *
+                          final_conv.weight.shape[3])
+                std = (2.0 / fan_in) ** 0.5
+                final_conv.weight.data[ch].normal_(0.0, std)
+                # Reset dead-step counter so AuxK lets these revive normally.
+                self._steps_since_active[ch] = 0
+            offset += n_d
+
+        self._leaf_count.zero_()
+        return n_dead
 
     def compute_auxk_loss(
         self,
@@ -2846,6 +2980,8 @@ class BottleneckTopKTaxonResNetEncoder(_BottleneckEncoderBase):
         out_channels: int = 3,
         k_leaves: int = 0,
         use_gate_value: bool = False,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__(
             in_channels=in_channels,
@@ -2880,6 +3016,8 @@ class BottleneckTopKTaxonResNetEncoder(_BottleneckEncoderBase):
             out_channels=out_channels,
             k_leaves=k_leaves,
             use_gate_value=use_gate_value,
+            gumbel=gumbel,
+            resample_min_count=resample_min_count,
         )
         self.final_channels = self.bottleneck_stage.total_out_channels
 
@@ -2904,11 +3042,13 @@ class BottleneckTopKTaxonResNetEncoder(_BottleneckEncoderBase):
                 "output_shape": tuple(x.shape),
                 "dead_frac": regs["dead_frac"],
                 "entropy": regs["entropy"], "dkl": regs["dkl"],
+                "balance_loss": regs["balance_loss"],
             })
         details["latent_shape"] = tuple(x.shape)
         details["dead_frac"] = regs["dead_frac"]
         details["entropy"] = regs["entropy"]
         details["dkl"] = regs["dkl"]
+        details["balance_loss"] = regs["balance_loss"]
         return x, details
 
 

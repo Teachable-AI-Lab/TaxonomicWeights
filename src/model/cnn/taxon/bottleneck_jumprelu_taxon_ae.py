@@ -43,6 +43,8 @@ class BottleneckJumpReLUTaxonResNetEncoder(_BottleneckEncoderBase):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__(
             in_channels=in_channels,
@@ -73,6 +75,8 @@ class BottleneckJumpReLUTaxonResNetEncoder(_BottleneckEncoderBase):
             temperature=self.temperature,
             hard=self.default_hard,
             depth_decay=depth_decay,
+            gumbel=gumbel,
+            resample_min_count=resample_min_count,
         )
         self.final_channels = self.bottleneck_stage.total_out_channels
 
@@ -98,6 +102,7 @@ class BottleneckJumpReLUTaxonResNetEncoder(_BottleneckEncoderBase):
                 "dead_frac": regs["dead_frac"],
                 "entropy": regs["entropy"], "dkl": regs["dkl"],
                 "l0_hat": regs["l0_hat"], "sparsity": regs["sparsity"],
+                "balance_loss": regs["balance_loss"],
             })
         details["latent_shape"] = tuple(x.shape)
         details["dead_frac"] = regs["dead_frac"]
@@ -105,6 +110,7 @@ class BottleneckJumpReLUTaxonResNetEncoder(_BottleneckEncoderBase):
         details["dkl"] = regs["dkl"]
         details["l0_hat"] = regs["l0_hat"]
         details["sparsity"] = regs["sparsity"]
+        details["balance_loss"] = regs["balance_loss"]
         return x, details
 
 
@@ -133,6 +139,8 @@ class BottleneckJumpReLUTaxonAutoencoder(nn.Module):
         temperature: float = 1.0,
         hard: bool = False,
         depth_decay: float = 0.5,
+        gumbel: bool = False,
+        resample_min_count: int = 0,
     ) -> None:
         super().__init__()
         self.output_activation = output_activation.lower()
@@ -158,6 +166,8 @@ class BottleneckJumpReLUTaxonAutoencoder(nn.Module):
             temperature=temperature,
             hard=hard,
             depth_decay=depth_decay,
+            gumbel=gumbel,
+            resample_min_count=resample_min_count,
         )
         self.decoder = TaxonResNetDecoder(
             latent_channels=self.encoder.final_channels,
@@ -172,6 +182,13 @@ class BottleneckJumpReLUTaxonAutoencoder(nn.Module):
 
     def encode(self, x, hard=None, return_details=False):
         return self.encoder(x, hard=hard, return_details=return_details)
+
+    def set_tau(self, tau: float) -> None:
+        """Forward tau update to bottleneck stage (used by trainer for annealing)."""
+        self.encoder.bottleneck_stage.set_tau(tau)
+
+    def maybe_resample_dead_leaves(self) -> int:
+        return self.encoder.bottleneck_stage.maybe_resample_dead_leaves()
 
     def decode(self, z, output_size=None, return_details=False):
         return self.decoder(z, output_size=output_size, return_details=return_details)
@@ -197,6 +214,7 @@ class BottleneckJumpReLUTaxonAutoencoder(nn.Module):
             "l0_hat": enc_details["l0_hat"],
             "entropy": enc_details["entropy"],
             "dkl": enc_details["dkl"],
+            "balance_loss": enc_details["balance_loss"],
         }
         if not return_details:
             return recon, info

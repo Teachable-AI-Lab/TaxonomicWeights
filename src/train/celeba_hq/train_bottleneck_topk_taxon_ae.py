@@ -52,28 +52,34 @@ def build_scheduler(optimizer, steps_per_epoch, epochs, warmup_epochs) -> Lambda
 
 
 @torch.no_grad()
-def run_validation(model, loader, device, auxk_w, dkl_w=0.0) -> dict:
+def run_validation(model, loader, device, auxk_w, dkl_w=0.0, balance_w=0.0) -> dict:
     model.eval()
-    tot_loss = tot_recon = tot_auxk = tot_dead = tot_dkl = 0.0
+    tot_loss = tot_recon = tot_auxk = tot_dead = tot_dkl = tot_balance = 0.0
     nb = 0
+    need_details = (dkl_w > 0) or (balance_w > 0)
     for images, _ in loader:
         images = images.to(device, non_blocking=True)
-        if dkl_w > 0:
+        if need_details:
             recon, dead_frac, details = model(images, return_details=True)
-            dkl = float(details["encoder"]["dkl"].item())
+            dkl = float(details["encoder"]["dkl"].item()) if dkl_w > 0 else 0.0
+            balance = details["encoder"].get("balance_loss")
+            balance_v = float(balance.item()) if balance is not None else 0.0
         else:
             recon, dead_frac = model(images)
             dkl = 0.0
+            balance_v = 0.0
         recon_loss = F.mse_loss(recon, images)
         auxk_loss = model.compute_auxk_loss(images, recon)
-        loss = recon_loss + auxk_w*auxk_loss + dkl_w*dkl
+        loss = recon_loss + auxk_w*auxk_loss + dkl_w*dkl + balance_w*balance_v
         tot_loss += float(loss.item()); tot_recon += float(recon_loss.item())
         tot_auxk += float(auxk_loss.item()); tot_dead += float(dead_frac.item())
-        tot_dkl += dkl; nb += 1
+        tot_dkl += dkl; tot_balance += balance_v; nb += 1
     if nb == 0:
-        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0, "dkl": 0.0}
+        return {"loss": 0.0, "recon": 0.0, "auxk": 0.0, "dead_frac": 0.0,
+                "dkl": 0.0, "balance": 0.0}
     return {"loss": tot_loss/nb, "recon": tot_recon/nb,
-            "auxk": tot_auxk/nb, "dead_frac": tot_dead/nb, "dkl": tot_dkl/nb}
+            "auxk": tot_auxk/nb, "dead_frac": tot_dead/nb,
+            "dkl": tot_dkl/nb, "balance": tot_balance/nb}
 
 
 def save_recon_preview(model, loader, device, save_path, num_images=8) -> None:
@@ -142,6 +148,13 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=t.get("save_every", 5))
     p.add_argument("--seed", type=int, default=t.get("seed", 42))
     p.add_argument("--max-train-steps", type=int, default=t.get("max_train_steps", 0))
+    p.add_argument("--tau-start", type=float, default=t.get("tau_start", 0.0),
+                   help="if >0, anneal stage tau from tau_start to tau_end over tau_anneal_frac of total steps")
+    p.add_argument("--tau-end", type=float, default=t.get("tau_end", 0.0))
+    p.add_argument("--tau-anneal-frac", type=float, default=t.get("tau_anneal_frac", 0.5))
+    p.add_argument("--balance-weight", type=float, default=t.get("balance_weight", 0.0))
+    p.add_argument("--resample-interval", type=int, default=t.get("resample_interval", 0),
+                   help="if >0, attempt dead-leaf resampling every N optimizer steps")
     p.add_argument("--resume", type=str, default="")
     return p.parse_args(), m
 
@@ -197,6 +210,8 @@ def main() -> None:
         warmup_steps=int(_mc.get("warmup_steps", 0)),
         k_leaves=int(_mc.get("k_leaves", 0)),
         use_gate_value=bool(_mc.get("use_gate_value", False)),
+        gumbel=bool(_mc.get("gumbel", False)),
+        resample_min_count=int(_mc.get("resample_min_count", 0)),
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate,
@@ -225,6 +240,20 @@ def main() -> None:
                "val_loss": [], "val_recon": [], "val_auxk": [],
                "val_dead": [], "val_dkl": []}
 
+    # Pre-compute tau annealing schedule.
+    total_steps_planned = max(1, len(train_loader) * args.epochs)
+    anneal_steps = max(1, int(args.tau_anneal_frac * total_steps_planned))
+    tau_anneal_active = args.tau_start > 0.0 and args.tau_end > 0.0
+    if tau_anneal_active:
+        model.set_tau(args.tau_start)
+        print(f"[tau-anneal] tau_start={args.tau_start} tau_end={args.tau_end} "
+              f"over {anneal_steps}/{total_steps_planned} steps")
+    if args.balance_weight > 0:
+        print(f"[balance] balance_weight={args.balance_weight}")
+    if args.resample_interval > 0:
+        print(f"[resample] interval={args.resample_interval} "
+              f"min_count={_mc.get('resample_min_count', 0)}")
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
@@ -233,15 +262,24 @@ def main() -> None:
         for batch_idx, (images, _) in enumerate(train_loader, start=1):
             images = images.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            if args.dkl_weight > 0:
+            # Tau annealing (linear, only during the first tau_anneal_frac of training).
+            if tau_anneal_active:
+                frac = min(1.0, global_step / float(anneal_steps))
+                tau = args.tau_start + (args.tau_end - args.tau_start) * frac
+                model.set_tau(tau)
+            need_details = (args.dkl_weight > 0) or (args.balance_weight > 0)
+            if need_details:
                 recon, dead_frac, details = model(images, return_details=True)
-                dkl = details["encoder"]["dkl"]
+                dkl = details["encoder"]["dkl"] if args.dkl_weight > 0 else images.new_zeros(())
+                balance = details["encoder"].get("balance_loss", images.new_zeros(()))
             else:
                 recon, dead_frac = model(images)
                 dkl = images.new_zeros(())
+                balance = images.new_zeros(())
             recon_loss = F.mse_loss(recon, images)
             auxk_loss = model.compute_auxk_loss(images, recon)
-            loss = recon_loss + args.auxk_weight*auxk_loss + args.dkl_weight*dkl
+            loss = (recon_loss + args.auxk_weight*auxk_loss
+                    + args.dkl_weight*dkl + args.balance_weight*balance)
             loss.backward()
             optimizer.step(); scheduler.step()
             if args.decoder_max_norm > 0:
@@ -256,18 +294,26 @@ def main() -> None:
             running["auxk"] += float(auxk_loss.item()); running["dead"] += float(dead_frac.item())
             running["dkl"] += float(dkl.item()) if torch.is_tensor(dkl) else float(dkl)
             nb += 1; global_step += 1
+            # Periodic dead-leaf resampling.
+            if args.resample_interval > 0 and global_step % args.resample_interval == 0:
+                n_resampled = model.maybe_resample_dead_leaves()
+                if n_resampled > 0:
+                    print(f"[resample] step={global_step} resampled {n_resampled} dead leaves")
             if batch_idx % 50 == 0:
                 avg = {k: v/nb for k, v in running.items()}
                 lr = optimizer.param_groups[0]["lr"]
+                tau_now = model.encoder.bottleneck_stage.temperature
+                bv = float(balance.item()) if torch.is_tensor(balance) else float(balance)
                 print(f"epoch={epoch} batch={batch_idx}/{len(train_loader)} step={global_step} "
-                      f"lr={lr:.3e} loss={avg['loss']:.5f} recon={avg['recon']:.5f} "
-                      f"auxk={avg['auxk']:.5f} dead={avg['dead']:.3f}")
+                      f"lr={lr:.3e} tau={tau_now:.3f} loss={avg['loss']:.5f} recon={avg['recon']:.5f} "
+                      f"auxk={avg['auxk']:.5f} balance={bv:.4f} dead={avg['dead']:.3f}")
             if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                 break
 
         train_stats = {k: v/max(1, nb) for k, v in running.items()}
         val_stats = run_validation(model, val_loader, device,
-                                   args.auxk_weight, args.dkl_weight)
+                                   args.auxk_weight, args.dkl_weight,
+                                   balance_w=args.balance_weight)
         elapsed = time.time() - epoch_start
         print(f"epoch={epoch:03d} time={elapsed:.1f}s "
               f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
